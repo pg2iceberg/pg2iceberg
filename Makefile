@@ -13,6 +13,8 @@ server: build
 		--clickhouse-addr http://localhost:8123 \
 		--clickhouse-catalog-uri http://iceberg-rest:8181/v1 \
 		--clickhouse-s3-endpoint http://minio:9000 \
+		--clickhouse-s3-access-key admin \
+		--clickhouse-s3-secret-key password \
 		--clickhouse-warehouse "s3://warehouse/"
 
 docker-up:

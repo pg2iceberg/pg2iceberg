@@ -24,6 +24,8 @@ func main() {
 	chAddr := flag.String("clickhouse-addr", "", "ClickHouse HTTP address for auto-provisioning (e.g. http://localhost:8123)")
 	chCatalogURI := flag.String("clickhouse-catalog-uri", "", "Iceberg catalog URI as seen by ClickHouse (e.g. http://iceberg-rest:8181/v1)")
 	chS3Endpoint := flag.String("clickhouse-s3-endpoint", "", "S3 endpoint as seen by ClickHouse (e.g. http://minio:9000)")
+	chS3AccessKey := flag.String("clickhouse-s3-access-key", "", "S3 access key for ClickHouse storage")
+	chS3SecretKey := flag.String("clickhouse-s3-secret-key", "", "S3 secret key for ClickHouse storage")
 	chWarehouse := flag.String("clickhouse-warehouse", "s3://warehouse/", "warehouse path for ClickHouse catalog")
 
 	flag.Parse()
@@ -42,10 +44,12 @@ func main() {
 
 	if *serverMode {
 		chOpts := clickHouseOpts{
-			addr:       *chAddr,
-			catalogURI: *chCatalogURI,
-			s3Endpoint: *chS3Endpoint,
-			warehouse:  *chWarehouse,
+			addr:        *chAddr,
+			catalogURI:  *chCatalogURI,
+			s3Endpoint:  *chS3Endpoint,
+			s3AccessKey: *chS3AccessKey,
+			s3SecretKey: *chS3SecretKey,
+			warehouse:   *chWarehouse,
 		}
 		runServer(ctx, *listenAddr, *storeDSN, *storeDir, chOpts)
 	} else {
@@ -71,10 +75,12 @@ func runSingle(ctx context.Context, configPath string) {
 }
 
 type clickHouseOpts struct {
-	addr       string
-	catalogURI string
-	s3Endpoint string
-	warehouse  string
+	addr        string
+	catalogURI  string
+	s3Endpoint  string
+	s3AccessKey string
+	s3SecretKey string
+	warehouse   string
 }
 
 func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string, chOpts clickHouseOpts) {
@@ -97,7 +103,7 @@ func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string, chOpt
 
 	// Set up ClickHouse auto-provisioning if configured.
 	if chOpts.addr != "" {
-		ch := pipeline.NewClickHouseProvisioner(chOpts.addr, chOpts.catalogURI, chOpts.s3Endpoint, chOpts.warehouse)
+		ch := pipeline.NewClickHouseProvisioner(chOpts.addr, chOpts.catalogURI, chOpts.s3Endpoint, chOpts.s3AccessKey, chOpts.s3SecretKey, chOpts.warehouse)
 		mgr.SetClickHouse(ch)
 		log.Printf("clickhouse auto-provisioning enabled (%s)", chOpts.addr)
 	}
