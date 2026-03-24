@@ -1,4 +1,4 @@
-CREATE DATABASE IF NOT EXISTS iceberg ENGINE = DataLakeCatalog(
+CREATE DATABASE IF NOT EXISTS rideshare ENGINE = DataLakeCatalog(
     'http://iceberg-rest:8181/v1',
     'admin',
     'password'

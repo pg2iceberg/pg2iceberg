@@ -11,20 +11,24 @@ import (
 // ClickHouseProvisioner creates per-tenant databases in ClickHouse
 // via the HTTP interface.
 type ClickHouseProvisioner struct {
-	addr       string // e.g. "http://localhost:8123"
-	catalogURI string // Iceberg REST catalog URI as seen by ClickHouse (e.g. "http://iceberg-rest:8181/v1")
-	s3Endpoint string // S3 endpoint as seen by ClickHouse (e.g. "http://minio:9000")
-	warehouse  string // e.g. "s3://warehouse/"
-	client     *http.Client
+	addr        string // e.g. "http://localhost:8123"
+	catalogURI  string // Iceberg REST catalog URI as seen by ClickHouse (e.g. "http://iceberg-rest:8181/v1")
+	s3Endpoint  string // S3 endpoint as seen by ClickHouse (e.g. "http://minio:9000")
+	s3AccessKey string // S3 access key for storage
+	s3SecretKey string // S3 secret key for storage
+	warehouse   string // e.g. "s3://warehouse/"
+	client      *http.Client
 }
 
-func NewClickHouseProvisioner(addr, catalogURI, s3Endpoint, warehouse string) *ClickHouseProvisioner {
+func NewClickHouseProvisioner(addr, catalogURI, s3Endpoint, s3AccessKey, s3SecretKey, warehouse string) *ClickHouseProvisioner {
 	return &ClickHouseProvisioner{
-		addr:       addr,
-		catalogURI: catalogURI,
-		s3Endpoint: s3Endpoint,
-		warehouse:  warehouse,
-		client:     &http.Client{Timeout: 10 * time.Second},
+		addr:        addr,
+		catalogURI:  catalogURI,
+		s3Endpoint:  s3Endpoint,
+		s3AccessKey: s3AccessKey,
+		s3SecretKey: s3SecretKey,
+		warehouse:   warehouse,
+		client:      &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -32,8 +36,8 @@ func NewClickHouseProvisioner(addr, catalogURI, s3Endpoint, warehouse string) *C
 // if it doesn't already exist.
 func (c *ClickHouseProvisioner) EnsureDatabase(namespace string) error {
 	query := fmt.Sprintf(
-		`CREATE DATABASE IF NOT EXISTS %s ENGINE = DataLakeCatalog('%s') SETTINGS catalog_type = 'rest', warehouse = '%s', storage_endpoint = '%s'`,
-		namespace, c.catalogURI, c.warehouse, c.s3Endpoint,
+		`CREATE DATABASE IF NOT EXISTS %s ENGINE = DataLakeCatalog('%s', '%s', '%s') SETTINGS catalog_type = 'rest', warehouse = '%s', storage_endpoint = '%s'`,
+		namespace, c.catalogURI, c.s3AccessKey, c.s3SecretKey, c.warehouse, c.s3Endpoint,
 	)
 	return c.exec(query)
 }
