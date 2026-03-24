@@ -13,6 +13,21 @@ graph LR
   ICE --> OLAP[Snowflake<br />ClickHouse<br />etc.]
 ```
 
+## Quickstart
+
+```sh
+cd example
+docker compose up -d --wait
+```
+
+Then go to http://localhost:8123 and run:
+
+```sql
+select * from rideshare.`rideshare.rides`
+```
+
+You should see new rows added over time.
+
 ## FAQ
 
 ### Will it support other sources and sinks in the future?
