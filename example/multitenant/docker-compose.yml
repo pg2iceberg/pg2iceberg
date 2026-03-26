@@ -147,7 +147,7 @@ services:
     command:
       - "--server"
       - "--listen=:8080"
-      - "--store-dsn=host=postgres-store port=5432 dbname=pg2iceberg user=postgres password=postgres sslmode=disable"
+      - "--store-url=postgresql://postgres:postgres@postgres-store:5432/pg2iceberg?sslmode=disable"
       - "--clickhouse-addr=http://clickhouse:8123"
       - "--clickhouse-catalog-uri=http://iceberg-rest:8181/v1"
       - "--clickhouse-s3-endpoint=http://minio:9000"

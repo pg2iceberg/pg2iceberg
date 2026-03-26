@@ -17,7 +17,7 @@ func main() {
 	configPath := flag.String("config", "config.example.yaml", "path to config file")
 	serverMode := flag.Bool("server", false, "run in multi-tenant API server mode")
 	listenAddr := flag.String("listen", ":8080", "API server listen address")
-	storeDSN := flag.String("store-dsn", "", "postgres DSN for pipeline store (server mode)")
+	storeDSN := flag.String("store-url", "", "postgres URL for pipeline store, e.g. postgresql://user:pass@host:5432/db (server mode)")
 	storeDir := flag.String("store-dir", "./pipelines", "file-based pipeline store directory (server mode, used if -store-dsn is not set)")
 
 	// ClickHouse auto-provisioning (server mode)

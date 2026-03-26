@@ -51,7 +51,7 @@ Runs an HTTP API server that manages multiple pipelines. Pipelines are created, 
 docker run -p 8080:8080 pg2iceberg \
   --server \
   --listen=:8080 \
-  --store-dsn="host=mydb port=5432 dbname=pg2iceberg user=postgres password=postgres sslmode=disable"
+  --store-url="postgresql://postgres:postgres@mydb:5432/pg2iceberg?sslmode=disable"
 ```
 
 The web UI is a separate container that proxies API requests to the server:
