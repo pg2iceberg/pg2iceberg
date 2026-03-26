@@ -158,28 +158,23 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
 
-	tables := getTables(p.cfg)
 	p.schemas = make(map[string]*schema.TableSchema)
-	for _, table := range tables {
-		ts, err := schema.DiscoverSchema(ctx, pgConn, table)
+	for _, tc := range p.cfg.Tables {
+		ts, err := schema.DiscoverSchema(ctx, pgConn, tc.Name)
 		if err != nil {
 			pgConn.Close(ctx)
-			return fmt.Errorf("discover schema for %s: %w", table, err)
+			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
-		if p.cfg.Source.Mode == "query" {
-			for _, qt := range p.cfg.Source.Query.Tables {
-				if qt.Name == table && len(qt.PrimaryKey) > 0 {
-					ts.PK = qt.PrimaryKey
-				}
-			}
+		if p.cfg.Source.Mode == "query" && len(tc.PrimaryKey) > 0 {
+			ts.PK = tc.PrimaryKey
 		}
-		p.schemas[table] = ts
-		log.Printf("[pipeline:%s] discovered schema for %s: %d columns, pk=%v", p.id, table, len(ts.Columns), ts.PK)
+		p.schemas[tc.Name] = ts
+		log.Printf("[pipeline:%s] discovered schema for %s: %d columns, pk=%v", p.id, tc.Name, len(ts.Columns), ts.PK)
 	}
 	pgConn.Close(ctx)
 
 	// Initialize sink.
-	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres)
+	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables)
 	if err != nil {
 		return fmt.Errorf("create sink: %w", err)
 	}
@@ -204,12 +199,12 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	// Initialize source.
 	switch p.cfg.Source.Mode {
 	case "query":
-		qs := source.NewQuerySource(p.cfg.Source.Postgres, p.cfg.Source.Query)
+		qs := source.NewQuerySource(p.cfg.Source.Postgres, p.cfg.Source.Query, p.cfg.Tables)
 		if cp.Mode == "query" && cp.Watermark != "" {
 			t, err := time.Parse(time.RFC3339Nano, cp.Watermark)
 			if err == nil {
-				for _, qt := range p.cfg.Source.Query.Tables {
-					qs.SetWatermark(qt.Name, t)
+				for _, tc := range p.cfg.Tables {
+					qs.SetWatermark(tc.Name, t)
 				}
 				log.Printf("[pipeline:%s] restored query watermark: %v", p.id, t)
 			}
@@ -217,7 +212,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.src = qs
 
 	case "logical":
-		ls := source.NewLogicalSource(p.cfg.Source.Postgres, p.cfg.Source.Logical)
+		ls := source.NewLogicalSource(p.cfg.Source.Postgres, p.cfg.Source.Logical, p.cfg.Tables)
 		if cp.Mode == "logical" && cp.LSN > 0 {
 			ls.SetStartLSN(cp.LSN)
 			log.Printf("[pipeline:%s] restored logical LSN: %d", p.id, cp.LSN)
@@ -417,7 +412,7 @@ func (p *Pipeline) AddTable(ctx context.Context, tableName string) error {
 		}
 	case "query":
 		if qs, ok := p.src.(*source.QuerySource); ok {
-			qs.AddTable(config.QueryTableConfig{Name: tableName})
+			qs.AddTable(config.TableConfig{Name: tableName})
 		}
 	}
 
@@ -471,21 +466,3 @@ func newCheckpointStore(ctx context.Context, cfg *config.Config) (state.Checkpoi
 	return state.NewPgStore(ctx, url)
 }
 
-func getTables(cfg *config.Config) []string {
-	switch cfg.Source.Mode {
-	case "query":
-		tables := make([]string, len(cfg.Source.Query.Tables))
-		for i, t := range cfg.Source.Query.Tables {
-			tables[i] = t.Name
-		}
-		return tables
-	case "logical":
-		tables := make([]string, len(cfg.Source.Logical.Tables))
-		for i, t := range cfg.Source.Logical.Tables {
-			tables[i] = t.Name
-		}
-		return tables
-	default:
-		return nil
-	}
-}

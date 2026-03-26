@@ -161,14 +161,28 @@ discover_tests() {
 }
 
 # Generate a test-specific config YAML.
+# If an __extra.yaml file exists for the test, its contents are appended
+# to the table entry (indented under the table).
 gen_config() {
     local table="$1"
     local publication="$2"
     local slot="$3"
     local config_path="$4"
     local state_path="$5"
+    local extra_file="$6"
 
     cat > "$config_path" <<YAML
+tables:
+  - name: public.${table}
+YAML
+
+    # Append extra table config (e.g. iceberg partition) if the file exists.
+    if [ -n "$extra_file" ] && [ -f "$extra_file" ]; then
+        cat "$extra_file" >> "$config_path"
+    fi
+
+    cat >> "$config_path" <<YAML
+
 source:
   mode: logical
   postgres:
@@ -180,8 +194,6 @@ source:
   logical:
     publication_name: ${publication}
     slot_name: ${slot}
-    tables:
-      - name: public.${table}
 
 sink:
   catalog_uri: ${CATALOG_URI}
@@ -303,7 +315,8 @@ run_test() {
         DATA)
             # Start pg2iceberg on first DATA step.
             if [ "$replication_started" = false ]; then
-                gen_config "$table" "$publication" "$slot" "$config_path" "$state_path"
+                local extra_file="$CASES_DIR/${test_name}__extra.yaml"
+                gen_config "$table" "$publication" "$slot" "$config_path" "$state_path" "$extra_file"
                 "$PROJECT_DIR/bin/pg2iceberg" --config "$config_path" > "$pg2iceberg_log" 2>&1 &
                 pg2iceberg_pid=$!
 

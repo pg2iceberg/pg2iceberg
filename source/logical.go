@@ -19,11 +19,12 @@ import (
 // LogicalSource implements Source using PostgreSQL logical replication.
 // It manages the full lifecycle of the replication slot.
 type LogicalSource struct {
-	pgCfg  config.PostgresConfig
-	cfg    config.LogicalConfig
-	tables map[string]*schema.TableSchema
+	pgCfg     config.PostgresConfig
+	cfg       config.LogicalConfig
+	tableCfgs []config.TableConfig
+	tables    map[string]*schema.TableSchema
 
-	replConn *pgconn.PgConn
+	replConn  *pgconn.PgConn
 	queryConn *pgx.Conn
 
 	// relations caches RelationMessage by OID for decoding tuples.
@@ -41,10 +42,11 @@ type LogicalSource struct {
 	snapshotComplete bool
 }
 
-func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig) *LogicalSource {
+func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig) *LogicalSource {
 	return &LogicalSource{
 		pgCfg:     pgCfg,
 		cfg:       logicalCfg,
+		tableCfgs: tableCfgs,
 		tables:    make(map[string]*schema.TableSchema),
 		relations: make(map[uint32]*pglogrepl.RelationMessageV2),
 	}
@@ -76,7 +78,7 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 	defer l.queryConn.Close(ctx)
 
 	// Discover schemas for configured tables.
-	for _, tc := range l.cfg.Tables {
+	for _, tc := range l.tableCfgs {
 		ts, err := schema.DiscoverSchema(ctx, l.queryConn, tc.Name)
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
@@ -366,7 +368,7 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string,
 		return fmt.Errorf("set transaction snapshot: %w", err)
 	}
 
-	for _, tc := range l.cfg.Tables {
+	for _, tc := range l.tableCfgs {
 		if tc.SkipSnapshot {
 			log.Printf("[logical] snapshot: skipping %s (skip_snapshot=true)", tc.Name)
 			continue
@@ -473,15 +475,15 @@ func (l *LogicalSource) Close() error {
 // the PG publication; this only controls which replicated events pg2iceberg processes.
 func (l *LogicalSource) AddTable(table string) {
 	if !l.isTracked(table) {
-		l.cfg.Tables = append(l.cfg.Tables, config.LogicalTableConfig{Name: table})
+		l.tableCfgs = append(l.tableCfgs, config.TableConfig{Name: table})
 	}
 }
 
 // RemoveTable removes a table from the tracked set.
 func (l *LogicalSource) RemoveTable(table string) {
-	for i, tc := range l.cfg.Tables {
+	for i, tc := range l.tableCfgs {
 		if tc.Name == table {
-			l.cfg.Tables = append(l.cfg.Tables[:i], l.cfg.Tables[i+1:]...)
+			l.tableCfgs = append(l.tableCfgs[:i], l.tableCfgs[i+1:]...)
 			delete(l.tables, table)
 			return
 		}
@@ -489,7 +491,7 @@ func (l *LogicalSource) RemoveTable(table string) {
 }
 
 func (l *LogicalSource) isTracked(table string) bool {
-	for _, tc := range l.cfg.Tables {
+	for _, tc := range l.tableCfgs {
 		if tc.Name == table {
 			return true
 		}

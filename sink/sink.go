@@ -16,8 +16,9 @@ import (
 
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
-	cfg   config.SinkConfig
-	pgCfg config.PostgresConfig // source PG config for TOAST lookups
+	cfg       config.SinkConfig
+	pgCfg     config.PostgresConfig // source PG config for TOAST lookups
+	tableCfgs []config.TableConfig
 
 	catalog *CatalogClient
 	s3      *S3Client
@@ -59,7 +60,7 @@ type tableSink struct {
 	toastPending []toastPendingRow
 }
 
-func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig) (*Sink, error) {
+func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig) (*Sink, error) {
 	catalog := NewCatalogClient(cfg.CatalogURI)
 
 	s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
@@ -70,6 +71,7 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig) (*Sink, error) 
 	return &Sink{
 		cfg:            cfg,
 		pgCfg:          pgCfg,
+		tableCfgs:      tableCfgs,
 		catalog:        catalog,
 		s3:             s3Client,
 		tables:         make(map[string]*tableSink),
@@ -89,8 +91,11 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 
 	// Build partition spec from config.
 	var partExprs []string
-	if tc, ok := s.cfg.Tables[ts.Table]; ok {
-		partExprs = tc.Partition
+	for _, tc := range s.tableCfgs {
+		if tc.Name == ts.Table {
+			partExprs = tc.Iceberg.Partition
+			break
+		}
 	}
 	partSpec, err := BuildPartitionSpec(partExprs, ts)
 	if err != nil {

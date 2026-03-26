@@ -10,9 +10,35 @@ import (
 )
 
 type Config struct {
-	Source SourceConfig `yaml:"source" json:"source"`
-	Sink   SinkConfig   `yaml:"sink" json:"sink"`
-	State  StateConfig  `yaml:"state" json:"state"`
+	Tables []TableConfig `yaml:"tables" json:"tables"`
+	Source SourceConfig  `yaml:"source" json:"source"`
+	Sink   SinkConfig    `yaml:"sink" json:"sink"`
+	State  StateConfig   `yaml:"state" json:"state"`
+}
+
+// TableConfig describes a table to replicate.
+type TableConfig struct {
+	Name string `yaml:"name" json:"name"` // e.g. "public.orders"
+
+	// Logical mode options.
+	SkipSnapshot bool `yaml:"skip_snapshot" json:"skip_snapshot,omitempty"`
+
+	// Query mode options.
+	PrimaryKey      []string `yaml:"primary_key" json:"primary_key,omitempty"`
+	WatermarkColumn string   `yaml:"watermark_column" json:"watermark_column,omitempty"`
+
+	// Iceberg table options.
+	Iceberg IcebergTableConfig `yaml:"iceberg" json:"iceberg,omitempty"`
+}
+
+// IcebergTableConfig holds Iceberg-specific per-table settings.
+type IcebergTableConfig struct {
+	// Partition defines partition fields using function syntax:
+	//   - "day(created_at)"    → day transform on created_at column
+	//   - "month(event_time)"  → month transform
+	//   - "region"             → identity transform (column name only)
+	// Supported transforms: identity, year, month, day, hour.
+	Partition []string `yaml:"partition" json:"partition,omitempty"`
 }
 
 type SourceConfig struct {
@@ -41,8 +67,7 @@ func (p PostgresConfig) ReplicationDSN() string {
 }
 
 type QueryConfig struct {
-	Tables       []QueryTableConfig `yaml:"tables" json:"tables"`
-	PollInterval string             `yaml:"poll_interval" json:"poll_interval"`
+	PollInterval string `yaml:"poll_interval" json:"poll_interval"`
 }
 
 func (q QueryConfig) PollDuration() time.Duration {
@@ -53,32 +78,9 @@ func (q QueryConfig) PollDuration() time.Duration {
 	return d
 }
 
-type QueryTableConfig struct {
-	Name            string   `yaml:"name" json:"name"`
-	PrimaryKey      []string `yaml:"primary_key" json:"primary_key"`
-	WatermarkColumn string   `yaml:"watermark_column" json:"watermark_column"`
-}
-
 type LogicalConfig struct {
-	PublicationName string              `yaml:"publication_name" json:"publication_name"`
-	SlotName        string              `yaml:"slot_name" json:"slot_name"`
-	Tables          []LogicalTableConfig `yaml:"tables" json:"tables"`
-}
-
-// LogicalTableConfig describes a table tracked by logical replication.
-type LogicalTableConfig struct {
-	Name         string `yaml:"name" json:"name"`
-	SkipSnapshot bool   `yaml:"skip_snapshot" json:"skip_snapshot,omitempty"`
-}
-
-// SinkTableConfig holds per-table sink configuration.
-type SinkTableConfig struct {
-	// Partition defines partition fields using function syntax:
-	//   - "day(created_at)"    → day transform on created_at column
-	//   - "month(event_time)"  → month transform
-	//   - "region"             → identity transform (column name only)
-	// Supported transforms: identity, year, month, day, hour.
-	Partition []string `yaml:"partition" json:"partition,omitempty"`
+	PublicationName string `yaml:"publication_name" json:"publication_name"`
+	SlotName        string `yaml:"slot_name" json:"slot_name"`
 }
 
 type SinkConfig struct {
@@ -93,9 +95,6 @@ type SinkConfig struct {
 	FlushRows      int    `yaml:"flush_rows" json:"flush_rows"`
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
-
-	// Per-table configuration (keyed by PG table name, e.g. "public.orders").
-	Tables map[string]SinkTableConfig `yaml:"tables" json:"tables,omitempty"`
 
 	// Compaction settings
 	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`
@@ -154,6 +153,25 @@ func (s SinkConfig) FlushDuration() time.Duration {
 type StateConfig struct {
 	Path        string `yaml:"path" json:"path,omitempty"`
 	PostgresURL string `yaml:"postgres_url" json:"postgres_url,omitempty"`
+}
+
+// TableNames returns the list of table names from the top-level config.
+func (cfg *Config) TableNames() []string {
+	names := make([]string, len(cfg.Tables))
+	for i, t := range cfg.Tables {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// FindTable returns the TableConfig for a given table name, or nil if not found.
+func (cfg *Config) FindTable(name string) *TableConfig {
+	for i := range cfg.Tables {
+		if cfg.Tables[i].Name == name {
+			return &cfg.Tables[i]
+		}
+	}
+	return nil
 }
 
 // Load reads a config from a YAML file.

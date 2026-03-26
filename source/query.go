@@ -13,18 +13,20 @@ import (
 
 // QuerySource implements Source using periodic SELECT queries with a watermark column.
 type QuerySource struct {
-	cfg    config.QueryConfig
-	pgCfg  config.PostgresConfig
-	conn   *pgx.Conn
-	tables map[string]*schema.TableSchema
+	cfg       config.QueryConfig
+	pgCfg     config.PostgresConfig
+	tableCfgs []config.TableConfig
+	conn      *pgx.Conn
+	tables    map[string]*schema.TableSchema
 	// watermarks tracks the last-seen watermark per table.
 	watermarks map[string]time.Time
 }
 
-func NewQuerySource(pgCfg config.PostgresConfig, queryCfg config.QueryConfig) *QuerySource {
+func NewQuerySource(pgCfg config.PostgresConfig, queryCfg config.QueryConfig, tableCfgs []config.TableConfig) *QuerySource {
 	return &QuerySource{
 		cfg:        queryCfg,
 		pgCfg:      pgCfg,
+		tableCfgs:  tableCfgs,
 		tables:     make(map[string]*schema.TableSchema),
 		watermarks: make(map[string]time.Time),
 	}
@@ -44,7 +46,7 @@ func (q *QuerySource) Capture(ctx context.Context, events chan<- ChangeEvent) er
 	defer q.conn.Close(ctx)
 
 	// Discover schemas for all configured tables
-	for _, tbl := range q.cfg.Tables {
+	for _, tbl := range q.tableCfgs {
 		ts, err := schema.DiscoverSchema(ctx, q.conn, tbl.Name)
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tbl.Name, err)
@@ -77,7 +79,7 @@ func (q *QuerySource) Capture(ctx context.Context, events chan<- ChangeEvent) er
 }
 
 func (q *QuerySource) poll(ctx context.Context, events chan<- ChangeEvent) error {
-	for _, tbl := range q.cfg.Tables {
+	for _, tbl := range q.tableCfgs {
 		ts := q.tables[tbl.Name]
 		watermark := q.watermarks[tbl.Name]
 
@@ -138,15 +140,15 @@ func (q *QuerySource) poll(ctx context.Context, events chan<- ChangeEvent) error
 }
 
 // AddTable adds a table to the polling set.
-func (q *QuerySource) AddTable(tbl config.QueryTableConfig) {
-	q.cfg.Tables = append(q.cfg.Tables, tbl)
+func (q *QuerySource) AddTable(tbl config.TableConfig) {
+	q.tableCfgs = append(q.tableCfgs, tbl)
 }
 
 // RemoveTable removes a table from the polling set.
 func (q *QuerySource) RemoveTable(tableName string) {
-	for i, t := range q.cfg.Tables {
+	for i, t := range q.tableCfgs {
 		if t.Name == tableName {
-			q.cfg.Tables = append(q.cfg.Tables[:i], q.cfg.Tables[i+1:]...)
+			q.tableCfgs = append(q.tableCfgs[:i], q.tableCfgs[i+1:]...)
 			delete(q.tables, tableName)
 			delete(q.watermarks, tableName)
 			return

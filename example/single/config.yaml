@@ -1,3 +1,10 @@
+tables:
+  - name: public.riders
+  - name: public.drivers
+  - name: public.rides
+  - name: public.payments
+  - name: public.ratings
+
 source:
   mode: logical
 
@@ -11,12 +18,6 @@ source:
   logical:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
-    tables:
-      - name: public.riders
-      - name: public.drivers
-      - name: public.rides
-      - name: public.payments
-      - name: public.ratings
 
 sink:
   catalog_uri: http://iceberg-rest:8181
