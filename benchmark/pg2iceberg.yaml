@@ -1,3 +1,9 @@
+tables:
+  - name: public.bench_events
+    iceberg:
+      partition:
+        - truncate[100000](seq)
+
 source:
   mode: logical
 
@@ -11,8 +17,6 @@ source:
   logical:
     publication_name: pg2iceberg_bench
     slot_name: pg2iceberg_bench_slot
-    tables:
-      - name: public.bench_events
 
 sink:
   catalog_uri: http://iceberg-rest:8181

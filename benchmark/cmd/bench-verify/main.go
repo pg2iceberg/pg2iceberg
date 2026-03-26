@@ -11,9 +11,9 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -22,6 +22,8 @@ import (
 	"github.com/linkedin/goavro/v2"
 	pq "github.com/parquet-go/parquet-go"
 )
+
+const chunkWidth int64 = 100000
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,25 +39,102 @@ func main() {
 	cfg := loadConfig()
 	log.Printf("bench-verify: namespace=%s table=%s", cfg.Namespace, cfg.Table)
 
-	// Step 1: Replay operations log from PG to compute expected state.
-	log.Println("step 1: loading operations log from postgres...")
-	expected, err := loadExpectedState(ctx, cfg.DatabaseURL)
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("load expected state: %v", err)
+		log.Fatalf("connect to postgres: %v", err)
 	}
-	log.Printf("  expected: %d live rows", len(expected))
+	defer pool.Close()
 
-	// Step 2: Read all data from Iceberg (Parquet files in S3).
-	log.Println("step 2: reading iceberg table from S3...")
-	actual, err := loadIcebergState(ctx, cfg)
+	s3Client := newS3Client(cfg)
+
+	// Step 1: Discover Iceberg data files grouped by partition.
+	log.Println("step 1: reading iceberg table metadata...")
+	partitionFiles, deleteSet, err := loadIcebergFileIndex(ctx, cfg, s3Client)
 	if err != nil {
-		log.Fatalf("load iceberg state: %v", err)
+		log.Fatalf("load iceberg file index: %v", err)
 	}
-	log.Printf("  iceberg: %d rows read", len(actual))
+	totalFiles := 0
+	for _, files := range partitionFiles {
+		totalFiles += len(files)
+	}
+	log.Printf("  found %d partitions, %d data files, %d deletes",
+		len(partitionFiles), totalFiles, len(deleteSet))
 
-	// Step 3: Compare.
-	log.Println("step 3: verifying correctness...")
-	result := verify(expected, actual)
+	// Step 2: Determine verification mode (ops log vs seed-only).
+	var opsCount int64
+	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM bench_operations").Scan(&opsCount); err != nil {
+		log.Fatalf("count operations: %v", err)
+	}
+	useOpsLog := opsCount > 0
+	if useOpsLog {
+		log.Printf("step 2: using operations log (%d entries)", opsCount)
+	} else {
+		log.Println("step 2: seed-only mode (no operations log)")
+	}
+
+	// Step 3: Build complete set of partition boundaries from both PG and Iceberg.
+	var seqMin, seqMax int64
+	if err := pool.QueryRow(ctx, "SELECT COALESCE(MIN(seq),0), COALESCE(MAX(seq),0) FROM bench_events").Scan(&seqMin, &seqMax); err != nil {
+		log.Fatalf("get seq range: %v", err)
+	}
+
+	icebergPartKeys := sortedPartitionKeys(partitionFiles)
+	allPartitions := mergePartitionRanges(icebergPartKeys, seqMin, seqMax, chunkWidth)
+	log.Printf("step 3: verifying %d partitions chunk-by-chunk (seq range [%d, %d])...",
+		len(allPartitions), seqMin, seqMax)
+
+	// Step 4: Process each partition.
+	result := verifyResult{
+		MissingSample: 10,
+		ExtraSample:   10,
+		WrongSample:   10,
+	}
+
+	for i, partKey := range allPartitions {
+		lo := partKey
+		hi := partKey + chunkWidth
+
+		// Load expected state for this chunk from PG.
+		var expected map[int64]int64
+		if useOpsLog {
+			expected, err = loadExpectedChunkFromOpsLog(ctx, pool, lo, hi)
+		} else {
+			expected, err = loadExpectedChunkFromTable(ctx, pool, lo, hi)
+		}
+		if err != nil {
+			log.Fatalf("load expected chunk [%d, %d): %v", lo, hi, err)
+		}
+
+		// Load actual state for this chunk from Iceberg.
+		partPathPrefix := fmt.Sprintf("seq_truncate=%d/", lo)
+		files := partitionFiles[partPathPrefix]
+		actual, err := loadIcebergChunk(ctx, s3Client, cfg, files, deleteSet)
+		if err != nil {
+			log.Fatalf("load iceberg chunk [%d, %d): %v", lo, hi, err)
+		}
+
+		// Compare.
+		cr := verifyChunk(expected, actual)
+		result.TotalExpected += cr.TotalExpected
+		result.TotalActual += cr.TotalActual
+		result.Missing = append(result.Missing, cr.Missing...)
+		result.Extra = append(result.Extra, cr.Extra...)
+		result.WrongValue = append(result.WrongValue, cr.WrongValue...)
+
+		if len(cr.Missing) > 0 || len(cr.Extra) > 0 || len(cr.WrongValue) > 0 {
+			log.Printf("  partition %d/%d [%d, %d): expected=%d actual=%d missing=%d extra=%d wrong=%d",
+				i+1, len(allPartitions), lo, hi,
+				cr.TotalExpected, cr.TotalActual,
+				len(cr.Missing), len(cr.Extra), len(cr.WrongValue))
+		}
+
+		if (i+1)%10 == 0 || i+1 == len(allPartitions) {
+			log.Printf("  progress: %d/%d partitions verified, %d rows checked",
+				i+1, len(allPartitions), result.TotalExpected)
+		}
+	}
+
+	result.Pass = len(result.Missing) == 0 && len(result.Extra) == 0 && len(result.WrongValue) == 0
 	printResult(result)
 
 	if !result.Pass {
@@ -106,139 +185,30 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// --- Expected State ---
+// --- Partition-aware Iceberg loading ---
 
-// expectedRow represents what we expect a row to look like after replaying all operations.
-type expectedRow struct {
-	Value int64
-}
-
-// loadExpectedState computes the expected final state.
-// It first checks for an operations log (used by stream mode). If empty,
-// it falls back to reading bench_events directly (seed-only mode where
-// every row is an insert with value = seq).
-func loadExpectedState(ctx context.Context, dsn string) (map[int64]expectedRow, error) {
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-	defer pool.Close()
-
-	// Check if operations log has entries.
-	var opsCount int64
-	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM bench_operations").Scan(&opsCount); err != nil {
-		return nil, fmt.Errorf("count operations: %w", err)
-	}
-
-	if opsCount > 0 {
-		return loadExpectedFromOpsLog(ctx, pool)
-	}
-
-	// No operations log — seed-only mode. Read directly from bench_events.
-	log.Println("  no operations log found, reading expected state from bench_events (seed-only mode)")
-	return loadExpectedFromTable(ctx, pool)
-}
-
-func loadExpectedFromOpsLog(ctx context.Context, pool *pgxpool.Pool) (map[int64]expectedRow, error) {
-	rows, err := pool.Query(ctx, "SELECT op, seq, value FROM bench_operations ORDER BY id ASC")
-	if err != nil {
-		return nil, fmt.Errorf("query operations: %w", err)
-	}
-	defer rows.Close()
-
-	state := make(map[int64]expectedRow)
-	for rows.Next() {
-		var op string
-		var seq int64
-		var value *int64
-		if err := rows.Scan(&op, &seq, &value); err != nil {
-			return nil, fmt.Errorf("scan: %w", err)
-		}
-
-		switch op {
-		case "insert":
-			if value != nil {
-				state[seq] = expectedRow{Value: *value}
-			}
-		case "update":
-			if _, ok := state[seq]; ok && value != nil {
-				state[seq] = expectedRow{Value: *value}
-			}
-		case "delete":
-			delete(state, seq)
-		}
-	}
-	return state, rows.Err()
-}
-
-func loadExpectedFromTable(ctx context.Context, pool *pgxpool.Pool) (map[int64]expectedRow, error) {
-	var totalRows int64
-	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM bench_events").Scan(&totalRows); err != nil {
-		return nil, fmt.Errorf("count bench_events: %w", err)
-	}
-	log.Printf("  bench_events has %d rows, loading...", totalRows)
-
-	rows, err := pool.Query(ctx, "SELECT seq, value FROM bench_events")
-	if err != nil {
-		return nil, fmt.Errorf("query bench_events: %w", err)
-	}
-	defer rows.Close()
-
-	state := make(map[int64]expectedRow, totalRows)
-	loaded := int64(0)
-	for rows.Next() {
-		var seq int64
-		var value int64
-		if err := rows.Scan(&seq, &value); err != nil {
-			return nil, fmt.Errorf("scan: %w", err)
-		}
-		state[seq] = expectedRow{Value: value}
-		loaded++
-		if loaded%1000000 == 0 {
-			log.Printf("  loaded %dM / %dM rows from bench_events", loaded/1000000, totalRows/1000000)
-		}
-	}
-	log.Printf("  loaded %d rows from bench_events", loaded)
-	return state, rows.Err()
-}
-
-func countOps(state map[int64]expectedRow) int {
-	// This is just the number of live rows; the actual op count isn't needed.
-	return len(state)
-}
-
-// --- Iceberg State ---
-
-// icebergRow is a row as read from Parquet data files.
-type icebergRow struct {
-	Value int64
-}
-
-func loadIcebergState(ctx context.Context, cfg config) (map[int64]icebergRow, error) {
-	s3Client := newS3Client(cfg)
-
-	// Load table metadata from catalog.
+// loadIcebergFileIndex reads the Iceberg catalog and returns data files grouped by
+// partition path prefix, plus a set of deleted IDs from equality delete files.
+func loadIcebergFileIndex(ctx context.Context, cfg config, s3Client *s3.Client) (map[string][]string, map[int64]struct{}, error) {
 	manifestListURI, err := getManifestListURI(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("get manifest list: %w", err)
+		return nil, nil, fmt.Errorf("get manifest list: %w", err)
 	}
 	if manifestListURI == "" {
-		return nil, fmt.Errorf("no snapshots found for table %s.%s", cfg.Namespace, cfg.Table)
+		return nil, nil, fmt.Errorf("no snapshots found for table %s.%s", cfg.Namespace, cfg.Table)
 	}
 
-	// Download and parse manifest list.
 	mlKey := s3KeyFromURI(manifestListURI)
 	mlData, err := s3Download(ctx, s3Client, cfg.Warehouse, mlKey)
 	if err != nil {
-		return nil, fmt.Errorf("download manifest list: %w", err)
+		return nil, nil, fmt.Errorf("download manifest list: %w", err)
 	}
 
 	manifestInfos, err := readManifestList(mlData)
 	if err != nil {
-		return nil, fmt.Errorf("parse manifest list: %w", err)
+		return nil, nil, fmt.Errorf("parse manifest list: %w", err)
 	}
 
-	// Collect all data files and delete files from manifests.
 	var dataFilePaths []string
 	var deleteFilePaths []string
 
@@ -267,9 +237,7 @@ func loadIcebergState(ctx context.Context, cfg config) (map[int64]icebergRow, er
 		}
 	}
 
-	log.Printf("  found %d data files, %d delete files", len(dataFilePaths), len(deleteFilePaths))
-
-	// Build delete set from equality delete files.
+	// Build delete set.
 	deleteSet := make(map[int64]struct{})
 	for _, path := range deleteFilePaths {
 		key := s3KeyFromURI(path)
@@ -291,10 +259,130 @@ func loadIcebergState(ctx context.Context, cfg config) (map[int64]icebergRow, er
 	}
 	log.Printf("  delete set: %d entries", len(deleteSet))
 
-	// Read all data files, apply deletes, deduplicate by id (keep last).
-	result := make(map[int64]icebergRow)
-	totalRead := 0
-	for _, path := range dataFilePaths {
+	// Group data files by partition path.
+	// File paths look like: .../data/seq_truncate=0/uuid-data-0.parquet
+	partitionFiles := make(map[string][]string)
+	for _, fp := range dataFilePaths {
+		partKey := extractPartitionPrefix(fp)
+		partitionFiles[partKey] = append(partitionFiles[partKey], fp)
+	}
+
+	return partitionFiles, deleteSet, nil
+}
+
+// extractPartitionPrefix extracts the partition directory from a data file path.
+// Example: ".../data/seq_truncate=0/uuid-data-0.parquet" → "seq_truncate=0/"
+// For unpartitioned files: "" (empty string).
+func extractPartitionPrefix(filePath string) string {
+	idx := strings.Index(filePath, "/data/")
+	if idx < 0 {
+		return ""
+	}
+	afterData := filePath[idx+len("/data/"):]
+	lastSlash := strings.LastIndex(afterData, "/")
+	if lastSlash < 0 {
+		return ""
+	}
+	return afterData[:lastSlash+1]
+}
+
+// sortedPartitionKeys returns partition keys sorted by their numeric value.
+func sortedPartitionKeys(partitionFiles map[string][]string) []int64 {
+	var keys []int64
+	for k := range partitionFiles {
+		val := parsePartitionValue(k)
+		keys = append(keys, val)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
+
+// parsePartitionValue extracts the numeric value from "seq_truncate=N/".
+func parsePartitionValue(partKey string) int64 {
+	parts := strings.SplitN(partKey, "=", 2)
+	if len(parts) != 2 {
+		return 0
+	}
+	valStr := strings.TrimSuffix(parts[1], "/")
+	return toInt64(valStr)
+}
+
+// mergePartitionRanges returns a sorted, deduplicated list of partition boundaries
+// covering both the Iceberg partitions and the PG seq range.
+func mergePartitionRanges(icebergPartitions []int64, seqMin, seqMax, width int64) []int64 {
+	seen := make(map[int64]struct{})
+	for _, p := range icebergPartitions {
+		seen[p] = struct{}{}
+	}
+	for lo := (seqMin / width) * width; lo <= seqMax; lo += width {
+		seen[lo] = struct{}{}
+	}
+	result := make([]int64, 0, len(seen))
+	for k := range seen {
+		result = append(result, k)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+// --- Chunked PG loading ---
+
+func loadExpectedChunkFromTable(ctx context.Context, pool *pgxpool.Pool, lo, hi int64) (map[int64]int64, error) {
+	rows, err := pool.Query(ctx,
+		"SELECT seq, value FROM bench_events WHERE seq >= $1 AND seq < $2", lo, hi)
+	if err != nil {
+		return nil, fmt.Errorf("query bench_events: %w", err)
+	}
+	defer rows.Close()
+
+	state := make(map[int64]int64)
+	for rows.Next() {
+		var seq, value int64
+		if err := rows.Scan(&seq, &value); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		state[seq] = value
+	}
+	return state, rows.Err()
+}
+
+func loadExpectedChunkFromOpsLog(ctx context.Context, pool *pgxpool.Pool, lo, hi int64) (map[int64]int64, error) {
+	rows, err := pool.Query(ctx,
+		"SELECT op, seq, value FROM bench_operations WHERE seq >= $1 AND seq < $2 ORDER BY id ASC", lo, hi)
+	if err != nil {
+		return nil, fmt.Errorf("query operations: %w", err)
+	}
+	defer rows.Close()
+
+	state := make(map[int64]int64)
+	for rows.Next() {
+		var op string
+		var seq int64
+		var value *int64
+		if err := rows.Scan(&op, &seq, &value); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		switch op {
+		case "insert":
+			if value != nil {
+				state[seq] = *value
+			}
+		case "update":
+			if _, ok := state[seq]; ok && value != nil {
+				state[seq] = *value
+			}
+		case "delete":
+			delete(state, seq)
+		}
+	}
+	return state, rows.Err()
+}
+
+// --- Chunked Iceberg loading ---
+
+func loadIcebergChunk(ctx context.Context, s3Client *s3.Client, cfg config, files []string, deleteSet map[int64]struct{}) (map[int64]int64, error) {
+	result := make(map[int64]int64)
+	for _, path := range files {
 		key := s3KeyFromURI(path)
 		data, err := s3Download(ctx, s3Client, cfg.Warehouse, key)
 		if err != nil {
@@ -306,75 +394,64 @@ func loadIcebergState(ctx context.Context, cfg config) (map[int64]icebergRow, er
 			log.Printf("  warning: failed to read data file %s: %v", path, err)
 			continue
 		}
-
 		for _, row := range rows {
-			totalRead++
 			id := toInt64(row["id"])
-
-			// Skip deleted rows.
 			if _, deleted := deleteSet[id]; deleted {
 				continue
 			}
-
 			seq := toInt64(row["seq"])
 			value := toInt64(row["value"])
-			// For duplicate IDs (from updates), keep the latest by overwriting.
-			result[seq] = icebergRow{Value: value}
+			result[seq] = value
 		}
 	}
-	log.Printf("  total parquet rows read: %d, after dedup+delete: %d", totalRead, len(result))
-
 	return result, nil
 }
 
 // --- Verification ---
 
-type verifyResult struct {
-	Pass           bool
-	TotalExpected  int
-	TotalActual    int
-	Missing        []int64 // seqs in expected but not in actual
-	Extra          []int64 // seqs in actual but not in expected
-	WrongValue     []int64 // seqs present in both but with wrong value
-	MissingSample  int     // how many missing seqs to print
-	ExtraSample    int
-	WrongSample    int
+type chunkResult struct {
+	TotalExpected int
+	TotalActual   int
+	Missing       []int64
+	Extra         []int64
+	WrongValue    []int64
 }
 
-func verify(expected map[int64]expectedRow, actual map[int64]icebergRow) verifyResult {
-	r := verifyResult{
+func verifyChunk(expected, actual map[int64]int64) chunkResult {
+	r := chunkResult{
 		TotalExpected: len(expected),
 		TotalActual:   len(actual),
-		MissingSample: 10,
-		ExtraSample:   10,
-		WrongSample:   10,
 	}
-
-	// Check for missing rows (in expected, not in actual).
 	for seq := range expected {
 		if _, ok := actual[seq]; !ok {
 			r.Missing = append(r.Missing, seq)
 		}
 	}
-
-	// Check for extra rows (in actual, not in expected).
 	for seq := range actual {
 		if _, ok := expected[seq]; !ok {
 			r.Extra = append(r.Extra, seq)
 		}
 	}
-
-	// Check for wrong values.
-	for seq, exp := range expected {
-		if act, ok := actual[seq]; ok {
-			if exp.Value != act.Value {
+	for seq, expVal := range expected {
+		if actVal, ok := actual[seq]; ok {
+			if expVal != actVal {
 				r.WrongValue = append(r.WrongValue, seq)
 			}
 		}
 	}
-
-	r.Pass = len(r.Missing) == 0 && len(r.Extra) == 0 && len(r.WrongValue) == 0
 	return r
+}
+
+type verifyResult struct {
+	Pass          bool
+	TotalExpected int
+	TotalActual   int
+	Missing       []int64
+	Extra         []int64
+	WrongValue    []int64
+	MissingSample int
+	ExtraSample   int
+	WrongSample   int
 }
 
 func printResult(r verifyResult) {
@@ -654,6 +731,3 @@ func toInt64(v any) int64 {
 		return 0
 	}
 }
-
-// Keep the compiler happy — we reference time in logging.
-var _ = time.Now
