@@ -1,6 +1,5 @@
 bin/
 pg2iceberg-state.json
 .claude
-state/
 .DS_Store
 pg2iceberg
