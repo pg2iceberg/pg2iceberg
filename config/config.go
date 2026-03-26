@@ -60,9 +60,15 @@ type QueryTableConfig struct {
 }
 
 type LogicalConfig struct {
-	PublicationName string   `yaml:"publication_name" json:"publication_name"`
-	SlotName        string   `yaml:"slot_name" json:"slot_name"`
-	Tables          []string `yaml:"tables" json:"tables"`
+	PublicationName string              `yaml:"publication_name" json:"publication_name"`
+	SlotName        string              `yaml:"slot_name" json:"slot_name"`
+	Tables          []LogicalTableConfig `yaml:"tables" json:"tables"`
+}
+
+// LogicalTableConfig describes a table tracked by logical replication.
+type LogicalTableConfig struct {
+	Name         string `yaml:"name" json:"name"`
+	SkipSnapshot bool   `yaml:"skip_snapshot" json:"skip_snapshot,omitempty"`
 }
 
 type SinkConfig struct {

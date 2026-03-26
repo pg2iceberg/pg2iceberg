@@ -22,7 +22,9 @@ source:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
     tables:
-      - public.orders
+      - name: public.orders
+      # - name: public.event_log
+      #   skip_snapshot: true    # skip initial snapshot, only stream WAL changes
 
 sink:
   catalog_uri: http://localhost:8181

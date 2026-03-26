@@ -181,7 +181,7 @@ source:
     publication_name: ${publication}
     slot_name: ${slot}
     tables:
-      - public.${table}
+      - name: public.${table}
 
 sink:
   catalog_uri: ${CATALOG_URI}
