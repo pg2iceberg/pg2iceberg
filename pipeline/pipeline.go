@@ -480,7 +480,11 @@ func getTables(cfg *config.Config) []string {
 		}
 		return tables
 	case "logical":
-		return cfg.Source.Logical.Tables
+		tables := make([]string, len(cfg.Source.Logical.Tables))
+		for i, t := range cfg.Source.Logical.Tables {
+			tables[i] = t.Name
+		}
+		return tables
 	default:
 		return nil
 	}

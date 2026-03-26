@@ -76,12 +76,12 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 	defer l.queryConn.Close(ctx)
 
 	// Discover schemas for configured tables.
-	for _, table := range l.cfg.Tables {
-		ts, err := schema.DiscoverSchema(ctx, l.queryConn, table)
+	for _, tc := range l.cfg.Tables {
+		ts, err := schema.DiscoverSchema(ctx, l.queryConn, tc.Name)
 		if err != nil {
-			return fmt.Errorf("discover schema for %s: %w", table, err)
+			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
-		l.tables[table] = ts
+		l.tables[tc.Name] = ts
 	}
 
 	// Validate publication exists.
@@ -366,7 +366,12 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string,
 		return fmt.Errorf("set transaction snapshot: %w", err)
 	}
 
-	for _, table := range l.cfg.Tables {
+	for _, tc := range l.cfg.Tables {
+		if tc.SkipSnapshot {
+			log.Printf("[logical] snapshot: skipping %s (skip_snapshot=true)", tc.Name)
+			continue
+		}
+		table := tc.Name
 		ts := l.tables[table]
 
 		rows, err := tx.Query(ctx, fmt.Sprintf("SELECT * FROM %s", table))
@@ -468,14 +473,14 @@ func (l *LogicalSource) Close() error {
 // the PG publication; this only controls which replicated events pg2iceberg processes.
 func (l *LogicalSource) AddTable(table string) {
 	if !l.isTracked(table) {
-		l.cfg.Tables = append(l.cfg.Tables, table)
+		l.cfg.Tables = append(l.cfg.Tables, config.LogicalTableConfig{Name: table})
 	}
 }
 
 // RemoveTable removes a table from the tracked set.
 func (l *LogicalSource) RemoveTable(table string) {
-	for i, t := range l.cfg.Tables {
-		if t == table {
+	for i, tc := range l.cfg.Tables {
+		if tc.Name == table {
 			l.cfg.Tables = append(l.cfg.Tables[:i], l.cfg.Tables[i+1:]...)
 			delete(l.tables, table)
 			return
@@ -484,8 +489,8 @@ func (l *LogicalSource) RemoveTable(table string) {
 }
 
 func (l *LogicalSource) isTracked(table string) bool {
-	for _, t := range l.cfg.Tables {
-		if t == table {
+	for _, tc := range l.cfg.Tables {
+		if tc.Name == table {
 			return true
 		}
 	}
