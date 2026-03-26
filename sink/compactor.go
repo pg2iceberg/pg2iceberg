@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 	pq "github.com/parquet-go/parquet-go"
 )
 

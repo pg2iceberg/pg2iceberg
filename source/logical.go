@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/linkedin/goavro/v2"
 )
 

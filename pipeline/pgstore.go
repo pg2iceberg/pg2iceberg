@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

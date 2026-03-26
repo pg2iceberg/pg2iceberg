@@ -11,8 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/pipeline"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
 )
 
 // Server is the multi-tenant HTTP API server.

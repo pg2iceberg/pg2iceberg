@@ -1,6 +1,6 @@
 package pipeline
 
-import "github.com/hasyimibhar/pg2iceberg/config"
+import "github.com/pg2iceberg/pg2iceberg/config"
 
 // PipelineStore persists pipeline configurations across restarts.
 type PipelineStore interface {

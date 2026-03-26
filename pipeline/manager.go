@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/config"
 )
 
 // PipelineInfo exposes the state of a pipeline for API consumers.

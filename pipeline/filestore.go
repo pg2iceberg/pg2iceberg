@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/config"
 	"gopkg.in/yaml.v3"
 )
 

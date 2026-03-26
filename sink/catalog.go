@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 )
 
 // CatalogClient interacts with the Iceberg REST catalog.

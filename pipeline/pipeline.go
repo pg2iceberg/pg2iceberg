@@ -7,11 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/schema"
-	"github.com/hasyimibhar/pg2iceberg/sink"
-	"github.com/hasyimibhar/pg2iceberg/source"
-	"github.com/hasyimibhar/pg2iceberg/state"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/sink"
+	"github.com/pg2iceberg/pg2iceberg/source"
+	"github.com/pg2iceberg/pg2iceberg/state"
 	"github.com/jackc/pgx/v5"
 )
 

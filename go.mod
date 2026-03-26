@@ -1,4 +1,4 @@
-module github.com/hasyimibhar/pg2iceberg
+module github.com/pg2iceberg/pg2iceberg
 
 go 1.25.0
 

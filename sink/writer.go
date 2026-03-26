@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/parquet-go/parquet-go"
 )
 

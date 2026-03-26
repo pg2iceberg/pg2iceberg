@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/jackc/pgx/v5"
 )
 

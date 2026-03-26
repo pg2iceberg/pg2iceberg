@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hasyimibhar/pg2iceberg/api"
-	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/pipeline"
+	"github.com/pg2iceberg/pg2iceberg/api"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
 )
 
 func main() {
