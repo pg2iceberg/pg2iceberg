@@ -233,13 +233,6 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		}
 	}
 
-	// Register consistency table if enabled.
-	if p.cfg.Sink.ConsistencyTable {
-		if err := p.snk.RegisterConsistencyTable(ctx); err != nil {
-			return fmt.Errorf("register consistency table: %w", err)
-		}
-	}
-
 	// Start compactor if configured.
 	compactionInterval := p.cfg.Sink.CompactionDuration()
 	if compactionInterval > 0 {

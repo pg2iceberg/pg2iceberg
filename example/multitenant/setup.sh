@@ -38,7 +38,6 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_region": "us-east-1",
       "flush_interval": "10s",
       "flush_rows": 1000,
-      "consistency_table": true
     }
   }
 }'
@@ -79,7 +78,6 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_region": "us-east-1",
       "flush_interval": "10s",
       "flush_rows": 1000,
-      "consistency_table": true
     }
   }
 }'
@@ -119,7 +117,6 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_region": "us-east-1",
       "flush_interval": "10s",
       "flush_rows": 1000,
-      "consistency_table": true
     }
   }
 }'
