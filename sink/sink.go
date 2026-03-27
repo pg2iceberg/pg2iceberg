@@ -187,7 +187,9 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		return fmt.Errorf("unregistered table: %s", pgTable)
 	}
 
-	// Apply diff to the in-memory schema.
+	// Apply diff to the in-memory schema, tracking whether anything
+	// actually changes at the Iceberg level.
+	icebergChanged := false
 	nextFieldID := ts.schema.MaxFieldID() + 1
 
 	// Add new columns (always nullable — safe default for evolution).
@@ -199,6 +201,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 			FieldID:    nextFieldID,
 		})
 		nextFieldID++
+		icebergChanged = true
 	}
 
 	// Drop columns — remove from active column list.
@@ -207,27 +210,39 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		for i, col := range ts.schema.Columns {
 			if col.Name == dropped {
 				ts.schema.Columns = append(ts.schema.Columns[:i], ts.schema.Columns[i+1:]...)
+				icebergChanged = true
 				break
 			}
 		}
 	}
 
-	// Type changes — update PGType in-place.
+	// Type changes — update PGType in-place. Only flag as changed if the
+	// Iceberg type actually differs (e.g. varchar→text both map to "string").
 	for _, tc := range change.TypeChanges {
 		for i, col := range ts.schema.Columns {
 			if col.Name == tc.Name {
+				oldIceberg := schema.IcebergType(col.PGType)
+				newIceberg := schema.IcebergType(tc.NewType)
 				ts.schema.Columns[i].PGType = tc.NewType
+				if oldIceberg != newIceberg {
+					icebergChanged = true
+				}
 				break
 			}
 		}
 	}
 
-	// Evolve the Iceberg table schema via the catalog.
-	newSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.icebergName, ts.schemaID, ts.schema)
-	if err != nil {
-		return fmt.Errorf("catalog evolve schema for %s: %w", pgTable, err)
+	// Only call the catalog if the Iceberg schema actually changed.
+	// Some PG type changes (e.g. varchar→text) are no-ops at the Iceberg level.
+	if icebergChanged {
+		newSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.icebergName, ts.schemaID, ts.schema)
+		if err != nil {
+			return fmt.Errorf("catalog evolve schema for %s: %w", pgTable, err)
+		}
+		ts.schemaID = newSchemaID
+	} else {
+		log.Printf("[sink] schema change for %s is a no-op at Iceberg level, skipping catalog evolution", pgTable)
 	}
-	ts.schemaID = newSchemaID
 
 	// Rebuild writers with the new schema. Since the caller flushed first,
 	// all writers should be empty.
@@ -239,7 +254,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		}
 	}
 
-	log.Printf("[sink] evolved schema for %s to schema-id %d", pgTable, newSchemaID)
+	log.Printf("[sink] evolved schema for %s to schema-id %d", pgTable, ts.schemaID)
 	return nil
 }
 
