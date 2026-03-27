@@ -172,16 +172,23 @@ func (rw *RollingWriter) rollover() error {
 	return nil
 }
 
-// FlushAll flushes any remaining rows and returns all file chunks.
+// FlushAll serializes any remaining rows into file chunks and returns all
+// completed chunks. This is non-destructive — calling FlushAll again without
+// an intervening Commit returns the same chunks. Call Commit after a
+// successful upload/commit to clear the buffer.
 func (rw *RollingWriter) FlushAll() ([]FileChunk, error) {
 	if rw.writer.Len() > 0 {
 		if err := rw.rollover(); err != nil {
 			return nil, err
 		}
 	}
-	chunks := rw.completed
+	return rw.completed, nil
+}
+
+// Commit clears all completed chunks. Call this after the data has been
+// successfully persisted (uploaded and committed to the catalog).
+func (rw *RollingWriter) Commit() {
 	rw.completed = nil
-	return chunks, nil
 }
 
 func (rw *RollingWriter) Len() int {
