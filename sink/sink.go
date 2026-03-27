@@ -13,6 +13,8 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/source"
+	"github.com/pg2iceberg/pg2iceberg/worker"
+	"golang.org/x/sync/errgroup"
 )
 
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
@@ -306,8 +308,9 @@ func (s *Sink) NotifyCompactionDone() {
 	}
 }
 
-// Flush writes all buffered data to Iceberg for each table.
+// Flush writes all buffered data to Iceberg for each table, flushing tables in parallel.
 func (s *Sink) Flush(ctx context.Context) error {
+	var tasks []worker.Task
 	for pgTable, ts := range s.tables {
 		hasData := false
 		for _, pw := range ts.partitions {
@@ -320,11 +323,38 @@ func (s *Sink) Flush(ctx context.Context) error {
 			continue
 		}
 
-		if err := s.flushTable(ctx, pgTable, ts); err != nil {
-			return fmt.Errorf("flush %s: %w", pgTable, err)
-		}
+		pgTable, ts := pgTable, ts // capture loop vars
+		tasks = append(tasks, worker.Task{
+			Name: pgTable,
+			Fn: func(ctx context.Context, progress *worker.Progress) error {
+				return s.flushTable(ctx, pgTable, ts)
+			},
+		})
 	}
-	return nil
+
+	if len(tasks) == 0 {
+		return nil
+	}
+
+	pool := worker.NewPool(len(tasks))
+	_, err := pool.Run(ctx, tasks)
+	return err
+}
+
+// pendingUpload holds the data needed to upload a single Parquet file to S3.
+type pendingUpload struct {
+	key             string
+	data            []byte
+	content         int // 0=data, 2=equality delete
+	recordCount     int64
+	equalityFieldIDs []int
+	partitionValues map[string]any
+}
+
+// uploadResult holds the outcome of a completed upload.
+type uploadResult struct {
+	uri string
+	pendingUpload
 }
 
 func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) error {
@@ -339,78 +369,100 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 	snapshotID := now.UnixMilli()
 	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
 
-	var dataFiles []DataFileInfo
-	var deleteFiles []DataFileInfo
-	var manifestInfos []ManifestFileInfo
-
-	// Flush all partitions.
+	// 1. Flush all partitions to Parquet bytes and collect upload tasks.
+	var uploads []pendingUpload
 	for _, pw := range ts.partitions {
 		partPath := ""
 		if ts.partSpec != nil {
 			partPath = ts.partSpec.PartitionPath(pw.partValues)
 		}
 
-		// Compute Avro partition values for manifest entries.
 		avroPartValues := map[string]any{}
 		if ts.partSpec != nil && pw.partValues != nil {
 			avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
 		}
 
-		// 1. Flush and upload data files
 		dataChunks, err := pw.dataWriter.FlushAll()
 		if err != nil {
 			return fmt.Errorf("flush data: %w", err)
 		}
 		for i, chunk := range dataChunks {
 			fileUUID := uuid.New().String()
-			var dataKey string
+			var key string
 			if partPath != "" {
-				dataKey = fmt.Sprintf("%s/data/%s/%s-data-%d.parquet", basePath, partPath, fileUUID, i)
+				key = fmt.Sprintf("%s/data/%s/%s-data-%d.parquet", basePath, partPath, fileUUID, i)
 			} else {
-				dataKey = fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
+				key = fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
 			}
-			dataURI, err := s.s3.Upload(ctx, dataKey, chunk.Data)
-			if err != nil {
-				return fmt.Errorf("upload data: %w", err)
-			}
-			dataFiles = append(dataFiles, DataFileInfo{
-				Path:            dataURI,
-				FileSizeBytes:   int64(len(chunk.Data)),
-				RecordCount:     chunk.RowCount,
-				Content:         0, // data
-				PartitionValues: avroPartValues,
+			uploads = append(uploads, pendingUpload{
+				key:             key,
+				data:            chunk.Data,
+				content:         0,
+				recordCount:     chunk.RowCount,
+				partitionValues: avroPartValues,
 			})
 		}
 
-		// 2. Flush and upload equality delete files
 		delChunks, err := pw.delWriter.FlushAll()
 		if err != nil {
 			return fmt.Errorf("flush deletes: %w", err)
 		}
 		for i, chunk := range delChunks {
 			fileUUID := uuid.New().String()
-			var delKey string
+			var key string
 			if partPath != "" {
-				delKey = fmt.Sprintf("%s/data/%s/%s-deletes-%d.parquet", basePath, partPath, fileUUID, i)
+				key = fmt.Sprintf("%s/data/%s/%s-deletes-%d.parquet", basePath, partPath, fileUUID, i)
 			} else {
-				delKey = fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
+				key = fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
 			}
-			delURI, err := s.s3.Upload(ctx, delKey, chunk.Data)
-			if err != nil {
-				return fmt.Errorf("upload deletes: %w", err)
-			}
-			deleteFiles = append(deleteFiles, DataFileInfo{
-				Path:             delURI,
-				FileSizeBytes:    int64(len(chunk.Data)),
-				RecordCount:      chunk.RowCount,
-				Content:          2, // equality deletes
-				EqualityFieldIDs: ts.schema.PKFieldIDs(),
-				PartitionValues:  avroPartValues,
+			uploads = append(uploads, pendingUpload{
+				key:              key,
+				data:             chunk.Data,
+				content:          2,
+				recordCount:      chunk.RowCount,
+				equalityFieldIDs: ts.schema.PKFieldIDs(),
+				partitionValues:  avroPartValues,
 			})
 		}
 	}
 
-	// 3. Load current table metadata to get existing manifests
+	// 2. Upload all Parquet files to S3 in parallel.
+	results := make([]uploadResult, len(uploads))
+	g, gctx := errgroup.WithContext(ctx)
+	for i, u := range uploads {
+		i, u := i, u
+		g.Go(func() error {
+			uri, err := s.s3.Upload(gctx, u.key, u.data)
+			if err != nil {
+				return fmt.Errorf("upload %s: %w", u.key, err)
+			}
+			results[i] = uploadResult{uri: uri, pendingUpload: u}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Separate uploaded files into data and delete lists.
+	var dataFiles, deleteFiles []DataFileInfo
+	for _, r := range results {
+		fi := DataFileInfo{
+			Path:            r.uri,
+			FileSizeBytes:   int64(len(r.data)),
+			RecordCount:     r.recordCount,
+			Content:         r.content,
+			PartitionValues: r.partitionValues,
+		}
+		if r.content == 2 {
+			fi.EqualityFieldIDs = r.equalityFieldIDs
+			deleteFiles = append(deleteFiles, fi)
+		} else {
+			dataFiles = append(dataFiles, fi)
+		}
+	}
+
+	// 3. Load current table metadata to get existing manifests.
 	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
 	if err != nil {
 		return fmt.Errorf("load table: %w", err)
@@ -434,7 +486,8 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		}
 	}
 
-	// 4. Write data manifest (if we have data files)
+	// 4. Write data manifest (if we have data files).
+	var manifestInfos []ManifestFileInfo
 	if len(dataFiles) > 0 {
 		entries := make([]ManifestEntry, len(dataFiles))
 		for i, df := range dataFiles {
@@ -470,7 +523,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		})
 	}
 
-	// 5. Write delete manifest (if we have delete files)
+	// 5. Write delete manifest (if we have delete files).
 	if len(deleteFiles) > 0 {
 		entries := make([]ManifestEntry, len(deleteFiles))
 		for i, df := range deleteFiles {
@@ -506,7 +559,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		})
 	}
 
-	// 6. Write manifest list (existing + new manifests)
+	// 6. Write manifest list (existing + new manifests).
 	allManifests := append(existingManifests, manifestInfos...)
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
@@ -519,7 +572,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		return fmt.Errorf("upload manifest list: %w", err)
 	}
 
-	// 7. Commit snapshot
+	// 7. Commit snapshot.
 	operation := "append"
 	if len(deleteFiles) > 0 {
 		operation = "overwrite"
@@ -550,6 +603,13 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 
 	log.Printf("[sink] committed snapshot %d for %s (seq=%d, data_rows=%d, delete_rows=%d, data_files=%d, delete_files=%d)",
 		snapshotID, pgTable, seqNum, dataCount, delCount, len(dataFiles), len(deleteFiles))
+
+	// Commit writers only after successful catalog commit so that a
+	// retry after a transient failure re-uploads the same data.
+	for _, pw := range ts.partitions {
+		pw.dataWriter.Commit()
+		pw.delWriter.Commit()
+	}
 
 	ts.totalRows = 0
 	ts.toastPending = nil
