@@ -219,6 +219,94 @@ type SnapshotCommit struct {
 	Summary          map[string]string
 }
 
+// TableCommit holds the data needed to commit a snapshot for one table
+// within a multi-table transaction.
+type TableCommit struct {
+	Table             string
+	CurrentSnapshotID int64
+	Snapshot          SnapshotCommit
+}
+
+// CommitTransaction atomically commits snapshots to multiple tables using
+// the Iceberg REST catalog's multi-table transaction endpoint.
+func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+
+	// Single table — use the normal commit path.
+	if len(commits) == 1 {
+		tc := commits[0]
+		return c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot)
+	}
+
+	var tableChanges []map[string]any
+	for _, tc := range commits {
+		var requirements []map[string]any
+		if tc.CurrentSnapshotID <= 0 {
+			requirements = []map[string]any{
+				{
+					"type":        "assert-ref-snapshot-id",
+					"ref":         "main",
+					"snapshot-id": nil,
+				},
+			}
+		} else {
+			requirements = []map[string]any{
+				{
+					"type":        "assert-ref-snapshot-id",
+					"ref":         "main",
+					"snapshot-id": tc.CurrentSnapshotID,
+				},
+			}
+		}
+
+		updates := []map[string]any{
+			{
+				"action": "add-snapshot",
+				"snapshot": map[string]any{
+					"snapshot-id":      tc.Snapshot.SnapshotID,
+					"timestamp-ms":    tc.Snapshot.TimestampMs,
+					"manifest-list":   tc.Snapshot.ManifestListPath,
+					"summary":         tc.Snapshot.Summary,
+					"schema-id":       0,
+					"sequence-number": tc.Snapshot.SequenceNumber,
+				},
+			},
+			{
+				"action":      "set-snapshot-ref",
+				"ref-name":    "main",
+				"type":        "branch",
+				"snapshot-id": tc.Snapshot.SnapshotID,
+			},
+		}
+
+		tableChanges = append(tableChanges, map[string]any{
+			"identifier": map[string]any{
+				"namespace": []string{ns},
+				"name":      tc.Table,
+			},
+			"requirements": requirements,
+			"updates":      updates,
+		})
+	}
+
+	body := map[string]any{
+		"table-changes": tableChanges,
+	}
+
+	resp, err := c.post("/v1/transactions/commit", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		return c.readError(resp)
+	}
+	return nil
+}
+
 func (c *CatalogClient) get(path string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", c.baseURL+path, nil)
 	if err != nil {

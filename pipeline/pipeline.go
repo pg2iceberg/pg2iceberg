@@ -342,6 +342,14 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 
+			// Pass Begin/Commit through to sink for transaction tracking.
+			if event.Operation == source.OpBegin || event.Operation == source.OpCommit {
+				if err := p.snk.Write(event); err != nil {
+					log.Printf("[pipeline:%s] write error: %v", p.id, err)
+				}
+				continue
+			}
+
 			if err := p.snk.Write(event); err != nil {
 				log.Printf("[pipeline:%s] write error: %v", p.id, err)
 				continue
