@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -37,22 +38,27 @@ func main() {
 		cancel()
 	}()
 
+	var err error
 	if *serverMode {
-		runServer(ctx, *listenAddr, *storeDSN, *storeDir)
+		err = runServer(ctx, *listenAddr, *storeDSN, *storeDir)
 	} else {
-		runSingle(ctx, *configPath)
+		err = runSingle(ctx, *configPath)
+	}
+	if err != nil {
+		log.Printf("fatal: %v", err)
+		os.Exit(1)
 	}
 }
 
-func runSingle(ctx context.Context, configPath string) {
+func runSingle(ctx context.Context, configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	p := pipeline.NewPipeline("default", cfg)
 	if err := p.Start(ctx); err != nil {
-		log.Fatalf("fatal: %v", err)
+		return err
 	}
 
 	// Start a lightweight metrics server.
@@ -64,8 +70,9 @@ func runSingle(ctx context.Context, configPath string) {
 
 	<-p.Done()
 	if status, err := p.Status(); status == pipeline.StatusError && err != nil {
-		log.Fatalf("fatal: %v", err)
+		return err
 	}
+	return nil
 }
 
 func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) {
@@ -92,13 +99,13 @@ func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) 
 	}()
 }
 
-func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) {
+func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) error {
 	var store pipeline.PipelineStore
 
 	if storeDSN != "" {
 		pgStore, err := pipeline.NewPgStore(ctx, storeDSN)
 		if err != nil {
-			log.Fatalf("connect to pipeline store: %v", err)
+			return fmt.Errorf("connect to pipeline store: %w", err)
 		}
 		defer pgStore.Close()
 		store = pgStore
@@ -111,7 +118,7 @@ func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) {
 	mgr := pipeline.NewManager(ctx, store)
 
 	if err := mgr.RestoreAll(); err != nil {
-		log.Fatalf("restore pipelines: %v", err)
+		return fmt.Errorf("restore pipelines: %w", err)
 	}
 
 	srv := api.NewServer(mgr, listenAddr)
@@ -121,7 +128,5 @@ func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) {
 		mgr.StopAll()
 	}()
 
-	if err := srv.Run(ctx); err != nil {
-		log.Fatalf("server error: %v", err)
-	}
+	return srv.Run(ctx)
 }
