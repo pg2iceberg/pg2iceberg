@@ -13,7 +13,6 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/source"
-	"github.com/pg2iceberg/pg2iceberg/state"
 )
 
 // Status represents the current state of a Pipeline.
@@ -50,7 +49,7 @@ type Pipeline struct {
 
 	src     source.Source
 	snk     *sink.Sink
-	store   state.CheckpointStore
+	store   CheckpointStore
 	schemas map[string]*schema.TableSchema
 
 	startedAt     time.Time
@@ -83,7 +82,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 
 // NewPipeline creates a Pipeline but does not start it.
 // The sink and checkpoint store must be created by the caller.
-func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store state.CheckpointStore) *Pipeline {
+func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:     id,
 		cfg:    cfg,
@@ -720,10 +719,10 @@ func (p *Pipeline) monitorWALLag(ctx context.Context) {
 
 // NewCheckpointStore creates a CheckpointStore from config. It uses a file store
 // if a path is configured, otherwise falls back to Postgres.
-func NewCheckpointStore(ctx context.Context, cfg *config.Config) (state.CheckpointStore, error) {
+func NewCheckpointStore(ctx context.Context, cfg *config.Config) (CheckpointStore, error) {
 	// Explicit file path: use file store (local dev).
 	if cfg.State.Path != "" {
-		return state.NewFileStore(cfg.State.Path), nil
+		return NewFileCheckpointStore(cfg.State.Path), nil
 	}
 
 	// Explicit postgres URL, or fall back to source postgres.
@@ -731,6 +730,6 @@ func NewCheckpointStore(ctx context.Context, cfg *config.Config) (state.Checkpoi
 	if url == "" {
 		url = cfg.Source.Postgres.DSN()
 	}
-	return state.NewPgStore(ctx, url)
+	return NewPgCheckpointStore(ctx, url)
 }
 

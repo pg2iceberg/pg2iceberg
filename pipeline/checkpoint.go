@@ -1,4 +1,4 @@
-package state
+package pipeline
 
 import (
 	"encoding/json"
@@ -46,17 +46,17 @@ type CheckpointStore interface {
 	Close()
 }
 
-// FileStore persists checkpoints to a local JSON file.
-type FileStore struct {
+// FileCheckpointStore persists checkpoints to a local JSON file.
+type FileCheckpointStore struct {
 	path string
 }
 
-func NewFileStore(path string) *FileStore {
-	return &FileStore{path: path}
+func NewFileCheckpointStore(path string) *FileCheckpointStore {
+	return &FileCheckpointStore{path: path}
 }
 
 // Load reads the checkpoint from disk. Returns a zero Checkpoint if the file doesn't exist.
-func (s *FileStore) Load(pipelineID string) (*Checkpoint, error) {
+func (s *FileCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
 		return &Checkpoint{}, nil
@@ -73,7 +73,7 @@ func (s *FileStore) Load(pipelineID string) (*Checkpoint, error) {
 }
 
 // Save writes the checkpoint to disk atomically (write tmp + rename).
-func (s *FileStore) Save(pipelineID string, cp *Checkpoint) error {
+func (s *FileCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	cp.UpdatedAt = time.Now()
 
 	data, err := json.MarshalIndent(cp, "", "  ")
@@ -105,19 +105,19 @@ func (s *FileStore) Save(pipelineID string, cp *Checkpoint) error {
 	return nil
 }
 
-// Close is a no-op for FileStore.
-func (s *FileStore) Close() {}
+// Close is a no-op for FileCheckpointStore.
+func (s *FileCheckpointStore) Close() {}
 
-// MemStore is an in-memory CheckpointStore for testing.
-type MemStore struct {
+// MemCheckpointStore is an in-memory CheckpointStore for testing.
+type MemCheckpointStore struct {
 	checkpoints map[string]*Checkpoint
 }
 
-func NewMemStore() *MemStore {
-	return &MemStore{checkpoints: make(map[string]*Checkpoint)}
+func NewMemCheckpointStore() *MemCheckpointStore {
+	return &MemCheckpointStore{checkpoints: make(map[string]*Checkpoint)}
 }
 
-func (s *MemStore) Load(pipelineID string) (*Checkpoint, error) {
+func (s *MemCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	cp, ok := s.checkpoints[pipelineID]
 	if !ok {
 		return &Checkpoint{}, nil
@@ -125,10 +125,10 @@ func (s *MemStore) Load(pipelineID string) (*Checkpoint, error) {
 	return cp, nil
 }
 
-func (s *MemStore) Save(pipelineID string, cp *Checkpoint) error {
+func (s *MemCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	cp.UpdatedAt = time.Now()
 	s.checkpoints[pipelineID] = cp
 	return nil
 }
 
-func (s *MemStore) Close() {}
+func (s *MemCheckpointStore) Close() {}

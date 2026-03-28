@@ -1,6 +1,6 @@
 //go:build integration
 
-package source_test
+package pipeline_test
 
 import (
 	"context"
@@ -16,7 +16,6 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/source"
-	"github.com/pg2iceberg/pg2iceberg/state"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
@@ -83,7 +82,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 
 	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
 
-	p := pipeline.NewPipeline("test", cfg, snk, state.NewMemStore())
+	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
