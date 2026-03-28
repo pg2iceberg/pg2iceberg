@@ -40,7 +40,7 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 			// Compute partition key from the row to narrow file scan.
 			partKey := ""
 			if ts.partSpec != nil && !ts.partSpec.IsUnpartitioned() {
-				partKey, _ = ts.partSpec.PartitionKey(p.row, ts.schema)
+				partKey = ts.partSpec.PartitionKey(p.row, ts.schema)
 			}
 			info = &pendingInfo{partitionKey: partKey}
 			pendingByPK[pkKey] = info
@@ -165,8 +165,8 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 				resolved++
 			}
 
-			// Cache for future lookups.
-			ts.rowCache[pkKey] = copyRow(row)
+			// Cache for future lookups. row is uniquely owned (from readParquetRows).
+			ts.rowCache[pkKey] = row
 
 			delete(pendingByPK, pkKey)
 		}
@@ -208,9 +208,15 @@ func partitionKeyFromAvroValues(avroValues map[string]any, partSpec *PartitionSp
 // buildPKKey creates a unique key for a row based on its PK columns.
 // Uses null byte as separator to avoid collisions.
 func buildPKKey(row map[string]any, pk []string) string {
-	parts := make([]string, len(pk))
-	for i, col := range pk {
-		parts[i] = fmt.Sprintf("%v", row[col])
+	if len(pk) == 1 {
+		return fmt.Sprintf("%v", row[pk[0]])
 	}
-	return strings.Join(parts, "\x00")
+	var b strings.Builder
+	for i, col := range pk {
+		if i > 0 {
+			b.WriteByte(0)
+		}
+		fmt.Fprintf(&b, "%v", row[col])
+	}
+	return b.String()
 }

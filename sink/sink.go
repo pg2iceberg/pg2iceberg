@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -281,13 +282,13 @@ func (ts *tableSink) getPartitionWriter(row map[string]any) *partitionedWriter {
 		return ts.partitions[""]
 	}
 
-	key, values := ts.partSpec.PartitionKey(row, ts.schema)
+	key := ts.partSpec.PartitionKey(row, ts.schema)
 	pw, ok := ts.partitions[key]
 	if !ok {
 		pw = &partitionedWriter{
 			dataWriter: NewRollingDataWriter(ts.schema, ts.targetSize),
 			delWriter:  NewRollingDeleteWriter(ts.schema, ts.targetSize),
-			partValues: values,
+			partValues: ts.partSpec.PartitionValues(row, ts.schema),
 		}
 		ts.partitions[key] = pw
 	}
@@ -347,7 +348,7 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 			ts.totalRows++
 			// Cache the full row for future TOAST resolution.
 			pkKey := buildPKKey(event.After, event.PK)
-			ts.rowCache[pkKey] = copyRow(event.After)
+			ts.rowCache[pkKey] = event.After
 		}
 	case source.OpUpdate:
 		// Equality delete for old row (routed by old row's partition).
@@ -387,7 +388,7 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 			} else {
 				// Cache the now-complete row.
 				pkKey := buildPKKey(event.After, event.PK)
-				ts.rowCache[pkKey] = copyRow(event.After)
+				ts.rowCache[pkKey] = event.After
 			}
 		}
 	case source.OpDelete:
@@ -403,6 +404,13 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 		}
 	}
 	return nil
+}
+
+// releaseRowCache returns all row maps in the cache to the source pool.
+func releaseRowCache(cache map[string]map[string]any) {
+	for _, row := range cache {
+		source.ReleaseRow(row)
+	}
 }
 
 // ShouldFlush checks if there are committed transactions ready to flush.
@@ -499,6 +507,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 			pw.delWriter.DiscardCompleted()
 		}
 		ts.toastPending = nil
+		releaseRowCache(ts.rowCache)
 		ts.rowCache = make(map[string]map[string]any)
 	}
 
@@ -530,13 +539,16 @@ type preparedFlush struct {
 	commit     SnapshotCommit
 }
 
-// flushAllTables uploads data for all tables in parallel, then commits all
-// tables atomically via a single multi-table catalog transaction.
+// flushAllTables serializes, uploads, and commits data for all tables.
+// Parquet serialization and S3 uploads are parallelized across all partitions
+// of all tables using a single worker pool, then each table's metadata is
+// assembled and committed atomically.
 func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
-	var tablesToFlush []struct {
+	type tableInfo struct {
 		pgTable string
 		ts      *tableSink
 	}
+	var tablesToFlush []tableInfo
 	for pgTable, ts := range s.tables {
 		hasData := false
 		for _, pw := range ts.partitions {
@@ -548,40 +560,89 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		if !hasData {
 			continue
 		}
-		tablesToFlush = append(tablesToFlush, struct {
-			pgTable string
-			ts      *tableSink
-		}{pgTable, ts})
+		tablesToFlush = append(tablesToFlush, tableInfo{pgTable, ts})
 	}
 
 	if len(tablesToFlush) == 0 {
 		return nil, nil
 	}
 
-	// Phase 1: Prepare all tables in parallel (serialize + upload to S3).
-	prepared := make([]*preparedFlush, len(tablesToFlush))
-	var tasks []worker.Task
-	for i, t := range tablesToFlush {
-		i, t := i, t
-		tasks = append(tasks, worker.Task{
-			Name: t.pgTable,
-			Fn: func(ctx context.Context, progress *worker.Progress) error {
-				pf, err := s.prepareTableFlush(ctx, t.pgTable, t.ts)
-				if err != nil {
-					return err
-				}
-				prepared[i] = pf
-				return nil
-			},
-		})
+	// Phase 0: Resolve TOAST for all tables (must happen before serialization).
+	for _, t := range tablesToFlush {
+		if len(t.ts.toastPending) > 0 {
+			if err := s.resolveToast(ctx, t.pgTable, t.ts); err != nil {
+				return nil, fmt.Errorf("resolve TOAST for %s: %w", t.pgTable, err)
+			}
+		}
 	}
 
-	pool := worker.NewPool(len(tasks))
+	// Phase 1: Serialize all partitions to Parquet + upload to S3 in parallel.
+	// Each task handles one partition (serialize parquet, then upload).
+	var mu sync.Mutex
+	partResults := make(map[string][]uploadResult)
+
+	var tasks []worker.Task
+	for _, t := range tablesToFlush {
+		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.icebergName)
+		for _, pw := range t.ts.partitions {
+			pw := pw
+			pgTable := t.pgTable
+			ts := t.ts
+
+			partPath := ""
+			if ts.partSpec != nil {
+				partPath = ts.partSpec.PartitionPath(pw.partValues)
+			}
+			avroPartValues := map[string]any{}
+			if ts.partSpec != nil && pw.partValues != nil {
+				avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
+			}
+
+			taskName := pgTable
+			if partPath != "" {
+				taskName = fmt.Sprintf("%s/%s", pgTable, partPath)
+			}
+
+			tasks = append(tasks, worker.Task{
+				Name: taskName,
+				Fn: func(ctx context.Context, progress *worker.Progress) error {
+					uploads, err := serializePartition(pw, ts, basePath, partPath, avroPartValues)
+					if err != nil {
+						return err
+					}
+					results, err := s.uploadFiles(ctx, uploads)
+					if err != nil {
+						return err
+					}
+					mu.Lock()
+					partResults[pgTable] = append(partResults[pgTable], results...)
+					mu.Unlock()
+					return nil
+				},
+			})
+		}
+	}
+
+	concurrency := runtime.NumCPU()
+	if len(tasks) < concurrency {
+		concurrency = len(tasks)
+	}
+	pool := worker.NewPool(concurrency)
 	if _, err := pool.Run(ctx, tasks); err != nil {
 		return nil, err
 	}
 
-	// Phase 2: Commit all tables atomically in a single catalog transaction.
+	// Phase 2: Assemble metadata and commit all tables.
+	prepared := make([]*preparedFlush, 0, len(tablesToFlush))
+	for _, t := range tablesToFlush {
+		results := partResults[t.pgTable]
+		pf, err := s.assembleTableCommit(ctx, t.pgTable, t.ts, results)
+		if err != nil {
+			return nil, err
+		}
+		prepared = append(prepared, pf)
+	}
+
 	tableCommits := make([]TableCommit, len(prepared))
 	for i, pf := range prepared {
 		tableCommits[i] = TableCommit{
@@ -605,6 +666,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		}
 		pf.ts.totalRows = 0
 		pf.ts.toastPending = nil
+		releaseRowCache(pf.ts.rowCache)
 		pf.ts.rowCache = make(map[string]map[string]any)
 		if !pf.ts.partSpec.IsUnpartitioned() {
 			for key := range pf.ts.partitions {
@@ -614,6 +676,122 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	}
 
 	return snapshotIDs, nil
+}
+
+// prepareTableFlush serializes, uploads, and assembles metadata for a single
+// table. Used by the single-table flush path (flushTable).
+func (s *Sink) prepareTableFlush(ctx context.Context, pgTable string, ts *tableSink) (*preparedFlush, error) {
+	if len(ts.toastPending) > 0 {
+		if err := s.resolveToast(ctx, pgTable, ts); err != nil {
+			return nil, fmt.Errorf("resolve TOAST: %w", err)
+		}
+	}
+
+	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
+	results, err := s.serializeAndUploadPartitions(ctx, pgTable, ts, basePath)
+	if err != nil {
+		return nil, err
+	}
+	return s.assembleTableCommit(ctx, pgTable, ts, results)
+}
+
+// serializeAndUploadPartitions serializes all partitions to parquet and uploads
+// them to S3. Returns the upload results for all files.
+func (s *Sink) serializeAndUploadPartitions(ctx context.Context, pgTable string, ts *tableSink, basePath string) ([]uploadResult, error) {
+	var allResults []uploadResult
+	for _, pw := range ts.partitions {
+		partPath := ""
+		if ts.partSpec != nil {
+			partPath = ts.partSpec.PartitionPath(pw.partValues)
+		}
+		avroPartValues := map[string]any{}
+		if ts.partSpec != nil && pw.partValues != nil {
+			avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
+		}
+
+		uploads, err := serializePartition(pw, ts, basePath, partPath, avroPartValues)
+		if err != nil {
+			return nil, err
+		}
+
+		results, err := s.uploadFiles(ctx, uploads)
+		if err != nil {
+			return nil, err
+		}
+		allResults = append(allResults, results...)
+	}
+	return allResults, nil
+}
+
+// serializePartition flushes a single partition writer to parquet bytes.
+func serializePartition(pw *partitionedWriter, ts *tableSink, basePath, partPath string, avroPartValues map[string]any) ([]pendingUpload, error) {
+	var uploads []pendingUpload
+
+	dataChunks, err := pw.dataWriter.FlushAll()
+	if err != nil {
+		return nil, fmt.Errorf("flush data: %w", err)
+	}
+	for i, chunk := range dataChunks {
+		fileUUID := uuid.New().String()
+		var key string
+		if partPath != "" {
+			key = fmt.Sprintf("%s/data/%s/%s-data-%d.parquet", basePath, partPath, fileUUID, i)
+		} else {
+			key = fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
+		}
+		uploads = append(uploads, pendingUpload{
+			key:             key,
+			data:            chunk.Data,
+			content:         0,
+			recordCount:     chunk.RowCount,
+			partitionValues: avroPartValues,
+		})
+	}
+
+	delChunks, err := pw.delWriter.FlushAll()
+	if err != nil {
+		return nil, fmt.Errorf("flush deletes: %w", err)
+	}
+	for i, chunk := range delChunks {
+		fileUUID := uuid.New().String()
+		var key string
+		if partPath != "" {
+			key = fmt.Sprintf("%s/data/%s/%s-deletes-%d.parquet", basePath, partPath, fileUUID, i)
+		} else {
+			key = fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
+		}
+		uploads = append(uploads, pendingUpload{
+			key:              key,
+			data:             chunk.Data,
+			content:          2,
+			recordCount:      chunk.RowCount,
+			equalityFieldIDs: ts.schema.PKFieldIDs(),
+			partitionValues:  avroPartValues,
+		})
+	}
+
+	return uploads, nil
+}
+
+// uploadFiles uploads a batch of pending files to S3 in parallel.
+func (s *Sink) uploadFiles(ctx context.Context, uploads []pendingUpload) ([]uploadResult, error) {
+	results := make([]uploadResult, len(uploads))
+	g, gctx := errgroup.WithContext(ctx)
+	for i, u := range uploads {
+		i, u := i, u
+		g.Go(func() error {
+			uri, err := s.s3.Upload(gctx, u.key, u.data)
+			if err != nil {
+				return fmt.Errorf("upload %s: %w", u.key, err)
+			}
+			results[i] = uploadResult{uri: uri, pendingUpload: u}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // pendingUpload holds the data needed to upload a single Parquet file to S3.
@@ -632,94 +810,12 @@ type uploadResult struct {
 	pendingUpload
 }
 
-// prepareTableFlush does all S3 work for a table (serialize, upload parquet,
-// write manifests) and returns a preparedFlush ready for catalog commit.
-func (s *Sink) prepareTableFlush(ctx context.Context, pgTable string, ts *tableSink) (*preparedFlush, error) {
-	// Resolve any unchanged TOAST columns before serializing to Parquet.
-	if len(ts.toastPending) > 0 {
-		if err := s.resolveToast(ctx, pgTable, ts); err != nil {
-			return nil, fmt.Errorf("resolve TOAST: %w", err)
-		}
-	}
-
+// assembleTableCommit takes already-uploaded file results and builds the
+// manifests, manifest list, and snapshot commit for a single table.
+func (s *Sink) assembleTableCommit(ctx context.Context, pgTable string, ts *tableSink, results []uploadResult) (*preparedFlush, error) {
 	now := time.Now()
 	snapshotID := now.UnixMilli()
 	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
-
-	// 1. Flush all partitions to Parquet bytes and collect upload tasks.
-	var uploads []pendingUpload
-	for _, pw := range ts.partitions {
-		partPath := ""
-		if ts.partSpec != nil {
-			partPath = ts.partSpec.PartitionPath(pw.partValues)
-		}
-
-		avroPartValues := map[string]any{}
-		if ts.partSpec != nil && pw.partValues != nil {
-			avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
-		}
-
-		dataChunks, err := pw.dataWriter.FlushAll()
-		if err != nil {
-			return nil, fmt.Errorf("flush data: %w", err)
-		}
-		for i, chunk := range dataChunks {
-			fileUUID := uuid.New().String()
-			var key string
-			if partPath != "" {
-				key = fmt.Sprintf("%s/data/%s/%s-data-%d.parquet", basePath, partPath, fileUUID, i)
-			} else {
-				key = fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
-			}
-			uploads = append(uploads, pendingUpload{
-				key:             key,
-				data:            chunk.Data,
-				content:         0,
-				recordCount:     chunk.RowCount,
-				partitionValues: avroPartValues,
-			})
-		}
-
-		delChunks, err := pw.delWriter.FlushAll()
-		if err != nil {
-			return nil, fmt.Errorf("flush deletes: %w", err)
-		}
-		for i, chunk := range delChunks {
-			fileUUID := uuid.New().String()
-			var key string
-			if partPath != "" {
-				key = fmt.Sprintf("%s/data/%s/%s-deletes-%d.parquet", basePath, partPath, fileUUID, i)
-			} else {
-				key = fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
-			}
-			uploads = append(uploads, pendingUpload{
-				key:              key,
-				data:             chunk.Data,
-				content:          2,
-				recordCount:      chunk.RowCount,
-				equalityFieldIDs: ts.schema.PKFieldIDs(),
-				partitionValues:  avroPartValues,
-			})
-		}
-	}
-
-	// 2. Upload all Parquet files to S3 in parallel.
-	results := make([]uploadResult, len(uploads))
-	g, gctx := errgroup.WithContext(ctx)
-	for i, u := range uploads {
-		i, u := i, u
-		g.Go(func() error {
-			uri, err := s.s3.Upload(gctx, u.key, u.data)
-			if err != nil {
-				return fmt.Errorf("upload %s: %w", u.key, err)
-			}
-			results[i] = uploadResult{uri: uri, pendingUpload: u}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
 
 	// Separate uploaded files into data and delete lists.
 	var dataFiles, deleteFiles []DataFileInfo
@@ -739,7 +835,7 @@ func (s *Sink) prepareTableFlush(ctx context.Context, pgTable string, ts *tableS
 		}
 	}
 
-	// 3. Load current table metadata to get existing manifests.
+	// Load current table metadata to get existing manifests.
 	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load table: %w", err)
@@ -903,6 +999,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) (i
 	}
 	ts.totalRows = 0
 	ts.toastPending = nil
+	releaseRowCache(ts.rowCache)
 	ts.rowCache = make(map[string]map[string]any)
 	if !ts.partSpec.IsUnpartitioned() {
 		for key := range ts.partitions {
@@ -919,15 +1016,6 @@ func extractPK(row map[string]any, pk []string) map[string]any {
 		result[col] = row[col]
 	}
 	return result
-}
-
-// copyRow creates a shallow copy of a row map.
-func copyRow(row map[string]any) map[string]any {
-	cp := make(map[string]any, len(row))
-	for k, v := range row {
-		cp[k] = v
-	}
-	return cp
 }
 
 // pgTableToIceberg converts "public.orders" to "orders" for the Iceberg table name.
