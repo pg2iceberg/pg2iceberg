@@ -52,10 +52,11 @@ type Pipeline struct {
 	store   CheckpointStore
 	schemas map[string]*schema.TableSchema
 
-	startedAt     time.Time
-	lastFlushAt   time.Time
+	startedAt      time.Time
+	lastFlushAt    time.Time
 	rowsProcessed  int64
 	bytesProcessed int64
+	lastWrittenLSN uint64 // LSN of the last event written to sink
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -405,12 +406,18 @@ func (p *Pipeline) run(ctx context.Context) {
 				if err := p.snk.Write(event); err != nil {
 					log.Printf("[pipeline:%s] write error: %v", p.id, err)
 				}
+				if event.LSN > p.lastWrittenLSN {
+					p.lastWrittenLSN = event.LSN
+				}
 				continue
 			}
 
 			if err := p.snk.Write(event); err != nil {
 				log.Printf("[pipeline:%s] write error: %v", p.id, err)
 				continue
+			}
+			if event.LSN > p.lastWrittenLSN {
+				p.lastWrittenLSN = event.LSN
 			}
 			p.rowsProcessed++
 			metrics.RowsProcessedTotal.WithLabelValues(p.id, event.Table, event.Operation.String()).Inc()
@@ -495,7 +502,7 @@ func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
 	}
 	cp.SnapshotedTables[table] = true
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		cp.LSN = ls.ReceivedLSN()
+		cp.LSN = p.lastWrittenLSN
 		ls.SetFlushedLSN(cp.LSN)
 	}
 
@@ -526,7 +533,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil // no longer needed once fully complete
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		cp.LSN = ls.ReceivedLSN()
+		cp.LSN = p.lastWrittenLSN
 		ls.SetFlushedLSN(cp.LSN)
 	}
 
@@ -586,7 +593,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	switch p.cfg.Source.Mode {
 	case "logical":
 		if ls, ok := p.src.(*source.LogicalSource); ok {
-			cp.LSN = ls.ReceivedLSN()
+			cp.LSN = p.lastWrittenLSN
 			ls.SetFlushedLSN(cp.LSN)
 		}
 	}

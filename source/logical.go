@@ -262,6 +262,8 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		return fmt.Errorf("parse logical msg: %w", err)
 	}
 
+	walEnd := uint64(xld.WALStart) + uint64(len(xld.WALData))
+
 	switch m := logicalMsg.(type) {
 	case *pglogrepl.RelationMessageV2:
 		table := fqTable(m.Namespace, m.RelationName)
@@ -276,6 +278,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 						Table:        table,
 						Operation:    OpSchemaChange,
 						SchemaChange: diff,
+						LSN:          walEnd,
 					}:
 					case <-ctx.Done():
 						return ctx.Err()
@@ -303,6 +306,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			Operation:          OpInsert,
 			After:              after,
 			PK:                 ts.PK,
+			LSN:                walEnd,
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
 			TransactionID:      l.currentTxXID,
@@ -335,6 +339,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			Before:             before,
 			PK:                 ts.PK,
 			After:              after,
+			LSN:                walEnd,
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
 			UnchangedCols:      unchangedCols,
@@ -366,6 +371,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			Operation:          OpDelete,
 			Before:             before,
 			PK:                 ts.PK,
+			LSN:                walEnd,
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
 			TransactionID:      l.currentTxXID,
@@ -380,6 +386,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		select {
 		case events <- ChangeEvent{
 			Operation:      OpBegin,
+			LSN:            walEnd,
 			TransactionID:  m.Xid,
 			SourceTimestamp: m.CommitTime,
 		}:
@@ -390,6 +397,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		select {
 		case events <- ChangeEvent{
 			Operation:      OpCommit,
+			LSN:            walEnd,
 			TransactionID:  l.currentTxXID,
 			SourceTimestamp: m.CommitTime,
 		}:

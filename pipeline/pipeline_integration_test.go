@@ -198,6 +198,186 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	t.Logf("in-memory storage has %d files", fileCount)
 }
 
+// TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents verifies that when new
+// WAL events arrive during a flush, flushedLSN only covers what was actually
+// flushed to Iceberg — not events received after the flush started.
+//
+// The race: Capture goroutine advances receivedLSN while flush() is running.
+// pipeline.flush() then reads ReceivedLSN() which now includes unflushed data,
+// and incorrectly sets flushedLSN to that value. If the process crashes before
+// the next flush, those events are lost because PG thinks they were confirmed.
+func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE test_events (
+			id SERIAL PRIMARY KEY,
+			value INTEGER NOT NULL
+		);
+		CREATE PUBLICATION test_pub FOR TABLE test_events;
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval: "1h",    // disable time-based flush
+		FlushRows:     15,      // flush after 15 rows
+		FlushBytes:    1 << 30, // effectively disabled
+		Namespace:     "test_ns",
+		Warehouse:     "s3://test-bucket/",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.test_events"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	// Use a gate storage backend: blocks Upload until the test signals proceed.
+	// This lets us deterministically inject new WAL events while flush is running.
+	mem := newGatedStorage()
+	cat := newMemCatalog()
+
+	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
+	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	ls, ok := p.Source().(*source.LogicalSource)
+	if !ok {
+		t.Fatal("pipeline source is not *LogicalSource")
+	}
+
+	flushedAfterSnapshot := ls.FlushedLSN()
+
+	// Arm the gate now that the pipeline is running (snapshot phase uploads pass freely).
+	mem.Arm()
+
+	// Insert 16 rows to trigger flush. The threshold is 15, but it's checked
+	// after DML events (not Commit), so the 16th Insert is what sees
+	// TotalBuffered >= 15 (15 previously committed single-row txns).
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	for i := 0; i < 16; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO test_events (value) VALUES ($1)", i); err != nil {
+			t.Fatalf("insert batch 1: %v", err)
+		}
+	}
+
+	// Step 1: Wait for the flush to start (Upload is called, storage blocks).
+	t.Log("waiting for flush to start (upload blocked)...")
+	select {
+	case <-mem.uploading:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for upload to start")
+	}
+
+	// Step 2: While flush is blocked, insert more rows. The Capture goroutine
+	// receives these and advances receivedLSN, but they are NOT in the flush.
+	for i := 100; i < 110; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO test_events (value) VALUES ($1)", i); err != nil {
+			t.Fatalf("insert batch 2: %v", err)
+		}
+	}
+
+	// Step 3: Wait for receivedLSN to advance past the snapshot (second batch received).
+	receivedBeforeRelease := flushedAfterSnapshot
+	waitFor(t, 15*time.Second, func() bool {
+		receivedBeforeRelease = ls.ReceivedLSN()
+		return receivedBeforeRelease > flushedAfterSnapshot
+	})
+	t.Logf("receivedLSN advanced to %d while flush is blocked", receivedBeforeRelease)
+
+	// Step 4: Release the upload — flush completes, pipeline sets flushedLSN.
+	close(mem.proceed)
+
+	// Wait for flushedLSN to advance (flush completes).
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedAfterSnapshot })
+
+	flushedAfterFirstFlush := ls.FlushedLSN()
+	receivedAfterFirstFlush := ls.ReceivedLSN()
+
+	t.Logf("after first flush: flushedLSN=%d receivedLSN=%d", flushedAfterFirstFlush, receivedAfterFirstFlush)
+
+	// === Key assertion ===
+	// The first flush only covered the first 16 rows. The second batch (10 rows)
+	// was received during the flush but NOT flushed to Iceberg. Therefore
+	// flushedLSN must be strictly less than receivedLSN.
+	//
+	// BUG: pipeline.flush() reads ReceivedLSN() after Flush() completes, so
+	// flushedLSN includes the second batch's LSN — data that was never flushed.
+	if flushedAfterFirstFlush >= receivedAfterFirstFlush {
+		t.Errorf("flushedLSN (%d) should be < receivedLSN (%d): "+
+			"events received during flush should NOT be included in flushedLSN",
+			flushedAfterFirstFlush, receivedAfterFirstFlush)
+	}
+}
+
+// gatedStorage wraps memStorage and blocks Upload calls until the test signals
+// proceed, allowing deterministic control of flush timing. The gate must be
+// armed explicitly via Arm() — uploads before arming pass through freely.
+type gatedStorage struct {
+	*memStorage
+	armed     atomic.Bool
+	uploading chan struct{} // closed when first gated Upload is called
+	proceed   chan struct{} // test closes this to unblock Upload
+	once      sync.Once
+}
+
+func newGatedStorage() *gatedStorage {
+	return &gatedStorage{
+		memStorage: newMemStorage(),
+		uploading:  make(chan struct{}),
+		proceed:    make(chan struct{}),
+	}
+}
+
+// Arm activates the gate. Subsequent Upload calls will block until proceed is closed.
+func (s *gatedStorage) Arm() { s.armed.Store(true) }
+
+func (s *gatedStorage) Upload(ctx context.Context, key string, data []byte) (string, error) {
+	if s.armed.Load() {
+		s.once.Do(func() { close(s.uploading) })
+		<-s.proceed
+	}
+	return s.memStorage.Upload(ctx, key, data)
+}
+
 func waitForStatus(t *testing.T, p *pipeline.Pipeline, target pipeline.Status, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
