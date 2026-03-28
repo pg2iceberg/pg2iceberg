@@ -491,6 +491,18 @@ func (s *Sink) Flush(ctx context.Context) error {
 		return nil
 	}
 
+	// Reset all table writers before replaying. This ensures that stale
+	// completed chunks from a previous failed flush are discarded. Without
+	// this, FlushAll (which is non-destructive) would return both old chunks
+	// and new ones, producing duplicate data in Iceberg.
+	for _, ts := range s.tables {
+		for _, pw := range ts.partitions {
+			pw.dataWriter.Reset()
+			pw.delWriter.Reset()
+		}
+		ts.toastPending = nil
+	}
+
 	// Drain committed transactions into per-table writers.
 	for _, tx := range s.committedTxns {
 		for _, event := range tx.events {
