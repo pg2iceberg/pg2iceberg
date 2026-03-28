@@ -442,13 +442,48 @@ func (p *Pipeline) run(ctx context.Context) {
 			}
 
 		case err := <-errCh:
+			// Drain any remaining events from the channel so they are
+			// written to the sink before the final flush. The Capture
+			// goroutine has already returned, so no new events will arrive.
+			for {
+				select {
+				case event, ok := <-events:
+					if !ok {
+						goto drained
+					}
+					if event.Operation == source.OpBegin || event.Operation == source.OpCommit {
+						if writeErr := p.snk.Write(event); writeErr != nil {
+							log.Printf("[pipeline:%s] drain write error: %v", p.id, writeErr)
+						}
+						if event.LSN > p.lastWrittenLSN {
+							p.lastWrittenLSN = event.LSN
+						}
+					} else if event.Operation != source.OpSnapshotTableComplete &&
+						event.Operation != source.OpSnapshotComplete &&
+						event.Operation != source.OpSchemaChange {
+						if writeErr := p.snk.Write(event); writeErr != nil {
+							log.Printf("[pipeline:%s] drain write error: %v", p.id, writeErr)
+						}
+						if event.LSN > p.lastWrittenLSN {
+							p.lastWrittenLSN = event.LSN
+						}
+					}
+				default:
+					goto drained
+				}
+			}
+		drained:
 			if p.snk.ShouldFlush() {
+				// Use a separate context for the final flush — the pipeline
+				// context may already be cancelled (e.g. graceful shutdown).
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				flushedBytes := p.snk.TotalBufferedBytes()
-				if flushErr := p.flush(ctx); flushErr != nil {
+				if flushErr := p.flush(flushCtx); flushErr != nil {
 					log.Printf("[pipeline:%s] final flush error: %v", p.id, flushErr)
 				} else {
 					p.bytesProcessed += flushedBytes
 				}
+				flushCancel()
 			}
 			if err != nil && err != context.Canceled {
 				p.setStatus(StatusError, err)
