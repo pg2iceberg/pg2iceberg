@@ -26,8 +26,9 @@
 # SQL files just use the actual table name directly.
 #
 # Usage:
-#   ./tests/run.sh                        # run all tests
+#   ./tests/run.sh                        # run all tests sequentially
 #   ./tests/run.sh 00001_basic_insert     # run a specific test
+#   PARALLEL=4 ./tests/run.sh             # run 4 tests concurrently
 
 set -euo pipefail
 
@@ -51,6 +52,9 @@ S3_SECRET_KEY="${S3_SECRET_KEY:-password}"
 FLUSH_INTERVAL="${FLUSH_INTERVAL:-3s}"
 FLUSH_ROWS="${FLUSH_ROWS:-10000}"
 NAMESPACE="default"
+
+# Parallelism: number of tests to run concurrently (1 = sequential).
+PARALLEL="${PARALLEL:-1}"
 
 passed=0
 failed=0
@@ -392,7 +396,7 @@ run_test() {
 
     if [ "$actual" = "$expected" ]; then
         echo "  PASS"
-        passed=$((passed + 1))
+        echo "PASS" > "${tmp_dir}/result"
     else
         echo "  FAIL"
         diff --color=auto -u \
@@ -403,8 +407,12 @@ run_test() {
             echo "  pg2iceberg log tail:"
             tail -10 "$pg2iceberg_log" | sed 's/^/    /'
         fi
-        failed=$((failed + 1))
-        errors+=("$test_name")
+        echo "FAIL" > "${tmp_dir}/result"
+    fi
+    # Preserve result dir for the collector (cleanup_test still runs on RETURN,
+    # but we copy the result out first).
+    if [ -n "${RESULT_DIR:-}" ]; then
+        cp "${tmp_dir}/result" "${RESULT_DIR}/${test_name}"
     fi
 }
 
@@ -436,10 +444,57 @@ main() {
         die "no tests found in $CASES_DIR"
     fi
 
-    for test_name in $tests; do
-        run_test "$test_name"
+    # Collect results from parallel runs in a shared temp directory.
+    RESULT_DIR=$(mktemp -d)
+    export RESULT_DIR
+
+    if [ "$PARALLEL" -le 1 ]; then
+        # Sequential mode.
+        for test_name in $tests; do
+            run_test "$test_name"
+            echo ""
+        done
+    else
+        # Parallel mode: run up to $PARALLEL tests concurrently.
+        local running=0
+        local pids=()
+        local pid_names=()
+
+        for test_name in $tests; do
+            run_test "$test_name" &
+            pids+=($!)
+            pid_names+=("$test_name")
+            running=$((running + 1))
+
+            # Throttle: wait for a slot when at max concurrency.
+            if [ $running -ge "$PARALLEL" ]; then
+                wait -n 2>/dev/null || true
+                running=$((running - 1))
+            fi
+        done
+
+        # Wait for remaining tests.
+        for pid in "${pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
         echo ""
+    fi
+
+    # ── Collect results ──
+    for result_file in "$RESULT_DIR"/*; do
+        [ -f "$result_file" ] || continue
+        local test_name
+        test_name="$(basename "$result_file")"
+        local result
+        result="$(cat "$result_file")"
+        if [ "$result" = "PASS" ]; then
+            passed=$((passed + 1))
+        else
+            failed=$((failed + 1))
+            errors+=("$test_name")
+        fi
     done
+    rm -rf "$RESULT_DIR"
 
     # ── Summary ──
     echo "=== Results: $passed passed, $failed failed ==="
