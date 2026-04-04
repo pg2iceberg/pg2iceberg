@@ -67,6 +67,25 @@ func (b *ChangeEventBuffer) Drain(pgTable string) ([]changeEvent, int64) {
 	return events, snapID
 }
 
+// DrainAll removes and returns all buffered events for all tables at once,
+// along with the latest events snapshot ID per table. This ensures events
+// from the same Sink flush are consumed atomically across tables.
+func (b *ChangeEventBuffer) DrainAll() (map[string][]changeEvent, map[string]int64) {
+	if b == nil {
+		return nil, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	events := b.events
+	snapIDs := b.snapshotID
+	b.events = make(map[string][]changeEvent)
+	b.snapshotID = make(map[string]int64)
+	for pgTable := range events {
+		metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
+	}
+	return events, snapIDs
+}
+
 // fileIndex tracks which PKs live in which data files for a single table.
 // Used to resolve TOAST unchanged columns by downloading only the affected files.
 type fileIndex struct {
@@ -168,21 +187,24 @@ func (m *Materializer) LastEventsSnapshots() map[string]int64 {
 // Called during graceful shutdown to ensure all flushed events are materialized.
 //
 // The in-memory ChangeEventBuffer is drained and discarded so that
-// MaterializeTable falls through to the S3 path, which reads event files
-// directly from the Iceberg events table. This is necessary because the
-// Run() goroutine may have drained the buffer but failed to materialize
-// (e.g. context cancelled), leaving a gap. The events table on S3 is the
-// authoritative record of all flushed events, so reading from it guarantees
-// nothing is skipped.
+// MaterializeAll runs two materialization cycles to ensure all events are
+// processed before shutdown. The first cycle processes any buffered events
+// atomically. The buffer is then drained to force the second cycle through
+// the S3 path, which reads event files directly from the Iceberg events
+// table. This is necessary because the Run() goroutine may have drained the
+// buffer but failed to materialize (e.g. context cancelled), leaving a gap.
+// The events table on S3 is the authoritative record of all flushed events,
+// so reading from it guarantees nothing is skipped.
 func (m *Materializer) MaterializeAll(ctx context.Context) {
-	for pgTable := range m.tables {
-		m.buf.Drain(pgTable)
+	// Cycle 1: process buffered events atomically.
+	if err := m.materializeCycle(ctx); err != nil {
+		log.Printf("[materializer] final cycle (buffer) error: %v", err)
 	}
-	for pgTable, ts := range m.tables {
-		if err := m.MaterializeTable(ctx, pgTable, ts); err != nil {
-			metrics.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-			log.Printf("[materializer] final pass error for %s: %v", pgTable, err)
-		}
+	// Discard remaining buffer to force S3 path.
+	m.buf.DrainAll()
+	// Cycle 2: catch anything via S3 fallback.
+	if err := m.materializeCycle(ctx); err != nil {
+		log.Printf("[materializer] final cycle (s3) error: %v", err)
 	}
 }
 
@@ -201,14 +223,65 @@ func (m *Materializer) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for pgTable, ts := range m.tables {
-				if err := m.MaterializeTable(ctx, pgTable, ts); err != nil {
-					metrics.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-					log.Printf("[materializer] error materializing %s: %v", pgTable, err)
-				}
+			if err := m.materializeCycle(ctx); err != nil {
+				log.Printf("[materializer] cycle error: %v", err)
 			}
 		}
 	}
+}
+
+// materializeCycle runs a single materialization cycle for all tables.
+// It drains all buffered events atomically, prepares each table, then
+// commits all prepared tables atomically via CommitTransaction.
+func (m *Materializer) materializeCycle(ctx context.Context) error {
+	// Phase 1: Drain all tables atomically.
+	allEvents, allSnapIDs := m.buf.DrainAll()
+
+	// Phase 2: Prepare all tables.
+	var prepared []*preparedMaterialization
+	for pgTable, ts := range m.tables {
+		prep, err := m.prepareTable(ctx, pgTable, ts, allEvents[pgTable], allSnapIDs[pgTable])
+		if err != nil {
+			// Abort entire cycle. Drained events are safe on S3 in the
+			// events tables; next cycle recovers via the S3 fallback path.
+			metrics.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
+			return fmt.Errorf("prepare %s: %w", pgTable, err)
+		}
+		if prep != nil {
+			prepared = append(prepared, prep)
+		}
+	}
+
+	if len(prepared) == 0 {
+		return nil
+	}
+
+	// Phase 3: Atomic multi-table commit.
+	commits := make([]TableCommit, len(prepared))
+	for i, p := range prepared {
+		commits[i] = TableCommit{
+			Table:             p.icebergName,
+			CurrentSnapshotID: p.prevSnapID,
+			Snapshot:          p.commit,
+		}
+	}
+
+	if err := m.catalog.CommitTransaction(m.cfg.Namespace, commits); err != nil {
+		for _, p := range prepared {
+			metrics.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
+		}
+		return fmt.Errorf("commit materialized transaction: %w", err)
+	}
+
+	// Phase 4: Apply side effects only after successful commit.
+	for _, p := range prepared {
+		m.applyPostCommit(p)
+	}
+
+	if len(prepared) > 1 {
+		log.Printf("[materializer] cycle complete: %d tables committed atomically", len(prepared))
+	}
+	return nil
 }
 
 // changeEvent represents a parsed change event from the events table.
@@ -220,60 +293,117 @@ type changeEvent struct {
 	row           map[string]any // user columns only
 }
 
+// preparedMaterialization holds all artifacts produced by prepareTable,
+// ready to be committed atomically with other tables.
+type preparedMaterialization struct {
+	pgTable         string
+	ts              *tableSink
+	icebergName     string // ts.icebergName
+	prevSnapID      int64  // materialized table snapshot before this commit
+	commit          SnapshotCommit
+	newMatManifests []ManifestFileInfo // to update ts.matManifests after commit
+
+	// Deferred side effects.
+	fromBuffer     bool
+	bufSnapID      int64         // for checkpoint update (buffer path)
+	s3SnapID       int64         // for checkpoint update (S3 path)
+	events         []changeEvent // retained for metrics (event count, max LSN)
+	dataCount      int
+	deleteCount    int
+	deleteRowCount int64
+	bucketCount    int
+
+	// Timing phases for diagnostics.
+	start      time.Time
+	tDrain     time.Duration
+	tFold      time.Duration
+	tToast     time.Duration
+	tSerialize time.Duration
+	tUpload    time.Duration
+}
+
 // MaterializeTable reads new events for one table and applies them to the
-// materialized table using Merge-on-Read. Instead of downloading and rewriting
-// existing data files (CoW), it writes:
-//   - Equality delete files: for UPDATEs and DELETEs (marks old rows for removal)
-//   - New data files: for INSERTs and UPDATEs (contains the new/updated rows)
-//
-// Existing manifests from the previous snapshot are carried forward unchanged.
+// materialized table using Merge-on-Read. This is a convenience wrapper that
+// drains the buffer, prepares, commits, and applies post-commit effects for
+// a single table.
 func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts *tableSink) error {
+	events, bufSnapID := m.buf.Drain(pgTable)
+	prep, err := m.prepareTable(ctx, pgTable, ts, events, bufSnapID)
+	if err != nil {
+		return err
+	}
+	if prep == nil {
+		return nil
+	}
+
+	err = m.catalog.CommitTransaction(m.cfg.Namespace, []TableCommit{{
+		Table:             prep.icebergName,
+		CurrentSnapshotID: prep.prevSnapID,
+		Snapshot:          prep.commit,
+	}})
+	if err != nil {
+		return fmt.Errorf("commit materialized snapshot: %w", err)
+	}
+
+	m.applyPostCommit(prep)
+	return nil
+}
+
+// prepareTable reads new events for one table, folds them, serializes to
+// Parquet, uploads to S3, and assembles manifests — but does NOT commit.
+// Returns nil if there is nothing to commit.
+//
+// The caller is responsible for committing via CommitTransaction and then
+// calling applyPostCommit to finalize side effects.
+func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tableSink,
+	bufEvents []changeEvent, bufSnapID int64) (*preparedMaterialization, error) {
+
 	start := time.Now()
 	catalog := m.catalog
 	s3 := m.s3
 	ns := m.cfg.Namespace
 
-	// Prefer in-memory events (fast path: no S3 reads).
-	events, bufSnapID := m.buf.Drain(pgTable)
+	events := bufEvents
 	fromBuffer := len(events) > 0
 
+	var s3SnapID int64
 	if !fromBuffer {
 		// No in-memory events — fall back to S3 (crash recovery path).
 		eventsTm, err := catalog.LoadTable(ns, ts.eventsIcebergName)
 		if err != nil {
-			return fmt.Errorf("load events table: %w", err)
+			return nil, fmt.Errorf("load events table: %w", err)
 		}
 		if eventsTm == nil || eventsTm.Metadata.CurrentSnapshotID == 0 {
-			return nil // no events yet
+			return nil, nil // no events yet
 		}
 
 		currentSnapshotID := eventsTm.Metadata.CurrentSnapshotID
 		lastProcessed := m.lastEventsSnapshot[pgTable]
 
 		if currentSnapshotID == lastProcessed {
-			return nil // already up to date
+			return nil, nil // already up to date
 		}
 
 		newFiles, err := m.findNewEventFiles(ctx, s3, eventsTm, lastProcessed)
 		if err != nil {
-			return fmt.Errorf("find new event files: %w", err)
+			return nil, fmt.Errorf("find new event files: %w", err)
 		}
 		if len(newFiles) == 0 {
 			m.lastEventsSnapshot[pgTable] = currentSnapshotID
-			return nil
+			return nil, nil
 		}
 
 		events, err = m.readEvents(ctx, s3, newFiles, ts.srcSchema)
 		if err != nil {
-			return fmt.Errorf("read events: %w", err)
+			return nil, fmt.Errorf("read events: %w", err)
 		}
 		if len(events) == 0 {
 			m.lastEventsSnapshot[pgTable] = currentSnapshotID
-			return nil
+			return nil, nil
 		}
 
-		// Update checkpoint now — S3 events are loaded.
-		m.lastEventsSnapshot[pgTable] = currentSnapshotID
+		// Track for deferred checkpoint update (applied after commit).
+		s3SnapID = currentSnapshotID
 	}
 
 	// Phase timing for diagnostics.
@@ -282,13 +412,13 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	pk := ts.srcSchema.PK
 	if len(pk) == 0 {
 		log.Printf("[materializer] skipping %s: no primary key", pgTable)
-		return nil
+		return nil, nil
 	}
 
 	// Load the materialized table metadata (needed for TOAST + commit).
 	matTm, err := catalog.LoadTable(ns, ts.icebergName)
 	if err != nil {
-		return fmt.Errorf("load materialized table: %w", err)
+		return nil, fmt.Errorf("load materialized table: %w", err)
 	}
 
 	var prevMatSnapID int64
@@ -324,7 +454,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		if fi == nil || fi.snapshotID != matTm.Metadata.CurrentSnapshotID {
 			fi, err = m.buildFileIndex(ctx, pgTable, ts, matTm)
 			if err != nil {
-				return fmt.Errorf("build file index: %w", err)
+				return nil, fmt.Errorf("build file index: %w", err)
 			}
 			m.fileIndexes[pgTable] = fi
 		}
@@ -483,7 +613,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	}
 	foldPool := worker.NewPool(foldConcurrency)
 	if _, err := foldPool.Run(ctx, foldTasks); err != nil {
-		return fmt.Errorf("fold: %w", err)
+		return nil, fmt.Errorf("fold: %w", err)
 	}
 
 	tFold := time.Since(start)
@@ -507,15 +637,15 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		for path := range affectedFilePaths {
 			dfKey, err := KeyFromURI(path)
 			if err != nil {
-				return fmt.Errorf("TOAST: parse URI %s: %w", path, err)
+				return nil, fmt.Errorf("TOAST: parse URI %s: %w", path, err)
 			}
 			data, err := downloadWithRetry(ctx, s3, dfKey)
 			if err != nil {
-				return fmt.Errorf("TOAST: download %s: %w", path, err)
+				return nil, fmt.Errorf("TOAST: download %s: %w", path, err)
 			}
 			rows, err := readParquetRows(data, ts.srcSchema)
 			if err != nil {
-				return fmt.Errorf("TOAST: read %s: %w", path, err)
+				return nil, fmt.Errorf("TOAST: read %s: %w", path, err)
 			}
 			for _, row := range rows {
 				pkKey := buildPKKey(row, pk)
@@ -624,7 +754,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 
 	serializePool := worker.NewPool(foldConcurrency)
 	if _, err := serializePool.Run(ctx, serializeTasks); err != nil {
-		return fmt.Errorf("serialize: %w", err)
+		return nil, fmt.Errorf("serialize: %w", err)
 	}
 
 	tSerialize := time.Since(start)
@@ -674,7 +804,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		}
 		pool := worker.NewPool(concurrency)
 		if _, err := pool.Run(ctx, tasks); err != nil {
-			return fmt.Errorf("upload materialized files: %w", err)
+			return nil, fmt.Errorf("upload materialized files: %w", err)
 		}
 
 		for _, u := range uploaded {
@@ -704,8 +834,10 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	if len(deleteEntries) == 0 && len(dataEntries) == 0 {
 		if fromBuffer && bufSnapID > 0 {
 			m.lastEventsSnapshot[pgTable] = bufSnapID
+		} else if s3SnapID > 0 {
+			m.lastEventsSnapshot[pgTable] = s3SnapID
 		}
-		return nil
+		return nil, nil
 	}
 
 	// --- Phase 3: Carry forward existing manifests and commit ---
@@ -715,7 +847,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		var err error
 		ts.matManifests, err = m.loadExistingManifests(ctx, s3, matTm)
 		if err != nil {
-			return fmt.Errorf("load existing manifests: %w", err)
+			return nil, fmt.Errorf("load existing manifests: %w", err)
 		}
 	}
 	existingManifests := ts.matManifests
@@ -726,12 +858,12 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	if len(dataEntries) > 0 {
 		manifestBytes, err := WriteManifest(ts.srcSchema, dataEntries, seqNum, 0, ts.partSpec)
 		if err != nil {
-			return fmt.Errorf("write data manifest: %w", err)
+			return nil, fmt.Errorf("write data manifest: %w", err)
 		}
 		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-data.avro", basePath, uuid.New().String())
 		manifestURI, err := s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
-			return fmt.Errorf("upload data manifest: %w", err)
+			return nil, fmt.Errorf("upload data manifest: %w", err)
 		}
 		var totalRows int64
 		for _, e := range dataEntries {
@@ -752,12 +884,12 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	if len(deleteEntries) > 0 {
 		manifestBytes, err := WriteManifest(ts.srcSchema, deleteEntries, seqNum, 1, ts.partSpec)
 		if err != nil {
-			return fmt.Errorf("write delete manifest: %w", err)
+			return nil, fmt.Errorf("write delete manifest: %w", err)
 		}
 		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-deletes.avro", basePath, uuid.New().String())
 		manifestURI, err := s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
-			return fmt.Errorf("upload delete manifest: %w", err)
+			return nil, fmt.Errorf("upload delete manifest: %w", err)
 		}
 		newManifests = append(newManifests, ManifestFileInfo{
 			Path:           manifestURI,
@@ -770,19 +902,19 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		})
 	}
 
-	// Manifest list = existing manifests + new manifests. Cache for next cycle.
+	// Manifest list = existing manifests + new manifests.
+	// Do NOT update ts.matManifests yet — deferred to applyPostCommit.
 	allManifests := append(existingManifests, newManifests...)
-	ts.matManifests = allManifests
 
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
-		return fmt.Errorf("write manifest list: %w", err)
+		return nil, fmt.Errorf("write manifest list: %w", err)
 	}
 
 	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
 	mlURI, err := s3.Upload(ctx, mlKey, mlBytes)
 	if err != nil {
-		return fmt.Errorf("upload manifest list: %w", err)
+		return nil, fmt.Errorf("upload manifest list: %w", err)
 	}
 
 	commit := SnapshotCommit{
@@ -796,54 +928,77 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		},
 	}
 
-	if err := catalog.CommitSnapshot(ns, ts.icebergName, prevMatSnapID, commit); err != nil {
-		return fmt.Errorf("commit materialized snapshot: %w", err)
-	}
-	tCommit := time.Since(start)
+	return &preparedMaterialization{
+		pgTable:         pgTable,
+		ts:              ts,
+		icebergName:     ts.icebergName,
+		prevSnapID:      prevMatSnapID,
+		commit:          commit,
+		newMatManifests: allManifests,
+		fromBuffer:      fromBuffer,
+		bufSnapID:       bufSnapID,
+		s3SnapID:        s3SnapID,
+		events:          events,
+		dataCount:       len(dataEntries),
+		deleteCount:     len(deleteEntries),
+		deleteRowCount:  deleteRowCount,
+		bucketCount:     len(buckets),
+		start:           start,
+		tDrain:          tDrain,
+		tFold:           tFold,
+		tToast:          tToast,
+		tSerialize:      tSerialize,
+		tUpload:         tUpload,
+	}, nil
+}
+
+// applyPostCommit finalizes side effects after a successful catalog commit.
+// Must be called only after CommitTransaction succeeds.
+func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
+	// Update manifest cache.
+	prep.ts.matManifests = prep.newMatManifests
 
 	// Invalidate the file index so it's rebuilt on next TOAST resolution.
-	// MoR doesn't rewrite files, but equality deletes logically remove old rows.
-	// Rebuilding ensures the index reflects the current state.
-	if fi := m.fileIndexes[pgTable]; fi != nil {
-		fi.snapshotID = 0 // force rebuild on next use
+	if fi := m.fileIndexes[prep.pgTable]; fi != nil {
+		fi.snapshotID = 0
 	}
 
-	// Update checkpoint for in-memory path (S3 path already updated above).
-	if fromBuffer && bufSnapID > 0 {
-		m.lastEventsSnapshot[pgTable] = bufSnapID
+	// Update checkpoint.
+	if prep.fromBuffer && prep.bufSnapID > 0 {
+		m.lastEventsSnapshot[prep.pgTable] = prep.bufSnapID
+	} else if prep.s3SnapID > 0 {
+		m.lastEventsSnapshot[prep.pgTable] = prep.s3SnapID
 	}
 
+	// Metrics + logging.
 	source := "buffer"
-	if !fromBuffer {
+	if !prep.fromBuffer {
 		source = "s3"
 	}
-	duration := time.Since(start)
+	duration := time.Since(prep.start)
 
-	// Track highest materialized LSN.
 	var maxLSN int64
-	for _, ev := range events {
+	for _, ev := range prep.events {
 		if ev.lsn > maxLSN {
 			maxLSN = ev.lsn
 		}
 	}
 	if maxLSN > 0 {
-		metrics.MaterializerMaterializedLSN.WithLabelValues(pgTable).Set(float64(maxLSN))
+		metrics.MaterializerMaterializedLSN.WithLabelValues(prep.pgTable).Set(float64(maxLSN))
 	}
 
-	metrics.MaterializerDurationSeconds.WithLabelValues(pgTable).Observe(duration.Seconds())
-	metrics.MaterializerRunsTotal.WithLabelValues(pgTable, source).Inc()
-	metrics.MaterializerEventsTotal.WithLabelValues(pgTable).Add(float64(len(events)))
-	metrics.MaterializerDataFilesWrittenTotal.WithLabelValues(pgTable).Add(float64(len(dataEntries)))
-	metrics.MaterializerDeleteFilesWrittenTotal.WithLabelValues(pgTable).Add(float64(len(deleteEntries)))
-	metrics.MaterializerDeleteRowsTotal.WithLabelValues(pgTable).Add(float64(deleteRowCount))
+	metrics.MaterializerDurationSeconds.WithLabelValues(prep.pgTable).Observe(duration.Seconds())
+	metrics.MaterializerRunsTotal.WithLabelValues(prep.pgTable, source).Inc()
+	metrics.MaterializerEventsTotal.WithLabelValues(prep.pgTable).Add(float64(len(prep.events)))
+	metrics.MaterializerDataFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.dataCount))
+	metrics.MaterializerDeleteFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteCount))
+	metrics.MaterializerDeleteRowsTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteRowCount))
 
-	log.Printf("[materializer] materialized %s: %d events (%s), %d buckets, %d data files, %d delete files (%.1fs) [drain=%.0fms fold=%.0fms toast=%.0fms upload=%.0fms commit=%.0fms]",
-		pgTable, len(events), source, len(buckets), len(dataEntries), len(deleteEntries), duration.Seconds(),
-		float64(tDrain.Milliseconds()), float64((tFold-tDrain).Milliseconds()),
-		float64((tToast-tFold).Milliseconds()),
-		float64((tUpload-tSerialize).Milliseconds()), float64((tCommit-tUpload).Milliseconds()))
-
-	return nil
+	log.Printf("[materializer] materialized %s: %d events (%s), %d buckets, %d data files, %d delete files (%.1fs) [drain=%.0fms fold=%.0fms toast=%.0fms upload=%.0fms]",
+		prep.pgTable, len(prep.events), source, prep.bucketCount, prep.dataCount, prep.deleteCount, duration.Seconds(),
+		float64(prep.tDrain.Milliseconds()), float64((prep.tFold-prep.tDrain).Milliseconds()),
+		float64((prep.tToast-prep.tFold).Milliseconds()),
+		float64((prep.tUpload-prep.tSerialize).Milliseconds()))
 }
 
 // loadExistingManifests reads all manifest file entries from the current
