@@ -18,6 +18,8 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/schema"
 )
 
+const fieldIDKey = "PARQUET:field_id"
+
 // colSizer holds precomputed per-column sizing info to avoid repeated string
 // comparisons in the hot path. fixedSize > 0 means the column has a known
 // fixed byte width; fixedSize == 0 means it's variable-length (text, json, etc.).
@@ -135,6 +137,9 @@ func buildArrowSchema(columns []schema.Column) *arrow.Schema {
 			Name:     col.Name,
 			Type:     pgToArrowType(col.PGType),
 			Nullable: col.IsNullable,
+			Metadata: arrow.MetadataFrom(map[string]string{
+				fieldIDKey: strconv.Itoa(col.FieldID),
+			}),
 		}
 	}
 	return arrow.NewSchema(fields, nil)
