@@ -101,6 +101,11 @@ func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store Checkpoint
 	}
 }
 
+// SetEventBuf sets the change event buffer used to pass events from the
+// sink to the materializer. Must be called before Start. Used in tests
+// that construct the Sink directly with a custom eventBuf.
+func (p *Pipeline) SetEventBuf(buf *sink.ChangeEventBuffer) { p.eventBuf = buf }
+
 // ID returns the pipeline identifier.
 func (p *Pipeline) ID() string { return p.id }
 
