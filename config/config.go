@@ -124,10 +124,21 @@ type SinkConfig struct {
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
 
+	// Events table partition expression, e.g. "day(_ts)" or "month(_ts)".
+	// Defaults to "day(_ts)" if not set.
+	EventsPartition string `yaml:"events_partition" json:"events_partition,omitempty"`
+
 	// Materializer settings
 	MaterializerInterval       string `yaml:"materializer_interval" json:"materializer_interval,omitempty"`
 	MaterializerTargetFileSize int64  `yaml:"materializer_target_file_size" json:"materializer_target_file_size,omitempty"`
 	MaterializerConcurrency    int    `yaml:"materializer_concurrency" json:"materializer_concurrency,omitempty"`
+}
+
+func (s SinkConfig) EventsPartitionOrDefault() string {
+	if s.EventsPartition != "" {
+		return s.EventsPartition
+	}
+	return "day(_ts)"
 }
 
 func (s SinkConfig) FlushBytesOrDefault() int64 {

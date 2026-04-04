@@ -331,10 +331,15 @@ func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema)
 			if valStr == "__null__" {
 				values[name] = nil
 			} else {
-				// Parse as int64 for truncate/bucket transforms, string otherwise.
-				if n, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+				avroType := partitionFieldAvroType(f.Transform, ts, f.SourceID)
+				switch avroType {
+				case "int":
+					n, _ := strconv.ParseInt(valStr, 10, 32)
+					values[name] = int32(n)
+				case "long":
+					n, _ := strconv.ParseInt(valStr, 10, 64)
 					values[name] = n
-				} else {
+				default:
 					values[name] = valStr
 				}
 			}

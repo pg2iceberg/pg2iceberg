@@ -81,7 +81,8 @@ type tableSink struct {
 
 	icebergName       string // materialized table name in Iceberg (e.g. "orders")
 	eventsIcebergName string // events table name in Iceberg (e.g. "orders_events")
-	partSpec          *PartitionSpec
+	partSpec          *PartitionSpec // materialized table partition spec
+	eventsPartSpec    *PartitionSpec // events table partition spec
 	targetSize        int64
 	schemaID          int // current Iceberg schema ID (events table)
 	matSchemaID       int // materialized table schema ID
@@ -189,8 +190,14 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		matSchemaID = matTm.Metadata.CurrentSchemaID
 	}
 
-	// Build events table schema and create/load it (e.g. "orders_events").
+	// Build events table schema and partition spec.
 	eventsSchema := EventsTableSchema(ts)
+	eventsPartSpec, err := BuildPartitionSpec(
+		[]string{s.cfg.EventsPartitionOrDefault()}, eventsSchema)
+	if err != nil {
+		return fmt.Errorf("build events partition spec: %w", err)
+	}
+
 	eventsTm, err := s.catalog.LoadTable(s.cfg.Namespace, eventsTable)
 	if err != nil {
 		return fmt.Errorf("load events table: %w", err)
@@ -198,12 +205,12 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 	var eventsSchemaID int
 	if eventsTm == nil {
 		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, eventsTable)
-		// Events table is unpartitioned (for now).
-		eventsTm, err = s.catalog.CreateTable(s.cfg.Namespace, eventsTable, eventsSchema, location, nil)
+		eventsTm, err = s.catalog.CreateTable(s.cfg.Namespace, eventsTable, eventsSchema, location, eventsPartSpec)
 		if err != nil {
 			return fmt.Errorf("create events table: %w", err)
 		}
-		log.Printf("[sink] created events table %s.%s", s.cfg.Namespace, eventsTable)
+		log.Printf("[sink] created events table %s.%s (partition=%s)",
+			s.cfg.Namespace, eventsTable, s.cfg.EventsPartitionOrDefault())
 		eventsSchemaID = eventsTm.Metadata.CurrentSchemaID
 	} else {
 		log.Printf("[sink] using existing events table %s.%s", s.cfg.Namespace, eventsTable)
@@ -217,15 +224,11 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		icebergName:       icebergTable,
 		eventsIcebergName: eventsTable,
 		partSpec:          partSpec,
+		eventsPartSpec:    eventsPartSpec,
 		targetSize:        targetSize,
 		schemaID:          eventsSchemaID,
 		matSchemaID:       matSchemaID,
 		partitions:        make(map[string]*partitionedWriter),
-	}
-
-	// Events table is unpartitioned — pre-create the default writer.
-	tSink.partitions[""] = &partitionedWriter{
-		dataWriter: NewRollingDataWriter(eventsSchema, targetSize),
 	}
 
 	s.tables[ts.Table] = tSink
@@ -320,9 +323,20 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 	return nil
 }
 
-// getEventsWriter returns the events writer. Events table is unpartitioned.
-func (ts *tableSink) getEventsWriter() *partitionedWriter {
-	return ts.partitions[""]
+// getEventsWriter returns the events writer for the given row's partition.
+func (ts *tableSink) getEventsWriter(row map[string]any) *partitionedWriter {
+	key := ""
+	if ts.eventsPartSpec != nil && !ts.eventsPartSpec.IsUnpartitioned() {
+		key = ts.eventsPartSpec.PartitionKey(row, ts.eventsSchema)
+	}
+	pw, ok := ts.partitions[key]
+	if !ok {
+		pw = &partitionedWriter{
+			dataWriter: NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
+		}
+		ts.partitions[key] = pw
+	}
+	return pw
 }
 
 // Write buffers a ChangeEvent for the next flush. DML events are held in
@@ -400,7 +414,7 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	row["_seq"] = s.seqCounter
 	s.seqCounter++
 
-	pw := ts.getEventsWriter()
+	pw := ts.getEventsWriter(row)
 	if err := pw.dataWriter.Add(row); err != nil {
 		return err
 	}
@@ -578,14 +592,21 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	var tasks []worker.Task
 	for _, t := range tablesToFlush {
 		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.eventsIcebergName)
-		for _, pw := range t.ts.partitions {
+		for partKey, pw := range t.ts.partitions {
 			pw := pw
 			pgTable := t.pgTable
+			partKey := partKey
+
+			// Compute partition path for the S3 key.
+			var partPath string
+			if t.ts.eventsPartSpec != nil && !t.ts.eventsPartSpec.IsUnpartitioned() && partKey != "" {
+				partPath = partKey // partKey is already in "field=value" format
+			}
 
 			tasks = append(tasks, worker.Task{
 				Name: pgTable,
 				Fn: func(ctx context.Context, progress *worker.Progress) error {
-					uploads, err := serializeEventsPartition(pw, basePath)
+					uploads, err := serializeEventsPartition(pw, basePath, partPath)
 					if err != nil {
 						return err
 					}
@@ -650,7 +671,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 }
 
 // serializeEventsPartition flushes an events partition writer to parquet bytes.
-func serializeEventsPartition(pw *partitionedWriter, basePath string) ([]pendingUpload, error) {
+func serializeEventsPartition(pw *partitionedWriter, basePath, partPath string) ([]pendingUpload, error) {
 	var uploads []pendingUpload
 
 	dataChunks, err := pw.dataWriter.FlushAll()
@@ -659,7 +680,12 @@ func serializeEventsPartition(pw *partitionedWriter, basePath string) ([]pending
 	}
 	for i, chunk := range dataChunks {
 		fileUUID := uuid.New().String()
-		key := fmt.Sprintf("%s/data/%s-events-%d.parquet", basePath, fileUUID, i)
+		var key string
+		if partPath != "" {
+			key = fmt.Sprintf("%s/data/%s/%s-events-%d.parquet", basePath, partPath, fileUUID, i)
+		} else {
+			key = fmt.Sprintf("%s/data/%s-events-%d.parquet", basePath, fileUUID, i)
+		}
 		uploads = append(uploads, pendingUpload{
 			key:         key,
 			data:        chunk.Data,
@@ -692,6 +718,21 @@ func (s *Sink) uploadFiles(ctx context.Context, uploads []pendingUpload) ([]uplo
 	return results, nil
 }
 
+// extractPartDir extracts the partition directory from a data file URI.
+// E.g. "s3://bucket/.../data/_ts_day=2026-04-04/uuid.parquet" → "_ts_day=2026-04-04"
+func extractPartDir(uri string) string {
+	idx := strings.Index(uri, "/data/")
+	if idx < 0 {
+		return ""
+	}
+	afterData := uri[idx+len("/data/"):]
+	slashIdx := strings.Index(afterData, "/")
+	if slashIdx < 0 {
+		return "" // unpartitioned file
+	}
+	return afterData[:slashIdx]
+}
+
 // pendingUpload holds the data needed to upload a single Parquet file to S3.
 type pendingUpload struct {
 	key             string
@@ -715,14 +756,24 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	snapshotID := now.UnixMilli()
 	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.eventsIcebergName)
 
+	eventsPartitioned := ts.eventsPartSpec != nil && !ts.eventsPartSpec.IsUnpartitioned()
+
 	var dataFiles []DataFileInfo
 	for _, r := range results {
-		dataFiles = append(dataFiles, DataFileInfo{
+		df := DataFileInfo{
 			Path:          r.uri,
 			FileSizeBytes: int64(len(r.data)),
 			RecordCount:   r.recordCount,
 			Content:       0,
-		})
+		}
+		if eventsPartitioned {
+			partPath := extractPartDir(r.uri)
+			if partPath != "" {
+				partValues := ts.eventsPartSpec.ParsePartitionPath(partPath, ts.eventsSchema)
+				df.PartitionValues = ts.eventsPartSpec.PartitionAvroValue(partValues, ts.eventsSchema)
+			}
+		}
+		dataFiles = append(dataFiles, df)
 	}
 
 	// Load current events table metadata.
@@ -764,8 +815,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 				DataFile:   df,
 			}
 		}
-		// Events table is unpartitioned — pass nil partSpec.
-		manifestBytes, err := WriteManifest(ts.eventsSchema, entries, seqNum, 0, nil)
+		manifestBytes, err := WriteManifest(ts.eventsSchema, entries, seqNum, 0, ts.eventsPartSpec)
 		if err != nil {
 			return nil, fmt.Errorf("write events manifest: %w", err)
 		}
