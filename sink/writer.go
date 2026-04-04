@@ -52,7 +52,7 @@ type colAppender struct {
 	name       string
 	idx        int
 	nullable   bool
-	appendVal  func(array.Builder, any) // appends a non-nil Go value
+	appendVal  func(array.Builder, any) error // appends a non-nil Go value; returns error on conversion failure
 	appendZero func(array.Builder)      // appends a typed zero for non-nullable nulls
 }
 
@@ -67,37 +67,85 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 		}
 		switch strings.ToLower(col.PGType) {
 		case "int2", "smallint", "int4", "integer", "serial":
-			ca.appendVal = func(b array.Builder, v any) { b.(*array.Int32Builder).Append(toInt32(v)) }
+			ca.appendVal = func(b array.Builder, v any) error {
+				n, err := toInt32(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.Int32Builder).Append(n)
+				return nil
+			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Int32Builder).Append(0) }
 		case "int8", "bigint", "bigserial":
-			ca.appendVal = func(b array.Builder, v any) { b.(*array.Int64Builder).Append(toInt64(v)) }
+			ca.appendVal = func(b array.Builder, v any) error {
+				n, err := toInt64(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.Int64Builder).Append(n)
+				return nil
+			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Int64Builder).Append(0) }
 		case "float4", "real":
-			ca.appendVal = func(b array.Builder, v any) { b.(*array.Float32Builder).Append(toFloat32(v)) }
+			ca.appendVal = func(b array.Builder, v any) error {
+				f, err := toFloat32(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.Float32Builder).Append(f)
+				return nil
+			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Float32Builder).Append(0) }
 		case "float8", "double precision":
-			ca.appendVal = func(b array.Builder, v any) { b.(*array.Float64Builder).Append(toFloat64(v)) }
+			ca.appendVal = func(b array.Builder, v any) error {
+				f, err := toFloat64(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.Float64Builder).Append(f)
+				return nil
+			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Float64Builder).Append(0) }
 		case "bool", "boolean":
-			ca.appendVal = func(b array.Builder, v any) { b.(*array.BooleanBuilder).Append(toBool(v)) }
+			ca.appendVal = func(b array.Builder, v any) error {
+				val, err := toBool(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.BooleanBuilder).Append(val)
+				return nil
+			}
 			ca.appendZero = func(b array.Builder) { b.(*array.BooleanBuilder).Append(false) }
 		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
-			ca.appendVal = func(b array.Builder, v any) {
-				b.(*array.TimestampBuilder).Append(arrow.Timestamp(toTimestampMicros(v)))
+			ca.appendVal = func(b array.Builder, v any) error {
+				us, err := toTimestampMicros(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.TimestampBuilder).Append(arrow.Timestamp(us))
+				return nil
 			}
 			ca.appendZero = func(b array.Builder) {
 				b.(*array.TimestampBuilder).Append(0)
 			}
 		case "date":
-			ca.appendVal = func(b array.Builder, v any) {
-				b.(*array.Date32Builder).Append(arrow.Date32(toDateDays(v)))
+			ca.appendVal = func(b array.Builder, v any) error {
+				d, err := toDateDays(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.Date32Builder).Append(arrow.Date32(d))
+				return nil
 			}
 			ca.appendZero = func(b array.Builder) {
 				b.(*array.Date32Builder).Append(0)
 			}
 		default:
 			// text, varchar, numeric, json, uuid, etc. → string
-			ca.appendVal = func(b array.Builder, v any) { b.(*array.StringBuilder).Append(toString(v)) }
+			ca.appendVal = func(b array.Builder, v any) error {
+				b.(*array.StringBuilder).Append(toString(v))
+				return nil
+			}
 			ca.appendZero = func(b array.Builder) { b.(*array.StringBuilder).Append("") }
 		}
 		appenders[i] = ca
@@ -206,7 +254,7 @@ func NewDeleteWriter(ts *schema.TableSchema) *ParquetWriter {
 	return newParquetWriter(ts, pkCols)
 }
 
-func (w *ParquetWriter) Add(row map[string]any) {
+func (w *ParquetWriter) Add(row map[string]any) error {
 	for i := range w.colAppenders {
 		ca := &w.colAppenders[i]
 		v := row[ca.name]
@@ -217,11 +265,14 @@ func (w *ParquetWriter) Add(row map[string]any) {
 				ca.appendZero(w.builders[ca.idx])
 			}
 		} else {
-			ca.appendVal(w.builders[ca.idx], v)
+			if err := ca.appendVal(w.builders[ca.idx], v); err != nil {
+				return fmt.Errorf("column %s: %w", ca.name, err)
+			}
 		}
 	}
 	w.rowCount++
 	w.estimatedBytes += estimateRowBytes(w.colSizers, row)
+	return nil
 }
 
 func (w *ParquetWriter) Len() int {
@@ -337,7 +388,9 @@ func NewRollingDeleteWriter(ts *schema.TableSchema, targetSize int64) *RollingWr
 }
 
 func (rw *RollingWriter) Add(row map[string]any) error {
-	rw.writer.Add(row)
+	if err := rw.writer.Add(row); err != nil {
+		return err
+	}
 
 	if rw.targetSize > 0 && rw.writer.EstimatedBytes() >= rw.targetSize {
 		if err := rw.rollover(); err != nil {
@@ -408,94 +461,109 @@ func (rw *RollingWriter) DiscardCompleted() {
 
 // --- type conversion helpers ---
 
-func toInt32(v any) int32 {
+func toInt32(v any) (int32, error) {
 	switch x := v.(type) {
 	case int32:
-		return x
+		return x, nil
 	case int64:
-		return int32(x)
+		return int32(x), nil
 	case int:
-		return int32(x)
+		return int32(x), nil
 	case float64:
-		return int32(x)
+		return int32(x), nil
 	case string:
-		n, _ := strconv.ParseInt(x, 10, 32)
-		return int32(n)
+		n, err := strconv.ParseInt(x, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("parse int32 %q: %w", x, err)
+		}
+		return int32(n), nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported type %T for int32", v)
 	}
 }
 
-func toInt64(v any) int64 {
+func toInt64(v any) (int64, error) {
 	switch x := v.(type) {
 	case int64:
-		return x
+		return x, nil
 	case int32:
-		return int64(x)
+		return int64(x), nil
 	case int:
-		return int64(x)
+		return int64(x), nil
 	case float64:
-		return int64(x)
+		return int64(x), nil
 	case string:
-		n, _ := strconv.ParseInt(x, 10, 64)
-		return n
+		n, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse int64 %q: %w", x, err)
+		}
+		return n, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported type %T for int64", v)
 	}
 }
 
-func toFloat32(v any) float32 {
+func toFloat32(v any) (float32, error) {
 	switch x := v.(type) {
 	case float32:
-		return x
+		return x, nil
 	case float64:
-		return float32(x)
+		return float32(x), nil
 	case string:
-		f, _ := strconv.ParseFloat(x, 32)
-		return float32(f)
+		f, err := strconv.ParseFloat(x, 32)
+		if err != nil {
+			return 0, fmt.Errorf("parse float32 %q: %w", x, err)
+		}
+		return float32(f), nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported type %T for float32", v)
 	}
 }
 
-func toFloat64(v any) float64 {
+func toFloat64(v any) (float64, error) {
 	switch x := v.(type) {
 	case float64:
-		return x
+		return x, nil
 	case float32:
-		return float64(x)
+		return float64(x), nil
 	case string:
-		f, _ := strconv.ParseFloat(x, 64)
-		return f
+		f, err := strconv.ParseFloat(x, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse float64 %q: %w", x, err)
+		}
+		return f, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported type %T for float64", v)
 	}
 }
 
-func toBool(v any) bool {
+func toBool(v any) (bool, error) {
 	switch x := v.(type) {
 	case bool:
-		return x
+		return x, nil
 	case string:
-		return x == "t" || x == "true" || x == "1"
+		return x == "t" || x == "true" || x == "1", nil
 	default:
-		return false
+		return false, fmt.Errorf("unsupported type %T for bool", v)
 	}
 }
 
-func toTimestampMicros(v any) int64 {
+func toTimestampMicros(v any) (int64, error) {
 	switch x := v.(type) {
 	case time.Time:
-		return x.UnixMicro()
+		return x.UnixMicro(), nil
 	case int64:
-		return x // already microseconds since epoch (e.g. from parquet roundtrip)
+		return x, nil // already microseconds since epoch (e.g. from parquet roundtrip)
 	case int32:
-		return int64(x)
+		return int64(x), nil
 	case string:
-		us, _ := fastParseTimestamp(x)
-		return us
+		us, ok := fastParseTimestamp(x)
+		if !ok {
+			return 0, fmt.Errorf("parse timestamp %q", x)
+		}
+		return us, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported type %T for timestamp", v)
 	}
 }
 
@@ -630,22 +698,23 @@ func atoiN(s string) int {
 	return n
 }
 
-func toDateDays(v any) int32 {
+func toDateDays(v any) (int32, error) {
 	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 	switch x := v.(type) {
 	case time.Time:
-		return int32(x.Sub(epoch).Hours() / 24)
+		return int32(x.Sub(epoch).Hours() / 24), nil
 	case int32:
-		return x // already days since epoch (e.g. from parquet roundtrip)
+		return x, nil // already days since epoch (e.g. from parquet roundtrip)
 	case int64:
-		return int32(x)
+		return int32(x), nil
 	case string:
-		if t, err := time.Parse("2006-01-02", x); err == nil {
-			return int32(t.Sub(epoch).Hours() / 24)
+		t, err := time.Parse("2006-01-02", x)
+		if err != nil {
+			return 0, fmt.Errorf("parse date %q: %w", x, err)
 		}
-		return 0
+		return int32(t.Sub(epoch).Hours() / 24), nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported type %T for date", v)
 	}
 }
 

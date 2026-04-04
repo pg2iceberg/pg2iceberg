@@ -9,6 +9,7 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -62,9 +63,19 @@ func (q *QuerySource) Capture(ctx context.Context, events chan<- ChangeEvent) er
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	pollWithRetry := func() error {
+		return utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+			if err := q.poll(ctx, events); err != nil {
+				q.reconnect(ctx)
+				return err
+			}
+			return nil
+		})
+	}
+
 	// Do an immediate first poll
-	if err := q.poll(ctx, events); err != nil {
-		log.Printf("[query] poll error: %v", err)
+	if err := pollWithRetry(); err != nil {
+		return fmt.Errorf("poll: %w", err)
 	}
 
 	for {
@@ -72,8 +83,8 @@ func (q *QuerySource) Capture(ctx context.Context, events chan<- ChangeEvent) er
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := q.poll(ctx, events); err != nil {
-				log.Printf("[query] poll error: %v", err)
+			if err := pollWithRetry(); err != nil {
+				return fmt.Errorf("poll: %w", err)
 			}
 		}
 	}
@@ -159,6 +170,18 @@ func (q *QuerySource) RemoveTable(tableName string) {
 			return
 		}
 	}
+}
+
+func (q *QuerySource) reconnect(ctx context.Context) {
+	if q.conn != nil {
+		q.conn.Close(ctx)
+	}
+	conn, err := pgx.Connect(ctx, q.pgCfg.DSN())
+	if err != nil {
+		log.Printf("[query] reconnect failed: %v", err)
+		return
+	}
+	q.conn = conn
 }
 
 func (q *QuerySource) Close() error {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -215,7 +216,11 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 
 		// Send standby status periodically so PG knows we're alive.
 		if time.Now().After(nextStandby) {
-			l.sendStandby(ctx)
+			if err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+				return l.sendStandby(ctx)
+			}); err != nil {
+				return fmt.Errorf("standby status: %w", err)
+			}
 			nextStandby = time.Now().Add(standbyInterval)
 		}
 
@@ -252,7 +257,11 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 			return fmt.Errorf("parse keepalive: %w", err)
 		}
 		if pkm.ReplyRequested {
-			l.sendStandby(ctx)
+			if err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+				return l.sendStandby(ctx)
+			}); err != nil {
+				return fmt.Errorf("standby status: %w", err)
+			}
 		}
 
 	case pglogrepl.XLogDataByteID:
@@ -453,11 +462,12 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 
 	if l.startLSN == 0 {
 		lsn, err := pglogrepl.ParseLSN(result.ConsistentPoint)
-		if err == nil {
-			l.startLSN = lsn
-			l.receivedLSN = lsn
-			l.flushedLSN.Store(uint64(lsn))
+		if err != nil {
+			return "", fmt.Errorf("parse consistent point LSN %q: %w", result.ConsistentPoint, err)
 		}
+		l.startLSN = lsn
+		l.receivedLSN = lsn
+		l.flushedLSN.Store(uint64(lsn))
 	}
 
 	l.slotCreated = true
@@ -545,13 +555,10 @@ func (l *LogicalSource) standbyStatus() pglogrepl.StandbyStatusUpdate {
 	}
 }
 
-func (l *LogicalSource) sendStandby(ctx context.Context) {
+func (l *LogicalSource) sendStandby(ctx context.Context) error {
 	// Only confirm the flushed LSN back to PG. This ensures PG will not
 	// recycle WAL that hasn't been durably written to Iceberg.
-	err := pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, l.standbyStatus())
-	if err != nil {
-		log.Printf("[logical] standby status error: %v", err)
-	}
+	return pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, l.standbyStatus())
 }
 
 // SendStandbyNow sends a standby status update to PG immediately.
@@ -566,7 +573,11 @@ func (l *LogicalSource) Close() error {
 	// Close the replication connection first so the slot becomes inactive.
 	if l.replConn != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		l.replConn.Close(ctx)
+		if err := l.replConn.Close(ctx); err != nil {
+			cancel()
+			l.replConn = nil
+			return fmt.Errorf("close replication connection: %w", err)
+		}
 		cancel()
 		l.replConn = nil
 	}

@@ -463,16 +463,28 @@ func valueToHashBytes(value any, pgType string) []byte {
 
 	switch lowerType {
 	case "integer", "int", "int4", "serial":
+		n, err := toInt32(value)
+		if err != nil {
+			return nil
+		}
 		buf := make([]byte, 4)
-		binary.LittleEndian.PutUint32(buf, uint32(toInt32(value)))
+		binary.LittleEndian.PutUint32(buf, uint32(n))
 		return buf
 	case "bigint", "int8", "bigserial":
+		n, err := toInt64(value)
+		if err != nil {
+			return nil
+		}
 		buf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(buf, uint64(toInt64(value)))
+		binary.LittleEndian.PutUint64(buf, uint64(n))
 		return buf
 	case "smallint", "int2":
+		n, err := toInt32(value)
+		if err != nil {
+			return nil
+		}
 		buf := make([]byte, 4)
-		binary.LittleEndian.PutUint32(buf, uint32(toInt32(value)))
+		binary.LittleEndian.PutUint32(buf, uint32(n))
 		return buf
 	case "date":
 		// Hash as days since epoch (int32 LE).
@@ -541,10 +553,16 @@ func applyTruncateTransform(w int, value any, pgType string) any {
 
 	switch lowerType {
 	case "integer", "int", "int4", "serial", "smallint", "int2":
-		v := toInt32(value)
+		v, err := toInt32(value)
+		if err != nil {
+			return value
+		}
 		return truncateInt32(v, int32(w))
 	case "bigint", "int8", "bigserial":
-		v := toInt64(value)
+		v, err := toInt64(value)
+		if err != nil {
+			return value
+		}
 		return truncateInt64(v, int64(w))
 	case "numeric", "decimal":
 		s := toString(value)
@@ -796,7 +814,8 @@ func goavroUnion(avroType string, val any) map[string]any {
 	case "double":
 		return map[string]any{"double": toAvroFloat64Value(val)}
 	case "boolean":
-		return map[string]any{"boolean": toBool(val)}
+		b, _ := toBool(val)
+		return map[string]any{"boolean": b}
 	default:
 		return map[string]any{"string": toString(val)}
 	}

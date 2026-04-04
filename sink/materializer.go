@@ -17,6 +17,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/pg2iceberg/pg2iceberg/worker"
 )
 
@@ -130,6 +131,17 @@ type Materializer struct {
 }
 
 // NewMaterializer creates a new Materializer.
+// downloadWithRetry wraps an S3 download with exponential backoff for transient errors.
+func downloadWithRetry(ctx context.Context, s3 ObjectStorage, key string) ([]byte, error) {
+	var data []byte
+	err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+		var err error
+		data, err = s3.Download(ctx, key)
+		return err
+	})
+	return data, err
+}
+
 func NewMaterializer(cfg config.SinkConfig, catalog Catalog, s3 ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
 	return &Materializer{
 		cfg:                cfg,
@@ -495,17 +507,15 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		for path := range affectedFilePaths {
 			dfKey, err := KeyFromURI(path)
 			if err != nil {
-				continue
+				return fmt.Errorf("TOAST: parse URI %s: %w", path, err)
 			}
-			data, err := s3.Download(ctx, dfKey)
+			data, err := downloadWithRetry(ctx, s3, dfKey)
 			if err != nil {
-				log.Printf("[materializer] TOAST: failed to download %s: %v", path, err)
-				continue
+				return fmt.Errorf("TOAST: download %s: %w", path, err)
 			}
 			rows, err := readParquetRows(data, ts.srcSchema)
 			if err != nil {
-				log.Printf("[materializer] TOAST: failed to read %s: %v", path, err)
-				continue
+				return fmt.Errorf("TOAST: read %s: %w", path, err)
 			}
 			for _, row := range rows {
 				pkKey := buildPKKey(row, pk)
@@ -849,7 +859,7 @@ func (m *Materializer) loadExistingManifests(ctx context.Context, s3 ObjectStora
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := s3.Download(ctx, mlKey)
+	mlData, err := downloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -889,7 +899,7 @@ func (m *Materializer) buildFileIndex(ctx context.Context, pgTable string, ts *t
 	for _, df := range allFiles {
 		dfKey, err := KeyFromURI(df.Path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse data file URI %s: %w", df.Path, err)
 		}
 		tasks = append(tasks, worker.Task{
 			Name: dfKey,
@@ -935,7 +945,7 @@ func (m *Materializer) loadAllDataFiles(ctx context.Context, s3 ObjectStorage, t
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := s3.Download(ctx, mlKey)
+	mlData, err := downloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -951,15 +961,15 @@ func (m *Materializer) loadAllDataFiles(ctx context.Context, s3 ObjectStorage, t
 		}
 		mKey, err := KeyFromURI(mfi.Path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
 		}
-		mData, err := s3.Download(ctx, mKey)
+		mData, err := downloadWithRetry(ctx, s3, mKey)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
 		}
 		entries, err := ReadManifest(mData)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read manifest %s: %w", mfi.Path, err)
 		}
 		for _, e := range entries {
 			if e.Status == 2 || e.DataFile.Content != 0 {
@@ -983,7 +993,7 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := s3.Download(ctx, mlKey)
+	mlData, err := downloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -1004,15 +1014,15 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 
 		mKey, err := KeyFromURI(mfi.Path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
 		}
-		mData, err := s3.Download(ctx, mKey)
+		mData, err := downloadWithRetry(ctx, s3, mKey)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
 		}
 		entries, err := ReadManifest(mData)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read manifest %s: %w", mfi.Path, err)
 		}
 		for _, e := range entries {
 			if e.Status == 2 || e.DataFile.Content != 0 {
@@ -1034,25 +1044,31 @@ func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files [
 	for _, df := range files {
 		key, err := KeyFromURI(df.Path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse event file URI %s: %w", df.Path, err)
 		}
-		data, err := s3.Download(ctx, key)
+		data, err := downloadWithRetry(ctx, s3, key)
 		if err != nil {
-			log.Printf("[materializer] failed to download event file %s: %v", df.Path, err)
-			continue
+			return nil, fmt.Errorf("download event file %s: %w", df.Path, err)
 		}
 
 		rows, err := readParquetRows(data, eventsSchema)
 		if err != nil {
-			log.Printf("[materializer] failed to read event file %s: %v", df.Path, err)
-			continue
+			return nil, fmt.Errorf("read event file %s: %w", df.Path, err)
 		}
 
 		for _, row := range rows {
+			lsn, err := toInt64(row["_lsn"])
+			if err != nil {
+				return nil, fmt.Errorf("parse _lsn in %s: %w", df.Path, err)
+			}
+			seq, err := toInt64(row["_seq"])
+			if err != nil {
+				return nil, fmt.Errorf("parse _seq in %s: %w", df.Path, err)
+			}
 			ev := changeEvent{
 				op:  fmt.Sprintf("%v", row["_op"]),
-				lsn: toInt64(row["_lsn"]),
-				seq: toInt64(row["_seq"]),
+				lsn: lsn,
+				seq: seq,
 			}
 
 			// Parse unchanged cols.
@@ -1177,7 +1193,11 @@ func readParquetPKKeysFromReaderAt(r io.ReaderAt, size int64, pk []string) ([]st
 				}
 				pageValues := page.Values()
 				vBuf := make([]pq.Value, page.NumValues())
-				n, _ := pageValues.ReadValues(vBuf)
+				n, err := pageValues.ReadValues(vBuf)
+				if err != nil && err != io.EOF {
+					pages.Close()
+					return nil, fmt.Errorf("read PK values from %s column: %w", p, err)
+				}
 				for i := 0; i < n; i++ {
 					if vBuf[i].IsNull() {
 						vals = append(vals, "<nil>")
