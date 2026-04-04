@@ -64,7 +64,7 @@ func (q *QuerySource) Capture(ctx context.Context, events chan<- ChangeEvent) er
 
 	// Do an immediate first poll
 	if err := q.poll(ctx, events); err != nil {
-		log.Printf("[query] poll error: %v", err)
+		return fmt.Errorf("poll: %w", err)
 	}
 
 	for {
@@ -73,7 +73,7 @@ func (q *QuerySource) Capture(ctx context.Context, events chan<- ChangeEvent) er
 			return ctx.Err()
 		case <-ticker.C:
 			if err := q.poll(ctx, events); err != nil {
-				log.Printf("[query] poll error: %v", err)
+				return fmt.Errorf("poll: %w", err)
 			}
 		}
 	}
