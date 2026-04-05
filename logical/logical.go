@@ -1,4 +1,4 @@
-package source
+package logical
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -24,7 +24,7 @@ type LogicalSource struct {
 	pgCfg      config.PostgresConfig
 	cfg        config.LogicalConfig
 	tableCfgs  []config.TableConfig
-	tables     map[string]*schema.TableSchema
+	tables     map[string]*postgres.TableSchema
 	pipelineID string
 
 	replConn  *pgconn.PgConn
@@ -78,7 +78,7 @@ func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConf
 		pgCfg:           pgCfg,
 		cfg:             logicalCfg,
 		tableCfgs:       tableCfgs,
-		tables:          make(map[string]*schema.TableSchema),
+		tables:          make(map[string]*postgres.TableSchema),
 		relations:       make(map[uint32]*pglogrepl.RelationMessageV2),
 		decoder:         NewWALDecoder(),
 		pipelineID:      pid,
@@ -124,7 +124,7 @@ func (l *LogicalSource) SetFlushedLSN(lsn uint64) {
 	l.flushedLSN.Store(lsn)
 }
 
-func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) error {
+func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.ChangeEvent) error {
 	// Open a regular connection for schema discovery and slot management.
 	var err error
 	l.queryConn, err = pgx.Connect(ctx, l.pgCfg.DSN())
@@ -135,7 +135,7 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 
 	// Discover schemas for configured tables.
 	for _, tc := range l.tableCfgs {
-		ts, err := schema.DiscoverSchema(ctx, l.queryConn, tc.Name)
+		ts, err := postgres.DiscoverSchema(ctx, l.queryConn, tc.Name)
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
@@ -181,7 +181,7 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 		// Signal to the pipeline that the snapshot is done so it can persist
 		// the flag in the checkpoint.
 		select {
-		case events <- ChangeEvent{Operation: OpSnapshotComplete}:
+		case events <- postgres.ChangeEvent{Operation: postgres.OpSnapshotComplete}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -249,7 +249,7 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 	}
 }
 
-func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyData, events chan<- ChangeEvent) error {
+func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyData, events chan<- postgres.ChangeEvent) error {
 	switch msg.Data[0] {
 	case pglogrepl.PrimaryKeepaliveMessageByteID:
 		pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
@@ -282,7 +282,7 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 	return nil
 }
 
-func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, events chan<- ChangeEvent) error {
+func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, events chan<- postgres.ChangeEvent) error {
 	msg, err := l.decoder.Decode(xld.WALData)
 	if err != nil {
 		return fmt.Errorf("decode WAL: %w", err)
@@ -302,9 +302,9 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 					log.Printf("[logical] schema change detected for %s: +%d columns, -%d columns, %d type changes",
 						table, len(diff.AddedColumns), len(diff.DroppedColumns), len(diff.TypeChanges))
 					select {
-					case events <- ChangeEvent{
+					case events <- postgres.ChangeEvent{
 						Table:        table,
-						Operation:    OpSchemaChange,
+						Operation:    postgres.OpSchemaChange,
 						SchemaChange: diff,
 						LSN:          walEnd,
 					}:
@@ -328,9 +328,9 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		ts := l.schemaForRelation(rel)
 
 		select {
-		case events <- ChangeEvent{
+		case events <- postgres.ChangeEvent{
 			Table:              table,
-			Operation:          OpInsert,
+			Operation:          postgres.OpInsert,
 			After:              msg.After,
 			PK:                 ts.PK,
 			LSN:                walEnd,
@@ -355,9 +355,9 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		unchangedCols := ExtractUnchangedCols(msg.After)
 
 		select {
-		case events <- ChangeEvent{
+		case events <- postgres.ChangeEvent{
 			Table:              table,
-			Operation:          OpUpdate,
+			Operation:          postgres.OpUpdate,
 			Before:             msg.Before,
 			PK:                 ts.PK,
 			After:              msg.After,
@@ -383,9 +383,9 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		ts := l.schemaForRelation(rel)
 
 		select {
-		case events <- ChangeEvent{
+		case events <- postgres.ChangeEvent{
 			Table:              table,
-			Operation:          OpDelete,
+			Operation:          postgres.OpDelete,
 			Before:             msg.Before,
 			PK:                 ts.PK,
 			LSN:                walEnd,
@@ -401,8 +401,8 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		l.currentTxCommitTime = msg.CommitTime
 		l.currentTxXID = msg.Xid
 		select {
-		case events <- ChangeEvent{
-			Operation:      OpBegin,
+		case events <- postgres.ChangeEvent{
+			Operation:      postgres.OpBegin,
 			LSN:            walEnd,
 			TransactionID:  msg.Xid,
 			SourceTimestamp: msg.CommitTime,
@@ -413,8 +413,8 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 	case msgCommit:
 		select {
-		case events <- ChangeEvent{
-			Operation:      OpCommit,
+		case events <- postgres.ChangeEvent{
+			Operation:      postgres.OpCommit,
 			LSN:            walEnd,
 			TransactionID:  l.currentTxXID,
 			SourceTimestamp: msg.CommitTime,
@@ -479,7 +479,7 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 // When snapshotName is non-empty (fresh slot), each per-table transaction is
 // pinned to the exported snapshot. On crash recovery (empty snapshotName),
 // a plain REPEATABLE READ transaction is used instead.
-func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string, events chan<- ChangeEvent) error {
+func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string, events chan<- postgres.ChangeEvent) error {
 	var tables []SnapshotTable
 	for _, tc := range l.tableCfgs {
 		if tc.SkipSnapshot {
@@ -636,15 +636,15 @@ func (l *LogicalSource) isTracked(table string) bool {
 	return false
 }
 
-func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *schema.TableSchema {
+func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *postgres.TableSchema {
 	table := fqTable(rel.Namespace, rel.RelationName)
 	if ts, ok := l.tables[table]; ok {
 		return ts
 	}
 	// Build a minimal schema from the relation message
-	ts := &schema.TableSchema{Table: table}
+	ts := &postgres.TableSchema{Table: table}
 	for i, col := range rel.Columns {
-		ts.Columns = append(ts.Columns, schema.Column{
+		ts.Columns = append(ts.Columns, postgres.Column{
 			Name:    col.Name,
 			PGType:  oidToPGType(col.DataType),
 			FieldID: i + 1,
@@ -740,9 +740,9 @@ func oidToPGType(oid uint32) string {
 	return "text"
 }
 
-// diffRelation compares two RelationMessageV2 and returns a SchemaChange if
+// diffRelation compares two RelationMessageV2 and returns a postgres.SchemaChange if
 // columns were added, dropped, or changed type. Returns nil when identical.
-func diffRelation(old, new *pglogrepl.RelationMessageV2) *SchemaChange {
+func diffRelation(old, new *pglogrepl.RelationMessageV2) *postgres.SchemaChange {
 	oldCols := make(map[string]uint32, len(old.Columns))
 	for _, c := range old.Columns {
 		oldCols[c.Name] = c.DataType
@@ -752,18 +752,18 @@ func diffRelation(old, new *pglogrepl.RelationMessageV2) *SchemaChange {
 		newCols[c.Name] = c.DataType
 	}
 
-	var sc SchemaChange
+	var sc postgres.SchemaChange
 
 	// Detect added columns and type changes.
 	for _, c := range new.Columns {
 		oldOID, existed := oldCols[c.Name]
 		if !existed {
-			sc.AddedColumns = append(sc.AddedColumns, SchemaColumn{
+			sc.AddedColumns = append(sc.AddedColumns, postgres.SchemaColumn{
 				Name:   c.Name,
 				PGType: oidToPGType(c.DataType),
 			})
 		} else if oldOID != c.DataType {
-			sc.TypeChanges = append(sc.TypeChanges, TypeChange{
+			sc.TypeChanges = append(sc.TypeChanges, postgres.TypeChange{
 				Name:    c.Name,
 				OldType: oidToPGType(oldOID),
 				NewType: oidToPGType(c.DataType),

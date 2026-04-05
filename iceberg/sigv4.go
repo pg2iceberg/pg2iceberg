@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"bytes"

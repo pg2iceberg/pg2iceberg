@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"encoding/base64"
@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/spaolacci/murmur3"
 )
 
@@ -25,7 +25,7 @@ type PartitionField struct {
 	TransformParam int    // N for bucket[N], W for truncate[W]
 
 	// Cached column metadata for hot-path lookups (set by BuildPartitionSpec).
-	sourceCol *schema.Column
+	sourceCol *postgres.Column
 }
 
 // PartitionSpec describes the partition spec for an Iceberg table.
@@ -76,10 +76,10 @@ func parsePartitionExpr(expr string) (transform, column string, param int, err e
 	return "identity", expr, 0, nil
 }
 
-// BuildPartitionSpec builds a PartitionSpec from config expressions and table schema.
+// BuildPartitionSpec builds a PartitionSpec from config expressions and table postgres.
 // Each expression is either "transform(column)" (e.g. "day(created_at)") or just
 // "column" for identity transform (e.g. "region").
-func BuildPartitionSpec(exprs []string, ts *schema.TableSchema) (*PartitionSpec, error) {
+func BuildPartitionSpec(exprs []string, ts *postgres.TableSchema) (*PartitionSpec, error) {
 	if len(exprs) == 0 {
 		return &PartitionSpec{}, nil
 	}
@@ -146,7 +146,7 @@ func (ps *PartitionSpec) IsUnpartitioned() bool {
 // PartitionKey computes the partition key string for a row.
 // Returns only the string key — use PartitionValues separately when the
 // partition value map is needed (e.g. on cache miss).
-func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *schema.TableSchema) string {
+func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *postgres.TableSchema) string {
 	if ps.IsUnpartitioned() {
 		return ""
 	}
@@ -182,7 +182,7 @@ func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *schema.TableSchema
 
 // PartitionValues computes the partition value map for a row.
 // Only needed when persisting partition metadata (e.g. new partition creation).
-func (ps *PartitionSpec) PartitionValues(row map[string]any, ts *schema.TableSchema) map[string]any {
+func (ps *PartitionSpec) PartitionValues(row map[string]any, ts *postgres.TableSchema) map[string]any {
 	values := make(map[string]any, len(ps.Fields))
 	for _, field := range ps.Fields {
 		col := field.sourceCol
@@ -277,7 +277,7 @@ func (f *PartitionField) transformString() string {
 }
 
 // PartitionRecordSchemaAvro returns the Avro schema for the partition tuple in manifest entries.
-func (ps *PartitionSpec) PartitionRecordSchemaAvro(ts *schema.TableSchema) string {
+func (ps *PartitionSpec) PartitionRecordSchemaAvro(ts *postgres.TableSchema) string {
 	if ps.IsUnpartitioned() {
 		return `{"type": "record", "name": "r102", "fields": []}`
 	}
@@ -293,7 +293,7 @@ func (ps *PartitionSpec) PartitionRecordSchemaAvro(ts *schema.TableSchema) strin
 }
 
 // PartitionAvroValue returns the partition values formatted for Avro encoding in manifest entries.
-func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *schema.TableSchema) map[string]any {
+func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *postgres.TableSchema) map[string]any {
 	if ps.IsUnpartitioned() || len(partValues) == 0 {
 		return map[string]any{}
 	}
@@ -314,7 +314,7 @@ func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *schem
 // ParsePartitionPath reverses a partition path like "seq_truncate=0" back into
 // partition values. Used when the original row is not available (e.g. DELETE
 // events resolved from the file index).
-func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema) map[string]any {
+func (ps *PartitionSpec) ParsePartitionPath(path string, ts *postgres.TableSchema) map[string]any {
 	values := make(map[string]any, len(ps.Fields))
 	parts := strings.Split(path, "/")
 	for _, part := range parts {
@@ -348,9 +348,25 @@ func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema)
 	return values
 }
 
+// ExtractPartBucketKey extracts the partition bucket key from a file path.
+// For a path like "ns.db/table/data/region=us/abc.parquet", returns "region=us".
+func ExtractPartBucketKey(filePath string) string {
+	// Find the data/ segment and extract everything between it and the filename.
+	idx := strings.Index(filePath, "/data/")
+	if idx < 0 {
+		return ""
+	}
+	rest := filePath[idx+6:] // after "/data/"
+	lastSlash := strings.LastIndex(rest, "/")
+	if lastSlash < 0 {
+		return "" // no partition directory
+	}
+	return rest[:lastSlash]
+}
+
 // --- helpers ---
 
-func findColumn(ts *schema.TableSchema, name string) *schema.Column {
+func findColumn(ts *postgres.TableSchema, name string) *postgres.Column {
 	for i := range ts.Columns {
 		if ts.Columns[i].Name == name {
 			return &ts.Columns[i]
@@ -359,7 +375,7 @@ func findColumn(ts *schema.TableSchema, name string) *schema.Column {
 	return nil
 }
 
-func findColumnByID(ts *schema.TableSchema, fieldID int) *schema.Column {
+func findColumnByID(ts *postgres.TableSchema, fieldID int) *postgres.Column {
 	for i := range ts.Columns {
 		if ts.Columns[i].FieldID == fieldID {
 			return &ts.Columns[i]
@@ -411,26 +427,26 @@ func applyTransform(transform string, param int, value any, pgType string) any {
 	case "identity":
 		return value
 	case "year":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
 		return int32(t.Year() - 1970)
 	case "month":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
 		return int32((t.Year()-1970)*12 + int(t.Month()) - 1)
 	case "day":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
 		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 		return int32(t.Sub(epoch).Hours() / 24)
 	case "hour":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
@@ -463,7 +479,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 
 	switch lowerType {
 	case "integer", "int", "int4", "serial":
-		n, err := toInt32(value)
+		n, err := ToInt32(value)
 		if err != nil {
 			return nil
 		}
@@ -471,7 +487,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		binary.LittleEndian.PutUint32(buf, uint32(n))
 		return buf
 	case "bigint", "int8", "bigserial":
-		n, err := toInt64(value)
+		n, err := ToInt64(value)
 		if err != nil {
 			return nil
 		}
@@ -479,7 +495,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		binary.LittleEndian.PutUint64(buf, uint64(n))
 		return buf
 	case "smallint", "int2":
-		n, err := toInt32(value)
+		n, err := ToInt32(value)
 		if err != nil {
 			return nil
 		}
@@ -488,7 +504,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		return buf
 	case "date":
 		// Hash as days since epoch (int32 LE).
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
@@ -500,7 +516,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 	case "timestamp", "timestamp without time zone",
 		"timestamptz", "timestamp with time zone":
 		// Hash as microseconds since epoch (int64 LE).
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
@@ -510,26 +526,26 @@ func valueToHashBytes(value any, pgType string) []byte {
 		binary.LittleEndian.PutUint64(buf, uint64(micros))
 		return buf
 	case "text", "varchar", "character varying", "char", "character", "name":
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	case "uuid":
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	case "bytea":
 		if b, ok := value.([]byte); ok {
 			return b
 		}
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	case "numeric", "decimal":
 		return decimalToHashBytes(value)
 	default:
 		// Fall back to string hash.
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	}
 }
 
 // decimalToHashBytes converts a decimal value to its unscaled 2's complement big-endian bytes
 // for Murmur3 hashing per the Iceberg spec.
 func decimalToHashBytes(value any) []byte {
-	s := toString(value)
+	s := ToString(value)
 	// Parse as big.Float to handle arbitrary precision.
 	f, _, err := new(big.Float).Parse(s, 10)
 	if err != nil {
@@ -553,28 +569,28 @@ func applyTruncateTransform(w int, value any, pgType string) any {
 
 	switch lowerType {
 	case "integer", "int", "int4", "serial", "smallint", "int2":
-		v, err := toInt32(value)
+		v, err := ToInt32(value)
 		if err != nil {
 			return value
 		}
 		return truncateInt32(v, int32(w))
 	case "bigint", "int8", "bigserial":
-		v, err := toInt64(value)
+		v, err := ToInt64(value)
 		if err != nil {
 			return value
 		}
 		return truncateInt64(v, int64(w))
 	case "numeric", "decimal":
-		s := toString(value)
+		s := ToString(value)
 		return truncateDecimal(s, w)
 	case "bytea":
 		return truncateBytes(value, w)
 	case "text", "varchar", "character varying", "char", "character", "name":
-		s := toString(value)
+		s := ToString(value)
 		return truncateString(s, w)
 	default:
 		// For other types, fall back to string truncation.
-		s := toString(value)
+		s := ToString(value)
 		return truncateString(s, w)
 	}
 }
@@ -633,7 +649,7 @@ func truncateBytes(value any, w int) string {
 			raw = []byte(v)
 		}
 	default:
-		raw = []byte(toString(value))
+		raw = []byte(ToString(value))
 	}
 
 	if w < len(raw) {
@@ -722,11 +738,11 @@ func formatUnscaled(unscaled *big.Int, scale int) string {
 	return result
 }
 
-// toTime converts a value to time.Time for partition transforms.
-// Uses fastParseTimestamp (microseconds) to avoid time.Parse overhead.
+// ToTime converts a value to time.Time for partition transforms.
+// Uses FastParseTimestamp (microseconds) to avoid time.Parse overhead.
 // Also handles int64 (microseconds since epoch) and int32 (days since epoch)
 // for values roundtripped through parquet.
-func toTime(v any, pgType string) time.Time {
+func ToTime(v any, pgType string) time.Time {
 	switch x := v.(type) {
 	case time.Time:
 		return x
@@ -749,7 +765,7 @@ func toTime(v any, pgType string) time.Time {
 			}
 			return time.Time{}
 		}
-		us, ok := fastParseTimestamp(x)
+		us, ok := FastParseTimestamp(x)
 		if ok {
 			return time.Unix(us/1_000_000, (us%1_000_000)*1000)
 		}
@@ -758,7 +774,7 @@ func toTime(v any, pgType string) time.Time {
 }
 
 // partitionFieldAvroType returns the Avro type for a partition field's transformed value.
-func partitionFieldAvroType(transform string, ts *schema.TableSchema, sourceID int) string {
+func partitionFieldAvroType(transform string, ts *postgres.TableSchema, sourceID int) string {
 	switch transform {
 	case "year", "month", "day", "hour", "bucket":
 		return "int"
@@ -767,13 +783,13 @@ func partitionFieldAvroType(transform string, ts *schema.TableSchema, sourceID i
 		if col == nil {
 			return "string"
 		}
-		return icebergToAvroType(schema.IcebergType(col.PGType))
+		return icebergToAvroType(postgres.IcebergType(col.PGType))
 	case "identity":
 		col := findColumnByID(ts, sourceID)
 		if col == nil {
 			return "string"
 		}
-		return icebergToAvroType(schema.IcebergType(col.PGType))
+		return icebergToAvroType(postgres.IcebergType(col.PGType))
 	default:
 		return "string"
 	}
@@ -814,10 +830,10 @@ func goavroUnion(avroType string, val any) map[string]any {
 	case "double":
 		return map[string]any{"double": toAvroFloat64Value(val)}
 	case "boolean":
-		b, _ := toBool(val)
+		b, _ := ToBool(val)
 		return map[string]any{"boolean": b}
 	default:
-		return map[string]any{"string": toString(val)}
+		return map[string]any{"string": ToString(val)}
 	}
 }
 

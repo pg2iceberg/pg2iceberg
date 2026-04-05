@@ -40,6 +40,44 @@ graph LR
 On logical replication mode (the recommended mode), it replicates change events to an append-only Iceberg table, which acts as a WAL. Once change events are written to this table, the replication slot LSN can be safely advanced. Since append-only write to Iceberg is fast, this minimizes the likelihood of the source database retaining too much WAL.
 
 A materializer, which runs at a separate interval, will then take these change events and merge them into its corresponding target tables, which will have the same schema as the source tables. If you don't need near real-time replication, just set the materializer interval to something high (e.g. 1 hour), which will essentially make pg2iceberg behave like a batch replication tool.
+∏
+### Query mode
+
+```mermaid
+graph LR
+  subgraph Postgres
+      TableA["Table A"]
+      TableB["Table B"]
+  end
+
+  subgraph Iceberg
+      TargetA[Table A]
+      TargetB[Table B]
+  end
+
+  TableA -->|"SELECT WHERE watermark > $1"| TargetA
+  TableB -->|"SELECT WHERE watermark > $1"| TargetB
+```
+
+On query mode, pg2iceberg polls Postgres using watermark-based SELECT queries and writes directly to the materialized Iceberg tables. Each row is an upsert (equality delete + insert) keyed by primary key.
+
+Query mode is simpler but cannot detect hard deletes and has no transaction semantics. Use logical mode when you need full CDC fidelity.
+
+## Code structure
+
+```
+pg2iceberg/
+├── cmd/pg2iceberg/  # entry point, mode dispatch
+├── config/          # YAML config parsing & validation
+├── iceberg/         # shared Iceberg primitives (catalog, S3, Parquet, manifest, TableWriter)
+├── logical/         # logical replication mode (WAL capture, events table, materializer)
+├── pipeline/        # shared infrastructure (Pipeline interface, checkpoint, metrics)
+├── postgres/        # shared PG types (TableSchema, ChangeEvent, Op)
+├── query/           # query polling mode (watermark poller, PK buffer, pipeline)
+└── utils/           # retry helper, task pool
+```
+
+Both modes share `iceberg.TableWriter` for the final write path (partition bucketing, Parquet serialization, S3 upload, manifest assembly, catalog commit). Logical mode adds a two-tier architecture (events table + materializer) on top, query mode calls the TableWriter directly.
 
 ## Quickstart
 

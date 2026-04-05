@@ -1,9 +1,9 @@
-package sink
+package iceberg
 
 import (
 	"strings"
 
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
 // EventsTableName returns the Iceberg table name for the events table.
@@ -16,9 +16,9 @@ func EventsTableName(icebergTable string) string {
 // The events table prepends metadata columns (_op, _lsn, _ts, _seq, _unchanged_cols)
 // and forces all user columns to be nullable (since DELETEs only carry PK values,
 // and TOAST updates have null for unchanged columns).
-func EventsTableSchema(src *schema.TableSchema) *schema.TableSchema {
+func EventsTableSchema(src *postgres.TableSchema) *postgres.TableSchema {
 	// Metadata columns use field IDs starting at 1.
-	metaCols := []schema.Column{
+	metaCols := []postgres.Column{
 		{Name: "_op", PGType: "text", IsNullable: false, FieldID: 1},
 		{Name: "_lsn", PGType: "int8", IsNullable: false, FieldID: 2},
 		{Name: "_ts", PGType: "timestamptz", IsNullable: false, FieldID: 3},
@@ -30,10 +30,10 @@ func EventsTableSchema(src *schema.TableSchema) *schema.TableSchema {
 	// source schema's field IDs. This preserves monotonicity when columns are
 	// dropped: the remaining columns keep their original field IDs, so the max
 	// field ID never decreases.
-	cols := make([]schema.Column, 0, len(metaCols)+len(src.Columns))
+	cols := make([]postgres.Column, 0, len(metaCols)+len(src.Columns))
 	cols = append(cols, metaCols...)
 	for _, col := range src.Columns {
-		cols = append(cols, schema.Column{
+		cols = append(cols, postgres.Column{
 			Name:       col.Name,
 			PGType:     col.PGType,
 			IsNullable: true, // always nullable in events table
@@ -41,15 +41,15 @@ func EventsTableSchema(src *schema.TableSchema) *schema.TableSchema {
 		})
 	}
 
-	return &schema.TableSchema{
+	return &postgres.TableSchema{
 		Table:   src.Table,
 		Columns: cols,
 		PK:      nil, // events table has no PK — it's append-only
 	}
 }
 
-// opString returns the single-character operation code for an event.
-func opString(op string) string {
+// OpString returns the single-character operation code for an event.
+func OpString(op string) string {
 	switch op {
 	case "INSERT":
 		return "I"
@@ -62,9 +62,9 @@ func opString(op string) string {
 	}
 }
 
-// unchangedColsString joins unchanged column names into a comma-separated string.
+// UnchangedColsString joins unchanged column names into a comma-separated string.
 // Returns "" if there are no unchanged columns.
-func unchangedColsString(cols []string) string {
+func UnchangedColsString(cols []string) string {
 	if len(cols) == 0 {
 		return ""
 	}

@@ -1,6 +1,6 @@
 //go:build integration
 
-package pipeline_test
+package logical_test
 
 import (
 	"context"
@@ -15,9 +15,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
-	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/pg2iceberg/pg2iceberg/sink"
-	"github.com/pg2iceberg/pg2iceberg/source"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
+	
+	"github.com/pg2iceberg/pg2iceberg/iceberg"
+	"github.com/pg2iceberg/pg2iceberg/logical"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/network"
@@ -84,9 +85,9 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	mem := newMemStorage()
 	cat := newMemCatalog()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
 
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -99,7 +100,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	// Wait for pipeline to be running (snapshot complete).
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -273,8 +274,8 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	mem := newGatedStorage()
 	cat := newMemCatalog()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -286,7 +287,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -422,8 +423,8 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 	mem := newMemStorage()
 	cat := newFailOnceCatalog()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -435,7 +436,7 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -539,7 +540,7 @@ func (s *gatedStorage) Upload(ctx context.Context, key string, data []byte) (str
 	return s.memStorage.Upload(ctx, key, data)
 }
 
-func waitForStatus(t *testing.T, p *pipeline.Pipeline, target pipeline.Status, timeout time.Duration) {
+func waitForStatus(t *testing.T, p *logical.Pipeline, target pipeline.Status, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
 	for {
@@ -634,11 +635,11 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := sink.NewChangeEventBuffer()
+	eventBuf := logical.NewChangeEventBuffer()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
 
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 	p.SetEventBuf(eventBuf)
 
 	if err := p.Start(ctx); err != nil {
@@ -651,7 +652,7 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -738,7 +739,7 @@ func newTrackingCatalog() *trackingCatalog {
 	return &trackingCatalog{memCatalog: newMemCatalog()}
 }
 
-func (c *trackingCatalog) CommitTransaction(ns string, commits []sink.TableCommit) error {
+func (c *trackingCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
 	var tables []string
 	for _, tc := range commits {
 		tables = append(tables, tc.Table)
@@ -773,13 +774,13 @@ func (c *trackingCatalog) matCommits() [][]string {
 // PushEvents call. This simulates the race where DrainAll fires between the
 // first and second PushEvents in Sink.Flush().
 type gatedEventBuffer struct {
-	buf         *sink.ChangeEventBuffer
+	buf         *logical.ChangeEventBuffer
 	pushCount   atomic.Int32
 	firstPushed chan struct{} // closed after first PushEvents completes
 	proceed     chan struct{} // test closes this to unblock second PushEvents
 }
 
-func newGatedEventBuffer(buf *sink.ChangeEventBuffer) *gatedEventBuffer {
+func newGatedEventBuffer(buf *logical.ChangeEventBuffer) *gatedEventBuffer {
 	return &gatedEventBuffer{
 		buf:         buf,
 		firstPushed: make(chan struct{}),
@@ -787,7 +788,7 @@ func newGatedEventBuffer(buf *sink.ChangeEventBuffer) *gatedEventBuffer {
 	}
 }
 
-func (g *gatedEventBuffer) PushEvents(pgTable string, events []sink.ChangeEvent, snapID int64) {
+func (g *gatedEventBuffer) PushEvents(pgTable string, events []logical.MatEvent, snapID int64) {
 	g.buf.PushEvents(pgTable, events, snapID)
 	if g.pushCount.Add(1) == 1 {
 		close(g.firstPushed) // signal: first table pushed
@@ -868,12 +869,12 @@ func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
 
 	// Wire up: gated buffer wraps real buffer. Sink sees the gate (blocks
 	// between pushes), materializer sees the real buffer (can drain).
-	realBuf := sink.NewChangeEventBuffer()
+	realBuf := logical.NewChangeEventBuffer()
 	gate := newGatedEventBuffer(realBuf)
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, gate)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, gate)
 
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 	p.SetEventBuf(realBuf) // materializer uses the real buffer directly
 
 	if err := p.Start(ctx); err != nil {
@@ -886,7 +887,7 @@ func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	if _, ok := p.Source().(*source.LogicalSource); !ok {
+	if p.Source() == nil {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
 
@@ -1060,37 +1061,37 @@ func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
 // memCatalog is an in-memory Catalog implementation for testing.
 type memCatalog struct {
 	mu     sync.Mutex
-	tables map[string]*sink.TableMetadata // keyed by "ns.table"
+	tables map[string]*iceberg.TableMetadata // keyed by "ns.table"
 	nextID int64
 }
 
 func newMemCatalog() *memCatalog {
 	return &memCatalog{
-		tables: make(map[string]*sink.TableMetadata),
+		tables: make(map[string]*iceberg.TableMetadata),
 		nextID: 1,
 	}
 }
 
 func (c *memCatalog) EnsureNamespace(ns string) error { return nil }
 
-func (c *memCatalog) LoadTable(ns, table string) (*sink.TableMetadata, error) {
+func (c *memCatalog) LoadTable(ns, table string) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := c.tables[ns+"."+table]
 	return tm, nil
 }
 
-func (c *memCatalog) CreateTable(ns, table string, ts *schema.TableSchema, location string, partSpec *sink.PartitionSpec) (*sink.TableMetadata, error) {
+func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tm := &sink.TableMetadata{}
+	tm := &iceberg.TableMetadata{}
 	tm.Metadata.FormatVersion = 2
 	tm.Metadata.Location = location
 	c.tables[ns+"."+table] = tm
 	return tm, nil
 }
 
-func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot sink.SnapshotCommit) error {
+func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot iceberg.SnapshotCommit) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := ns + "." + table
@@ -1119,7 +1120,7 @@ func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, s
 	return nil
 }
 
-func (c *memCatalog) CommitTransaction(ns string, commits []sink.TableCommit) error {
+func (c *memCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
 	for _, tc := range commits {
 		if err := c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
@@ -1128,7 +1129,7 @@ func (c *memCatalog) CommitTransaction(ns string, commits []sink.TableCommit) er
 	return nil
 }
 
-func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *schema.TableSchema) (int, error) {
+func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
 }
 
@@ -1148,7 +1149,7 @@ func newFailOnceCatalog() *failOnceCatalog {
 	}
 }
 
-func (c *failOnceCatalog) CommitTransaction(ns string, commits []sink.TableCommit) error {
+func (c *failOnceCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
 	n := c.commitCalls.Add(1)
 	if n == 1 {
 		c.once.Do(func() { close(c.failedCh) })
@@ -1204,7 +1205,7 @@ func newFailNTimesCatalog(n int) *failNTimesCatalog {
 	}
 }
 
-func (c *failNTimesCatalog) CommitTransaction(ns string, commits []sink.TableCommit) error {
+func (c *failNTimesCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
 	call := int(c.commitCalls.Add(1))
 	if call <= c.failCount {
 		if call == c.failCount {
@@ -1293,8 +1294,8 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 
 	mem := newFailNTimesStorage(2)
 	cat := newMemCatalog()
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1302,7 +1303,7 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*source.LogicalSource)
+	ls := p.Source()
 	lsnAfterSnapshot := ls.FlushedLSN()
 
 	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
@@ -1341,8 +1342,8 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newFailNTimesCatalog(3)
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1350,7 +1351,7 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*source.LogicalSource)
+	ls := p.Source()
 	lsnAfterSnapshot := ls.FlushedLSN()
 
 	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
@@ -1457,8 +1458,8 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newMemCatalog()
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1466,7 +1467,7 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*source.LogicalSource)
+	ls := p.Source()
 
 	// Phase 1: Confirm streaming works.
 	pgDirectHost, _ := pgCtr.Host(ctx)

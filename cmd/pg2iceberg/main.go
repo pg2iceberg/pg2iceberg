@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/logical"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"github.com/pg2iceberg/pg2iceberg/query"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -55,12 +57,28 @@ func runSingle(ctx context.Context, configPath string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	p, err := pipeline.BuildPipeline(ctx, "default", cfg)
-	if err != nil {
-		return fmt.Errorf("build pipeline: %w", err)
-	}
-	if err := p.Start(ctx); err != nil {
-		return err
+	var r pipeline.Pipeline
+
+	switch cfg.Source.Mode {
+	case "query":
+		qp, err := query.BuildPipeline(ctx, "default", cfg)
+		if err != nil {
+			return fmt.Errorf("build query pipeline: %w", err)
+		}
+		if err := qp.Start(ctx); err != nil {
+			return err
+		}
+		r = qp
+
+	default: // "logical" or unspecified
+		lp, err := logical.BuildPipeline(ctx, "default", cfg)
+		if err != nil {
+			return fmt.Errorf("build logical pipeline: %w", err)
+		}
+		if err := lp.Start(ctx); err != nil {
+			return err
+		}
+		r = lp
 	}
 
 	// Start a lightweight metrics server.
@@ -68,25 +86,25 @@ func runSingle(ctx context.Context, configPath string) error {
 	if metricsAddr == "" {
 		metricsAddr = ":9090"
 	}
-	startMetricsServer(ctx, metricsAddr, p)
+	startMetricsServer(ctx, metricsAddr, r)
 
-	<-p.Done()
-	if status, err := p.Status(); status == pipeline.StatusError && err != nil {
+	<-r.Done()
+	if status, err := r.Status(); status == pipeline.StatusError && err != nil {
 		return err
 	}
 	return nil
 }
 
-func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) {
+func startMetricsServer(ctx context.Context, addr string, r pipeline.Pipeline) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		status, _ := p.Status()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r2 *http.Request) {
+		status, _ := r.Status()
 		if status == pipeline.StatusError {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(p.Metrics())
+		json.NewEncoder(w).Encode(r.Metrics())
 	})
 
 	srv := &http.Server{Addr: addr, Handler: mux}

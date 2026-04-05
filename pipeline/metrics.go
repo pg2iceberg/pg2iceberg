@@ -1,4 +1,4 @@
-package metrics
+package pipeline
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
@@ -221,3 +221,67 @@ var SnapshotInProgress = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name:      "snapshot_in_progress",
 	Help:      "Whether the pipeline is currently performing an initial snapshot (1=yes, 0=no).",
 }, []string{"pipeline"})
+
+// --- Query mode ---
+
+var QueryPollTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "query_poll_total",
+	Help:      "Total number of poll cycles executed.",
+}, []string{"pipeline"})
+
+var QueryPollDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: namespace,
+	Name:      "query_poll_duration_seconds",
+	Help:      "Time taken for a single poll cycle across all tables.",
+	Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+}, []string{"pipeline"})
+
+var QueryPollRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "query_poll_rows_total",
+	Help:      "Total rows returned by poll queries.",
+}, []string{"pipeline", "table"})
+
+var QueryBufferRows = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: namespace,
+	Name:      "query_buffer_rows",
+	Help:      "Number of rows currently buffered awaiting flush.",
+}, []string{"pipeline", "table"})
+
+var QueryWatermarkLagSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: namespace,
+	Name:      "query_watermark_lag_seconds",
+	Help:      "Seconds between now and the latest watermark per table.",
+}, []string{"pipeline", "table"})
+
+var QueryFlushTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "query_flush_total",
+	Help:      "Total number of query-mode flush operations.",
+}, []string{"pipeline"})
+
+var QueryFlushErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "query_flush_errors_total",
+	Help:      "Total number of failed query-mode flushes.",
+}, []string{"pipeline"})
+
+var QueryFlushDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: namespace,
+	Name:      "query_flush_duration_seconds",
+	Help:      "Time taken for a query-mode flush (prepare + commit).",
+	Buckets:   []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+}, []string{"pipeline"})
+
+var QueryDataFilesWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "query_data_files_written_total",
+	Help:      "Total data files written by query-mode flushes.",
+}, []string{"pipeline", "table"})
+
+var QueryDeleteFilesWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "query_delete_files_written_total",
+	Help:      "Total equality delete files written by query-mode flushes.",
+}, []string{"pipeline", "table"})

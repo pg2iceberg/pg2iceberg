@@ -1,4 +1,4 @@
-package sink
+package logical
 
 import (
 	"context"
@@ -12,16 +12,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/config"
-	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/pg2iceberg/pg2iceberg/source"
-	"github.com/pg2iceberg/pg2iceberg/worker"
+	"github.com/pg2iceberg/pg2iceberg/iceberg"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"golang.org/x/sync/errgroup"
 )
 
 // txBuffer holds events for a single in-flight PG transaction.
 type txBuffer struct {
 	xid       uint32
-	events    []source.ChangeEvent
+	events    []postgres.ChangeEvent
 	tables    map[string]bool // which tables this tx touches
 	committed bool
 	commitTS  time.Time // PG commit timestamp
@@ -30,10 +30,10 @@ type txBuffer struct {
 // EventBuffer receives change events from the sink after a successful flush.
 // Used to pass events to downstream consumers without S3 round-trips.
 type EventBuffer interface {
-	PushEvents(pgTable string, events []ChangeEvent, snapshotID int64)
+	PushEvents(pgTable string, events []MatEvent, snapshotID int64)
 }
 
-// Sink buffers ChangeEvents and periodically flushes them to Iceberg.
+// Sink buffers MatEvents and periodically flushes them to Iceberg.
 // It writes append-only change events to an events table per source table.
 // A separate Materializer reads these events and produces flattened tables.
 type Sink struct {
@@ -41,8 +41,8 @@ type Sink struct {
 	tableCfgs  []config.TableConfig
 	pipelineID string // for metrics labeling
 
-	catalog Catalog
-	s3      ObjectStorage
+	catalog iceberg.Catalog
+	s3      iceberg.ObjectStorage
 
 	// Per-table state: keyed by PG table name (e.g. "public.orders").
 	// Each tableSink writes to the events table (e.g. "orders_events").
@@ -59,30 +59,30 @@ type Sink struct {
 	// Optional event buffer for pushing events after flush (avoids S3 round-trips).
 	eventBuf EventBuffer
 
-	// pendingDirectEvents holds ChangeEvents from non-transactional writes
+	// pendingDirectEvents holds MatEvents from non-transactional writes
 	// (e.g., snapshot) that should be pushed to the event buffer after the
 	// next successful Flush. Keyed by PG table name.
-	pendingDirectEvents map[string][]ChangeEvent
+	pendingDirectEvents map[string][]MatEvent
 
 	mu sync.Mutex
 }
 
 // partitionedWriter holds the data writer for a single partition of the events table.
 type partitionedWriter struct {
-	dataWriter *RollingWriter
+	dataWriter *iceberg.RollingWriter
 	partValues map[string]any // partition values for this partition (nil for unpartitioned)
 }
 
 type tableSink struct {
 	// Source schema (user columns only).
-	srcSchema *schema.TableSchema
+	srcSchema *postgres.TableSchema
 	// Events table schema (metadata + user columns, all user cols nullable).
-	eventsSchema *schema.TableSchema
+	eventsSchema *postgres.TableSchema
 
 	icebergName       string // materialized table name in Iceberg (e.g. "orders")
 	eventsIcebergName string // events table name in Iceberg (e.g. "orders_events")
-	partSpec          *PartitionSpec // materialized table partition spec
-	eventsPartSpec    *PartitionSpec // events table partition spec
+	partSpec          *iceberg.PartitionSpec // materialized table partition spec
+	eventsPartSpec    *iceberg.PartitionSpec // events table partition spec
 	targetSize        int64
 	schemaID          int // current Iceberg schema ID (events table)
 	matSchemaID       int // materialized table schema ID
@@ -92,8 +92,8 @@ type tableSink struct {
 	totalRows  int
 
 	// Cached manifest lists to avoid re-downloading from S3 every flush/materialize cycle.
-	eventsManifests []ManifestFileInfo // events table manifests
-	matManifests    []ManifestFileInfo // materialized table manifests
+	eventsManifests []iceberg.ManifestFileInfo // events table manifests
+	matManifests    []iceberg.ManifestFileInfo // materialized table manifests
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
@@ -102,15 +102,15 @@ type tableSink struct {
 func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, eventBuf EventBuffer) (*Sink, error) {
 	var httpClient *http.Client
 	if cfg.CatalogAuth == "sigv4" {
-		transport, err := NewSigV4Transport(cfg.S3Region)
+		transport, err := iceberg.NewSigV4Transport(cfg.S3Region)
 		if err != nil {
 			return nil, fmt.Errorf("create sigv4 transport: %w", err)
 		}
 		httpClient = &http.Client{Transport: transport}
 	}
-	catalog := NewCatalogClient(cfg.CatalogURI, httpClient)
+	catalog := iceberg.NewCatalogClient(cfg.CatalogURI, httpClient)
 
-	s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
+	s3Client, err := iceberg.NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
 	if err != nil {
 		return nil, fmt.Errorf("create s3 client: %w", err)
 	}
@@ -120,7 +120,7 @@ func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID
 
 // NewSink creates a Sink with the given dependencies.
 // eventBuf is optional — pass nil to disable in-memory event buffering.
-func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 ObjectStorage, catalog Catalog, eventBuf EventBuffer) *Sink {
+func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 iceberg.ObjectStorage, catalog iceberg.Catalog, eventBuf EventBuffer) *Sink {
 	return &Sink{
 		cfg:                 cfg,
 		tableCfgs:           tableCfgs,
@@ -130,18 +130,18 @@ func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID s
 		eventBuf:            eventBuf,
 		tables:              make(map[string]*tableSink),
 		openTxns:            make(map[uint32]*txBuffer),
-		pendingDirectEvents: make(map[string][]ChangeEvent),
+		pendingDirectEvents: make(map[string][]MatEvent),
 	}
 }
 
 // Close is a no-op. Retained for interface compatibility.
 func (s *Sink) Close() {}
 
-// Catalog returns the catalog client (for use by compactor).
-func (s *Sink) Catalog() Catalog { return s.catalog }
+// Catalog returns the catalog client.
+func (s *Sink) Catalog() iceberg.Catalog { return s.catalog }
 
 // S3 returns the S3 client.
-func (s *Sink) S3() ObjectStorage { return s.s3 }
+func (s *Sink) S3() iceberg.ObjectStorage { return s.s3 }
 
 // Tables returns the per-table state map (shared with the materializer).
 func (s *Sink) Tables() map[string]*tableSink { return s.tables }
@@ -149,9 +149,9 @@ func (s *Sink) Tables() map[string]*tableSink { return s.tables }
 // RegisterTable sets up writers for a table and ensures both the events table
 // and materialized table exist in the catalog. The sink writes to the events
 // table; the materializer reads from it and writes to the materialized table.
-func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {
+func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) error {
 	icebergTable := pgTableToIceberg(ts.Table)
-	eventsTable := EventsTableName(icebergTable)
+	eventsTable := iceberg.EventsTableName(icebergTable)
 
 	// Build partition spec from config (for materialized table).
 	var partExprs []string
@@ -161,7 +161,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 			break
 		}
 	}
-	partSpec, err := BuildPartitionSpec(partExprs, ts)
+	partSpec, err := iceberg.BuildPartitionSpec(partExprs, ts)
 	if err != nil {
 		return fmt.Errorf("build partition spec: %w", err)
 	}
@@ -191,8 +191,8 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 	}
 
 	// Build events table schema and partition spec.
-	eventsSchema := EventsTableSchema(ts)
-	eventsPartSpec, err := BuildPartitionSpec(
+	eventsSchema := iceberg.EventsTableSchema(ts)
+	eventsPartSpec, err := iceberg.BuildPartitionSpec(
 		[]string{s.cfg.EventsPartitionOrDefault()}, eventsSchema)
 	if err != nil {
 		return fmt.Errorf("build events partition spec: %w", err)
@@ -245,7 +245,7 @@ func (s *Sink) UnregisterTable(pgTable string) {
 // EvolveSchema applies a schema change to a table: updates the in-memory schema,
 // evolves both the events and materialized Iceberg tables, and rebuilds writers.
 // The caller must flush all buffered data before calling this.
-func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.SchemaChange) error {
+func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgres.SchemaChange) error {
 	ts, ok := s.tables[pgTable]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", pgTable)
@@ -257,7 +257,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 	nextFieldID := ts.srcSchema.MaxFieldID() + 1
 
 	for _, col := range change.AddedColumns {
-		ts.srcSchema.Columns = append(ts.srcSchema.Columns, schema.Column{
+		ts.srcSchema.Columns = append(ts.srcSchema.Columns, postgres.Column{
 			Name:       col.Name,
 			PGType:     col.PGType,
 			IsNullable: true,
@@ -280,8 +280,8 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 	for _, tc := range change.TypeChanges {
 		for i, col := range ts.srcSchema.Columns {
 			if col.Name == tc.Name {
-				oldIceberg := schema.IcebergType(col.PGType)
-				newIceberg := schema.IcebergType(tc.NewType)
+				oldIceberg := postgres.IcebergType(col.PGType)
+				newIceberg := postgres.IcebergType(tc.NewType)
 				ts.srcSchema.Columns[i].PGType = tc.NewType
 				if oldIceberg != newIceberg {
 					icebergChanged = true
@@ -300,7 +300,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		ts.matSchemaID = newMatSchemaID
 
 		// Rebuild events schema and evolve events table.
-		ts.eventsSchema = EventsTableSchema(ts.srcSchema)
+		ts.eventsSchema = iceberg.EventsTableSchema(ts.srcSchema)
 		newEventsSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.eventsIcebergName, ts.schemaID, ts.eventsSchema)
 		if err != nil {
 			return fmt.Errorf("catalog evolve events schema for %s: %w", pgTable, err)
@@ -310,10 +310,10 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		log.Printf("[sink] schema change for %s is a no-op at Iceberg level, skipping catalog evolution", pgTable)
 	}
 
-	// Rebuild writers with the new events schema.
+	// Rebuild writers with the new events postgres.
 	for key, pw := range ts.partitions {
 		ts.partitions[key] = &partitionedWriter{
-			dataWriter: NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
+			dataWriter: iceberg.NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
 			partValues: pw.partValues,
 		}
 	}
@@ -332,25 +332,25 @@ func (ts *tableSink) getEventsWriter(row map[string]any) *partitionedWriter {
 	pw, ok := ts.partitions[key]
 	if !ok {
 		pw = &partitionedWriter{
-			dataWriter: NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
+			dataWriter: iceberg.NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
 		}
 		ts.partitions[key] = pw
 	}
 	return pw
 }
 
-// Write buffers a ChangeEvent for the next flush. DML events are held in
-// per-transaction buffers until the corresponding OpCommit arrives, so
+// Write buffers a postgres.ChangeEvent for the next flush. DML events are held in
+// per-transaction buffers until the corresponding postgres.OpCommit arrives, so
 // flushes always align to PG transaction boundaries.
-func (s *Sink) Write(event source.ChangeEvent) error {
+func (s *Sink) Write(event postgres.ChangeEvent) error {
 	switch event.Operation {
-	case source.OpBegin:
+	case postgres.OpBegin:
 		s.openTxns[event.TransactionID] = &txBuffer{
 			xid:    event.TransactionID,
 			tables: make(map[string]bool),
 		}
 		return nil
-	case source.OpCommit:
+	case postgres.OpCommit:
 		tx, ok := s.openTxns[event.TransactionID]
 		if !ok {
 			return nil // no tracked DML in this tx
@@ -374,7 +374,7 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 	// Events without a transaction ID (e.g., snapshot) are written directly.
 	// Buffer for materializer — will be pushed after the next successful Flush.
 	if s.eventBuf != nil {
-		ce := s.toChangeEvent(event, s.seqCounter)
+		ce := s.toMatEvent(event, s.seqCounter)
 		s.pendingDirectEvents[event.Table] = append(s.pendingDirectEvents[event.Table], ce)
 	}
 	return s.writeDirect(event)
@@ -382,7 +382,7 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 
 // writeDirect writes a change event to the events table as an append-only row.
 // No TOAST resolution, no equality deletes — just append the event with metadata.
-func (s *Sink) writeDirect(event source.ChangeEvent) error {
+func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 	ts, ok := s.tables[event.Table]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", event.Table)
@@ -393,16 +393,16 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	// to avoid a per-row map allocation.
 	var row map[string]any
 	switch event.Operation {
-	case source.OpInsert:
+	case postgres.OpInsert:
 		row = event.After
 		row["_op"] = "I"
-	case source.OpUpdate:
+	case postgres.OpUpdate:
 		row = event.After
 		row["_op"] = "U"
 		if len(event.UnchangedCols) > 0 {
-			row["_unchanged_cols"] = unchangedColsString(event.UnchangedCols)
+			row["_unchanged_cols"] = iceberg.UnchangedColsString(event.UnchangedCols)
 		}
-	case source.OpDelete:
+	case postgres.OpDelete:
 		row = event.Before
 		row["_op"] = "D"
 	default:
@@ -422,26 +422,26 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	return nil
 }
 
-// toChangeEvent converts a source.ChangeEvent into a materializer ChangeEvent,
+// toMatEvent converts a postgres.ChangeEvent into a materializer postgres.ChangeEvent,
 // using the given seq value. Reuses the source event's map directly — the source
 // allocates a fresh map per event so no copy is needed. The map is shared with
 // writeDirect (which adds metadata keys like _lsn, _op); the materializer only
 // accesses user columns by name so the extra keys are harmless.
-func (s *Sink) toChangeEvent(event source.ChangeEvent, seq int64) ChangeEvent {
-	ce := ChangeEvent{
+func (s *Sink) toMatEvent(event postgres.ChangeEvent, seq int64) MatEvent {
+	ce := MatEvent{
 		lsn:           int64(event.LSN),
 		seq:           seq,
 		unchangedCols: event.UnchangedCols,
 	}
 
 	switch event.Operation {
-	case source.OpInsert:
+	case postgres.OpInsert:
 		ce.op = "I"
 		ce.row = event.After
-	case source.OpUpdate:
+	case postgres.OpUpdate:
 		ce.op = "U"
 		ce.row = event.After
-	case source.OpDelete:
+	case postgres.OpDelete:
 		ce.op = "D"
 		ce.row = event.Before
 	}
@@ -509,9 +509,9 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 	// Collect events per table for the materializer in-memory buffer.
 	// Start with pending direct events (snapshot rows written via writeDirect).
-	var bufferedEvents map[string][]ChangeEvent
+	var bufferedEvents map[string][]MatEvent
 	if s.eventBuf != nil {
-		bufferedEvents = make(map[string][]ChangeEvent)
+		bufferedEvents = make(map[string][]MatEvent)
 		for pgTable, events := range s.pendingDirectEvents {
 			bufferedEvents[pgTable] = append(bufferedEvents[pgTable], events...)
 		}
@@ -522,7 +522,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		for _, event := range tx.events {
 			// Capture seq before writeDirect increments seqCounter.
 			if s.eventBuf != nil {
-				ce := s.toChangeEvent(event, s.seqCounter)
+				ce := s.toMatEvent(event, s.seqCounter)
 				bufferedEvents[event.Table] = append(bufferedEvents[event.Table], ce)
 			}
 			if err := s.writeDirect(event); err != nil {
@@ -546,7 +546,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 	// Clear committed transactions and pending direct events.
 	s.committedTxns = nil
-	s.pendingDirectEvents = make(map[string][]ChangeEvent)
+	s.pendingDirectEvents = make(map[string][]MatEvent)
 	return nil
 }
 
@@ -556,7 +556,7 @@ type preparedFlush struct {
 	ts         *tableSink
 	snapshotID int64
 	prevSnapID int64
-	commit     SnapshotCommit
+	commit     iceberg.SnapshotCommit
 }
 
 // flushAllTables serializes, uploads, and commits events for all tables.
@@ -589,7 +589,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	var mu sync.Mutex
 	partResults := make(map[string][]uploadResult)
 
-	var tasks []worker.Task
+	var tasks []utils.Task
 	for _, t := range tablesToFlush {
 		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.eventsIcebergName)
 		for partKey, pw := range t.ts.partitions {
@@ -603,9 +603,9 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 				partPath = partKey // partKey is already in "field=value" format
 			}
 
-			tasks = append(tasks, worker.Task{
+			tasks = append(tasks, utils.Task{
 				Name: pgTable,
-				Fn: func(ctx context.Context, progress *worker.Progress) error {
+				Fn: func(ctx context.Context, progress *utils.Progress) error {
 					uploads, err := serializeEventsPartition(pw, basePath, partPath)
 					if err != nil {
 						return err
@@ -627,7 +627,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	if len(tasks) < concurrency {
 		concurrency = len(tasks)
 	}
-	pool := worker.NewPool(concurrency)
+	pool := utils.NewPool(concurrency)
 	if _, err := pool.Run(ctx, tasks); err != nil {
 		return nil, err
 	}
@@ -643,9 +643,9 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		prepared = append(prepared, pf)
 	}
 
-	tableCommits := make([]TableCommit, len(prepared))
+	tableCommits := make([]iceberg.TableCommit, len(prepared))
 	for i, pf := range prepared {
-		tableCommits[i] = TableCommit{
+		tableCommits[i] = iceberg.TableCommit{
 			Table:             pf.ts.eventsIcebergName,
 			CurrentSnapshotID: pf.prevSnapID,
 			Snapshot:          pf.commit,
@@ -758,9 +758,9 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 
 	eventsPartitioned := ts.eventsPartSpec != nil && !ts.eventsPartSpec.IsUnpartitioned()
 
-	var dataFiles []DataFileInfo
+	var dataFiles []iceberg.DataFileInfo
 	for _, r := range results {
-		df := DataFileInfo{
+		df := iceberg.DataFileInfo{
 			Path:          r.uri,
 			FileSizeBytes: int64(len(r.data)),
 			RecordCount:   r.recordCount,
@@ -788,7 +788,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	// On first flush (cache empty), load from S3 if a manifest list exists.
 	if ts.eventsManifests == nil {
 		if ml := tm.CurrentManifestList(); ml != "" {
-			mlKey, err := KeyFromURI(ml)
+			mlKey, err := iceberg.KeyFromURI(ml)
 			if err != nil {
 				return nil, fmt.Errorf("parse manifest list URI: %w", err)
 			}
@@ -796,7 +796,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 			if err != nil {
 				return nil, fmt.Errorf("download manifest list: %w", err)
 			}
-			ts.eventsManifests, err = ReadManifestList(mlData)
+			ts.eventsManifests, err = iceberg.ReadManifestList(mlData)
 			if err != nil {
 				return nil, fmt.Errorf("read manifest list: %w", err)
 			}
@@ -805,17 +805,17 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	existingManifests := ts.eventsManifests
 
 	// Write data manifest.
-	var manifestInfos []ManifestFileInfo
+	var manifestInfos []iceberg.ManifestFileInfo
 	if len(dataFiles) > 0 {
-		entries := make([]ManifestEntry, len(dataFiles))
+		entries := make([]iceberg.ManifestEntry, len(dataFiles))
 		for i, df := range dataFiles {
-			entries[i] = ManifestEntry{
+			entries[i] = iceberg.ManifestEntry{
 				Status:     1,
 				SnapshotID: snapshotID,
 				DataFile:   df,
 			}
 		}
-		manifestBytes, err := WriteManifest(ts.eventsSchema, entries, seqNum, 0, ts.eventsPartSpec)
+		manifestBytes, err := iceberg.WriteManifest(ts.eventsSchema, entries, seqNum, 0, ts.eventsPartSpec)
 		if err != nil {
 			return nil, fmt.Errorf("write events manifest: %w", err)
 		}
@@ -830,7 +830,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 		for _, df := range dataFiles {
 			totalRows += df.RecordCount
 		}
-		manifestInfos = append(manifestInfos, ManifestFileInfo{
+		manifestInfos = append(manifestInfos, iceberg.ManifestFileInfo{
 			Path:           manifestURI,
 			Length:         int64(len(manifestBytes)),
 			Content:        0,
@@ -844,7 +844,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	// Write manifest list (existing + new) and cache for next cycle.
 	allManifests := append(existingManifests, manifestInfos...)
 	ts.eventsManifests = allManifests
-	mlBytes, err := WriteManifestList(allManifests)
+	mlBytes, err := iceberg.WriteManifestList(allManifests)
 	if err != nil {
 		return nil, fmt.Errorf("write manifest list: %w", err)
 	}
@@ -867,7 +867,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 		ts:         ts,
 		snapshotID: snapshotID,
 		prevSnapID: tm.Metadata.CurrentSnapshotID,
-		commit: SnapshotCommit{
+		commit: iceberg.SnapshotCommit{
 			SnapshotID:       snapshotID,
 			SequenceNumber:   seqNum,
 			TimestampMs:      now.UnixMilli(),

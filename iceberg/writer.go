@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"bytes"
@@ -15,7 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
 const fieldIDKey = "PARQUET:field_id"
@@ -29,7 +29,7 @@ type colSizer struct {
 }
 
 // buildColSizers precomputes sizing info from column types.
-func buildColSizers(columns []schema.Column) []colSizer {
+func buildColSizers(columns []postgres.Column) []colSizer {
 	sizers := make([]colSizer, len(columns))
 	for i, col := range columns {
 		sizers[i].name = col.Name
@@ -57,7 +57,7 @@ type colAppender struct {
 }
 
 // buildColAppenders precomputes Arrow builder append functions for each column.
-func buildColAppenders(columns []schema.Column) []colAppender {
+func buildColAppenders(columns []postgres.Column) []colAppender {
 	appenders := make([]colAppender, len(columns))
 	for i, col := range columns {
 		ca := colAppender{
@@ -68,7 +68,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 		switch strings.ToLower(col.PGType) {
 		case "int2", "smallint", "int4", "integer", "serial":
 			ca.appendVal = func(b array.Builder, v any) error {
-				n, err := toInt32(v)
+				n, err := ToInt32(v)
 				if err != nil {
 					return err
 				}
@@ -78,7 +78,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) { b.(*array.Int32Builder).Append(0) }
 		case "int8", "bigint", "bigserial":
 			ca.appendVal = func(b array.Builder, v any) error {
-				n, err := toInt64(v)
+				n, err := ToInt64(v)
 				if err != nil {
 					return err
 				}
@@ -88,7 +88,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) { b.(*array.Int64Builder).Append(0) }
 		case "float4", "real":
 			ca.appendVal = func(b array.Builder, v any) error {
-				f, err := toFloat32(v)
+				f, err := ToFloat32(v)
 				if err != nil {
 					return err
 				}
@@ -98,7 +98,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) { b.(*array.Float32Builder).Append(0) }
 		case "float8", "double precision":
 			ca.appendVal = func(b array.Builder, v any) error {
-				f, err := toFloat64(v)
+				f, err := ToFloat64(v)
 				if err != nil {
 					return err
 				}
@@ -108,7 +108,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) { b.(*array.Float64Builder).Append(0) }
 		case "bool", "boolean":
 			ca.appendVal = func(b array.Builder, v any) error {
-				val, err := toBool(v)
+				val, err := ToBool(v)
 				if err != nil {
 					return err
 				}
@@ -118,7 +118,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) { b.(*array.BooleanBuilder).Append(false) }
 		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
 			ca.appendVal = func(b array.Builder, v any) error {
-				us, err := toTimestampMicros(v)
+				us, err := ToTimestampMicros(v)
 				if err != nil {
 					return err
 				}
@@ -130,7 +130,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 			}
 		case "date":
 			ca.appendVal = func(b array.Builder, v any) error {
-				d, err := toDateDays(v)
+				d, err := ToDateDays(v)
 				if err != nil {
 					return err
 				}
@@ -143,7 +143,7 @@ func buildColAppenders(columns []schema.Column) []colAppender {
 		default:
 			// text, varchar, numeric, json, uuid, etc. → string
 			ca.appendVal = func(b array.Builder, v any) error {
-				b.(*array.StringBuilder).Append(toString(v))
+				b.(*array.StringBuilder).Append(ToString(v))
 				return nil
 			}
 			ca.appendZero = func(b array.Builder) { b.(*array.StringBuilder).Append("") }
@@ -178,7 +178,7 @@ func pgToArrowType(pgType string) arrow.DataType {
 }
 
 // buildArrowSchema creates an Arrow schema from the column definitions.
-func buildArrowSchema(columns []schema.Column) *arrow.Schema {
+func buildArrowSchema(columns []postgres.Column) *arrow.Schema {
 	fields := make([]arrow.Field, len(columns))
 	for i, col := range columns {
 		fields[i] = arrow.Field{
@@ -212,9 +212,9 @@ var parquetWriterProps = apq.NewWriterProperties(
 // them as a Parquet file via pqarrow. Values are appended directly into
 // typed builders in Add(), eliminating intermediate row storage.
 type ParquetWriter struct {
-	tableSchema    *schema.TableSchema
+	tableSchema    *postgres.TableSchema
 	arrowSchema    *arrow.Schema
-	columns        []schema.Column
+	columns        []postgres.Column
 	colSizers      []colSizer
 	colAppenders   []colAppender
 	builders       []array.Builder
@@ -223,7 +223,7 @@ type ParquetWriter struct {
 	outBuf         bytes.Buffer
 }
 
-func newParquetWriter(ts *schema.TableSchema, columns []schema.Column) *ParquetWriter {
+func newParquetWriter(ts *postgres.TableSchema, columns []postgres.Column) *ParquetWriter {
 	arrowSchema := buildArrowSchema(columns)
 	return &ParquetWriter{
 		tableSchema:  ts,
@@ -236,13 +236,13 @@ func newParquetWriter(ts *schema.TableSchema, columns []schema.Column) *ParquetW
 }
 
 // NewDataWriter creates a writer for data files (all columns).
-func NewDataWriter(ts *schema.TableSchema) *ParquetWriter {
+func NewDataWriter(ts *postgres.TableSchema) *ParquetWriter {
 	return newParquetWriter(ts, ts.Columns)
 }
 
 // NewDeleteWriter creates a writer for equality delete files (PK columns only).
-func NewDeleteWriter(ts *schema.TableSchema) *ParquetWriter {
-	pkCols := make([]schema.Column, 0)
+func NewDeleteWriter(ts *postgres.TableSchema) *ParquetWriter {
+	pkCols := make([]postgres.Column, 0)
 	for _, pk := range ts.PK {
 		for _, col := range ts.Columns {
 			if col.Name == pk {
@@ -304,7 +304,7 @@ func estimateRowBytes(sizers []colSizer, row map[string]any) int64 {
 		if sizers[i].fixedSize > 0 {
 			size += sizers[i].fixedSize
 		} else {
-			size += int64(len(toString(v))) + 4
+			size += int64(len(ToString(v))) + 4
 		}
 	}
 	return size
@@ -360,15 +360,15 @@ type FileChunk struct {
 // RollingWriter wraps a ParquetWriter and automatically splits into
 // multiple files when the estimated size exceeds the target.
 type RollingWriter struct {
-	schema     *schema.TableSchema
-	newWriter  func(*schema.TableSchema) *ParquetWriter
+	schema     *postgres.TableSchema
+	newWriter  func(*postgres.TableSchema) *ParquetWriter
 	writer     *ParquetWriter
 	targetSize int64
 	completed  []FileChunk
 }
 
 // NewRollingDataWriter creates a rolling writer for data files.
-func NewRollingDataWriter(ts *schema.TableSchema, targetSize int64) *RollingWriter {
+func NewRollingDataWriter(ts *postgres.TableSchema, targetSize int64) *RollingWriter {
 	return &RollingWriter{
 		schema:     ts,
 		newWriter:  NewDataWriter,
@@ -378,7 +378,7 @@ func NewRollingDataWriter(ts *schema.TableSchema, targetSize int64) *RollingWrit
 }
 
 // NewRollingDeleteWriter creates a rolling writer for equality delete files.
-func NewRollingDeleteWriter(ts *schema.TableSchema, targetSize int64) *RollingWriter {
+func NewRollingDeleteWriter(ts *postgres.TableSchema, targetSize int64) *RollingWriter {
 	return &RollingWriter{
 		schema:     ts,
 		newWriter:  NewDeleteWriter,
@@ -461,7 +461,7 @@ func (rw *RollingWriter) DiscardCompleted() {
 
 // --- type conversion helpers ---
 
-func toInt32(v any) (int32, error) {
+func ToInt32(v any) (int32, error) {
 	switch x := v.(type) {
 	case int32:
 		return x, nil
@@ -482,7 +482,7 @@ func toInt32(v any) (int32, error) {
 	}
 }
 
-func toInt64(v any) (int64, error) {
+func ToInt64(v any) (int64, error) {
 	switch x := v.(type) {
 	case int64:
 		return x, nil
@@ -503,7 +503,7 @@ func toInt64(v any) (int64, error) {
 	}
 }
 
-func toFloat32(v any) (float32, error) {
+func ToFloat32(v any) (float32, error) {
 	switch x := v.(type) {
 	case float32:
 		return x, nil
@@ -520,7 +520,7 @@ func toFloat32(v any) (float32, error) {
 	}
 }
 
-func toFloat64(v any) (float64, error) {
+func ToFloat64(v any) (float64, error) {
 	switch x := v.(type) {
 	case float64:
 		return x, nil
@@ -537,7 +537,7 @@ func toFloat64(v any) (float64, error) {
 	}
 }
 
-func toBool(v any) (bool, error) {
+func ToBool(v any) (bool, error) {
 	switch x := v.(type) {
 	case bool:
 		return x, nil
@@ -548,7 +548,7 @@ func toBool(v any) (bool, error) {
 	}
 }
 
-func toTimestampMicros(v any) (int64, error) {
+func ToTimestampMicros(v any) (int64, error) {
 	switch x := v.(type) {
 	case time.Time:
 		return x.UnixMicro(), nil
@@ -557,7 +557,7 @@ func toTimestampMicros(v any) (int64, error) {
 	case int32:
 		return int64(x), nil
 	case string:
-		us, ok := fastParseTimestamp(x)
+		us, ok := FastParseTimestamp(x)
 		if !ok {
 			return 0, fmt.Errorf("parse timestamp %q", x)
 		}
@@ -567,7 +567,7 @@ func toTimestampMicros(v any) (int64, error) {
 	}
 }
 
-// fastParseTimestamp parses the PG logical replication timestamp format directly
+// FastParseTimestamp parses the PG logical replication timestamp format directly
 // without going through time.Parse. Expected format:
 //
 //	"2006-01-02 15:04:05.999999+08"     (short tz)
@@ -575,7 +575,7 @@ func toTimestampMicros(v any) (int64, error) {
 //	"2006-01-02 15:04:05+08"            (no fractional seconds)
 //
 // Returns microseconds since Unix epoch and true if parsed successfully.
-func fastParseTimestamp(s string) (int64, bool) {
+func FastParseTimestamp(s string) (int64, bool) {
 	// Minimum: "2006-01-02 15:04:05+08" = 22 chars
 	if len(s) < 22 || s[4] != '-' || s[7] != '-' || s[10] != ' ' || s[13] != ':' || s[16] != ':' {
 		return 0, false
@@ -622,7 +622,7 @@ func fastParseTimestamp(s string) (int64, bool) {
 	var tzOffsetSec int
 	if len(rest) == 0 {
 		// No timezone — timestamp without time zone. Treat as UTC.
-		days := daysSinceEpoch(year, int(month), day)
+		days := DaysSinceEpoch(year, int(month), day)
 		unixSec := int64(days)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
 		return unixSec*1_000_000 + int64(micros), true
 	}
@@ -655,13 +655,13 @@ func fastParseTimestamp(s string) (int64, bool) {
 	}
 
 	// Convert to Unix timestamp using a fast days-since-epoch calculation.
-	days := daysSinceEpoch(year, int(month), day)
+	days := DaysSinceEpoch(year, int(month), day)
 	unixSec := int64(days)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec) - int64(tzOffsetSec)
 	return unixSec*1_000_000 + int64(micros), true
 }
 
-// daysSinceEpoch returns the number of days from 1970-01-01 to the given date.
-func daysSinceEpoch(year, month, day int) int64 {
+// DaysSinceEpoch returns the number of days from 1970-01-01 to the given date.
+func DaysSinceEpoch(year, month, day int) int64 {
 	// Adjust for months before March (shifts leap day to end of year).
 	if month <= 2 {
 		year--
@@ -698,7 +698,7 @@ func atoiN(s string) int {
 	return n
 }
 
-func toDateDays(v any) (int32, error) {
+func ToDateDays(v any) (int32, error) {
 	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 	switch x := v.(type) {
 	case time.Time:
@@ -718,7 +718,7 @@ func toDateDays(v any) (int32, error) {
 	}
 }
 
-func toString(v any) string {
+func ToString(v any) string {
 	switch x := v.(type) {
 	case string:
 		return x
