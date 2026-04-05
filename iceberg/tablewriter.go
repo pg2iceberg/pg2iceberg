@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/pg2iceberg/pg2iceberg/worker"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
 // RowState is the final state of a single PK after folding/dedup.
@@ -25,7 +25,7 @@ type RowState struct {
 type TableWriteConfig struct {
 	Namespace   string
 	IcebergName string
-	SrcSchema   *schema.TableSchema
+	SrcSchema   *postgres.TableSchema
 	PartSpec    *PartitionSpec
 	SchemaID    int
 	TargetSize  int64
@@ -247,12 +247,12 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	// --- Serialize per bucket (equality deletes + data files) ---
 	results := make([]bucketResult, len(buckets))
 
-	serializeTasks := make([]worker.Task, len(buckets))
+	serializeTasks := make([]utils.Task, len(buckets))
 	for i, b := range buckets {
 		i, b := i, b
-		serializeTasks[i] = worker.Task{
+		serializeTasks[i] = utils.Task{
 			Name: b.key,
-			Fn: func(ctx context.Context, _ *worker.Progress) error {
+			Fn: func(ctx context.Context, _ *utils.Progress) error {
 				// Equality delete files for U/D rows.
 				var deleteRowCount int64
 				deleteWriter := NewRollingDeleteWriter(ts, targetSize)
@@ -330,7 +330,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	serializePool := worker.NewPool(concurrency)
+	serializePool := utils.NewPool(concurrency)
 	if _, err := serializePool.Run(ctx, serializeTasks); err != nil {
 		return nil, fmt.Errorf("serialize: %w", err)
 	}
@@ -356,12 +356,12 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		var mu sync.Mutex
 		var uploaded []uploadedFile
 
-		uploadTasks := make([]worker.Task, len(allPending))
+		uploadTasks := make([]utils.Task, len(allPending))
 		for i, pf := range allPending {
 			pf := pf
-			uploadTasks[i] = worker.Task{
+			uploadTasks[i] = utils.Task{
 				Name: pf.key,
-				Fn: func(ctx context.Context, _ *worker.Progress) error {
+				Fn: func(ctx context.Context, _ *utils.Progress) error {
 					uri, err := tw.s3.Upload(ctx, pf.key, pf.chunk.Data)
 					if err != nil {
 						return fmt.Errorf("upload %s: %w", pf.key, err)
@@ -378,7 +378,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		if len(uploadTasks) < uploadConcurrency {
 			uploadConcurrency = len(uploadTasks)
 		}
-		uploadPool := worker.NewPool(uploadConcurrency)
+		uploadPool := utils.NewPool(uploadConcurrency)
 		if _, err := uploadPool.Run(ctx, uploadTasks); err != nil {
 			return nil, fmt.Errorf("upload materialized files: %w", err)
 		}
@@ -559,15 +559,15 @@ func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIn
 		fileResults []fileResult
 	)
 
-	tasks := make([]worker.Task, 0, len(allFiles))
+	tasks := make([]utils.Task, 0, len(allFiles))
 	for _, df := range allFiles {
 		dfKey, err := KeyFromURI(df.Path)
 		if err != nil {
 			return nil, fmt.Errorf("parse data file URI %s: %w", df.Path, err)
 		}
-		tasks = append(tasks, worker.Task{
+		tasks = append(tasks, utils.Task{
 			Name: dfKey,
-			Fn: func(ctx context.Context, _ *worker.Progress) error {
+			Fn: func(ctx context.Context, _ *utils.Progress) error {
 				size, err := tw.s3.StatObject(ctx, dfKey)
 				if err != nil {
 					return fmt.Errorf("stat %s: %w", df.Path, err)
@@ -585,7 +585,7 @@ func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIn
 		})
 	}
 
-	pool := worker.NewPool(concurrency)
+	pool := utils.NewPool(concurrency)
 	if _, err := pool.Run(ctx, tasks); err != nil {
 		return nil, fmt.Errorf("build file index: %w", err)
 	}

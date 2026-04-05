@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -24,7 +24,7 @@ type LogicalSource struct {
 	pgCfg      config.PostgresConfig
 	cfg        config.LogicalConfig
 	tableCfgs  []config.TableConfig
-	tables     map[string]*schema.TableSchema
+	tables     map[string]*postgres.TableSchema
 	pipelineID string
 
 	replConn  *pgconn.PgConn
@@ -78,7 +78,7 @@ func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConf
 		pgCfg:           pgCfg,
 		cfg:             logicalCfg,
 		tableCfgs:       tableCfgs,
-		tables:          make(map[string]*schema.TableSchema),
+		tables:          make(map[string]*postgres.TableSchema),
 		relations:       make(map[uint32]*pglogrepl.RelationMessageV2),
 		decoder:         NewWALDecoder(),
 		pipelineID:      pid,
@@ -135,7 +135,7 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 
 	// Discover schemas for configured tables.
 	for _, tc := range l.tableCfgs {
-		ts, err := schema.DiscoverSchema(ctx, l.queryConn, tc.Name)
+		ts, err := postgres.DiscoverSchema(ctx, l.queryConn, tc.Name)
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
@@ -636,15 +636,15 @@ func (l *LogicalSource) isTracked(table string) bool {
 	return false
 }
 
-func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *schema.TableSchema {
+func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *postgres.TableSchema {
 	table := fqTable(rel.Namespace, rel.RelationName)
 	if ts, ok := l.tables[table]; ok {
 		return ts
 	}
 	// Build a minimal schema from the relation message
-	ts := &schema.TableSchema{Table: table}
+	ts := &postgres.TableSchema{Table: table}
 	for i, col := range rel.Columns {
-		ts.Columns = append(ts.Columns, schema.Column{
+		ts.Columns = append(ts.Columns, postgres.Column{
 			Name:    col.Name,
 			PGType:  oidToPGType(col.DataType),
 			FieldID: i + 1,

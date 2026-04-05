@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/logical"
 	"github.com/testcontainers/testcontainers-go"
@@ -1080,7 +1080,7 @@ func (c *memCatalog) LoadTable(ns, table string) (*sink.TableMetadata, error) {
 	return tm, nil
 }
 
-func (c *memCatalog) CreateTable(ns, table string, ts *schema.TableSchema, location string, partSpec *sink.PartitionSpec) (*sink.TableMetadata, error) {
+func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *sink.PartitionSpec) (*sink.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := &sink.TableMetadata{}
@@ -1128,7 +1128,7 @@ func (c *memCatalog) CommitTransaction(ns string, commits []sink.TableCommit) er
 	return nil
 }
 
-func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *schema.TableSchema) (int, error) {
+func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
 }
 

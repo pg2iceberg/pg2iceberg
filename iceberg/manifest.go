@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/linkedin/goavro/v2"
 )
 
@@ -42,7 +42,7 @@ type ManifestFileInfo struct {
 }
 
 // manifestEntrySchema returns the Avro schema for manifest entries.
-func manifestEntrySchema(ts *schema.TableSchema, partSpec *PartitionSpec) string {
+func manifestEntrySchema(ts *postgres.TableSchema, partSpec *PartitionSpec) string {
 	partSchema := `{"type": "record", "name": "r102", "fields": []}`
 	if partSpec != nil {
 		partSchema = partSpec.PartitionRecordSchemaAvro(ts)
@@ -107,7 +107,7 @@ const manifestListSchema = `{
 }`
 
 // WriteManifest writes a manifest Avro file containing the given entries.
-func WriteManifest(ts *schema.TableSchema, entries []ManifestEntry, seqNum int64, content int, partSpec *PartitionSpec) ([]byte, error) {
+func WriteManifest(ts *postgres.TableSchema, entries []ManifestEntry, seqNum int64, content int, partSpec *PartitionSpec) ([]byte, error) {
 	schemaJSON := manifestEntrySchema(ts, partSpec)
 	codec, err := goavro.NewCodec(schemaJSON)
 	if err != nil {
@@ -328,13 +328,13 @@ func encodeOCF(codec *goavro.Codec, records []any, metadata map[string][]byte) (
 }
 
 // IcebergSchemaJSONString builds a JSON string of the Iceberg schema for Avro metadata.
-func IcebergSchemaJSONString(ts *schema.TableSchema) string {
+func IcebergSchemaJSONString(ts *postgres.TableSchema) string {
 	fields := ""
 	for i, col := range ts.Columns {
 		if i > 0 {
 			fields += ","
 		}
-		iceType := schema.IcebergType(col.PGType)
+		iceType := postgres.IcebergType(col.PGType)
 		// Map high-level Iceberg types back to JSON type strings
 		typeJSON := `"` + iceType + `"`
 		fields += fmt.Sprintf(`{"id":%d,"name":"%s","required":%t,"type":%s}`,

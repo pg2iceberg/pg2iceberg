@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
@@ -20,7 +20,7 @@ type Poller struct {
 	pgCfg     config.PostgresConfig
 	tableCfgs []config.TableConfig
 	conn      *pgx.Conn
-	schemas   map[string]*schema.TableSchema
+	schemas   map[string]*postgres.TableSchema
 	watermarks map[string]time.Time
 }
 
@@ -29,7 +29,7 @@ func NewPoller(pgCfg config.PostgresConfig, tableCfgs []config.TableConfig) *Pol
 	return &Poller{
 		pgCfg:      pgCfg,
 		tableCfgs:  tableCfgs,
-		schemas:    make(map[string]*schema.TableSchema),
+		schemas:    make(map[string]*postgres.TableSchema),
 		watermarks: make(map[string]time.Time),
 	}
 }
@@ -43,7 +43,7 @@ func (p *Poller) Connect(ctx context.Context) error {
 	p.conn = conn
 
 	for _, tbl := range p.tableCfgs {
-		ts, err := schema.DiscoverSchema(ctx, conn, tbl.Name)
+		ts, err := postgres.DiscoverSchema(ctx, conn, tbl.Name)
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tbl.Name, err)
 		}
@@ -56,7 +56,7 @@ func (p *Poller) Connect(ctx context.Context) error {
 }
 
 // Schemas returns the discovered table schemas.
-func (p *Poller) Schemas() map[string]*schema.TableSchema { return p.schemas }
+func (p *Poller) Schemas() map[string]*postgres.TableSchema { return p.schemas }
 
 // SetWatermark restores a watermark from a checkpoint.
 func (p *Poller) SetWatermark(table string, t time.Time) {

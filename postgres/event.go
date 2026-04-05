@@ -1,7 +1,7 @@
 // Package source defines the shared types for change data capture.
 // These types are used by both the logical and query pipelines,
 // as well as the sink and pipeline packages.
-package source
+package postgres
 
 import (
 	"time"

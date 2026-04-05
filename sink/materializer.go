@@ -10,8 +10,8 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
-	"github.com/pg2iceberg/pg2iceberg/metrics"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
 // ChangeEventBuffer is a thread-safe buffer for change events, shared between
@@ -41,7 +41,7 @@ func (b *ChangeEventBuffer) PushEvents(pgTable string, events []ChangeEvent, sna
 	defer b.mu.Unlock()
 	b.events[pgTable] = append(b.events[pgTable], events...)
 	b.snapshotID[pgTable] = snapshotID
-	metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(float64(len(b.events[pgTable])))
+	pipeline.MaterializerBufferSize.WithLabelValues(pgTable).Set(float64(len(b.events[pgTable])))
 }
 
 // Drain removes and returns all buffered events for a table,
@@ -56,7 +56,7 @@ func (b *ChangeEventBuffer) Drain(pgTable string) ([]ChangeEvent, int64) {
 	snapID := b.snapshotID[pgTable]
 	delete(b.events, pgTable)
 	delete(b.snapshotID, pgTable)
-	metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
+	pipeline.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
 	return events, snapID
 }
 
@@ -74,7 +74,7 @@ func (b *ChangeEventBuffer) DrainAll() (map[string][]ChangeEvent, map[string]int
 	b.events = make(map[string][]ChangeEvent)
 	b.snapshotID = make(map[string]int64)
 	for pgTable := range events {
-		metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
+		pipeline.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
 	}
 	return events, snapIDs
 }
@@ -193,7 +193,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		if err != nil {
 			// Abort entire cycle. Drained events are safe on S3 in the
 			// events tables; next cycle recovers via the S3 fallback path.
-			metrics.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
+			pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
 			return fmt.Errorf("prepare %s: %w", pgTable, err)
 		}
 		if prep != nil {
@@ -217,7 +217,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 
 	if err := m.catalog.CommitTransaction(m.cfg.Namespace, commits); err != nil {
 		for _, p := range prepared {
-			metrics.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
+			pipeline.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
 		}
 		return fmt.Errorf("commit materialized transaction: %w", err)
 	}
@@ -528,15 +528,15 @@ func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
 		}
 	}
 	if maxLSN > 0 {
-		metrics.MaterializerMaterializedLSN.WithLabelValues(prep.pgTable).Set(float64(maxLSN))
+		pipeline.MaterializerMaterializedLSN.WithLabelValues(prep.pgTable).Set(float64(maxLSN))
 	}
 
-	metrics.MaterializerDurationSeconds.WithLabelValues(prep.pgTable).Observe(duration.Seconds())
-	metrics.MaterializerRunsTotal.WithLabelValues(prep.pgTable, source).Inc()
-	metrics.MaterializerEventsTotal.WithLabelValues(prep.pgTable).Add(float64(len(prep.events)))
-	metrics.MaterializerDataFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.dataCount))
-	metrics.MaterializerDeleteFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteCount))
-	metrics.MaterializerDeleteRowsTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteRowCount))
+	pipeline.MaterializerDurationSeconds.WithLabelValues(prep.pgTable).Observe(duration.Seconds())
+	pipeline.MaterializerRunsTotal.WithLabelValues(prep.pgTable, source).Inc()
+	pipeline.MaterializerEventsTotal.WithLabelValues(prep.pgTable).Add(float64(len(prep.events)))
+	pipeline.MaterializerDataFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.dataCount))
+	pipeline.MaterializerDeleteFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteCount))
+	pipeline.MaterializerDeleteRowsTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteRowCount))
 
 	log.Printf("[materializer] materialized %s: %d events (%s), %d buckets, %d data files, %d delete files (%.1fs) [drain=%.0fms fold=%.0fms toast=%.0fms]",
 		prep.pgTable, len(prep.events), source, prep.bucketCount, prep.dataCount, prep.deleteCount, duration.Seconds(),
@@ -598,7 +598,7 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 }
 
 // readEvents reads event parquet files and parses them into ChangeEvent structs.
-func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files []DataFileInfo, srcSchema *schema.TableSchema) ([]ChangeEvent, error) {
+func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files []DataFileInfo, srcSchema *postgres.TableSchema) ([]ChangeEvent, error) {
 	var events []ChangeEvent
 
 	// Build the events schema to read the parquet files.

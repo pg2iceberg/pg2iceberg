@@ -9,9 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
-	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
@@ -28,7 +27,7 @@ type Pipeline struct {
 	src     *LogicalSource
 	snk     *sink.Sink
 	store   pipeline.CheckpointStore
-	schemas map[string]*schema.TableSchema
+	schemas map[string]*postgres.TableSchema
 
 	startedAt      time.Time
 	lastFlushAt    time.Time
@@ -103,7 +102,7 @@ func (p *Pipeline) Status() (pipeline.Status, error) {
 // Done returns a channel that is closed when the pipeline exits.
 func (p *Pipeline) Done() <-chan struct{} { return p.done }
 
-// Metrics returns a snapshot of pipeline metrics.
+// Metrics returns a snapshot of pipeline pipeline.
 func (p *Pipeline) Metrics() pipeline.Metrics {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -197,8 +196,8 @@ func (p *Pipeline) setStatus(s pipeline.Status, err error) {
 		p.err = err
 	}
 	p.mu.Unlock()
-	if v, ok := metrics.StatusToFloat[string(s)]; ok {
-		metrics.PipelineStatus.WithLabelValues(p.id).Set(v)
+	if v, ok := pipeline.StatusToFloat[string(s)]; ok {
+		pipeline.PipelineStatus.WithLabelValues(p.id).Set(v)
 	}
 }
 
@@ -214,9 +213,9 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
 
-	p.schemas = make(map[string]*schema.TableSchema)
+	p.schemas = make(map[string]*postgres.TableSchema)
 	for _, tc := range p.cfg.Tables {
-		ts, err := schema.DiscoverSchema(ctx, pgConn, tc.Name)
+		ts, err := postgres.DiscoverSchema(ctx, pgConn, tc.Name)
 		if err != nil {
 			pgConn.Close(ctx)
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
@@ -256,7 +255,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.src.SetSnapshotedTables(cp.SnapshotedTables)
 	if !cp.SnapshotComplete {
 		p.setStatus(pipeline.StatusSnapshotting, nil)
-		metrics.SnapshotInProgress.WithLabelValues(p.id).Set(1)
+		pipeline.SnapshotInProgress.WithLabelValues(p.id).Set(1)
 	}
 
 	return nil
@@ -270,11 +269,11 @@ func (p *Pipeline) run(ctx context.Context) {
 	p.startedAt = time.Now()
 	if p.status != pipeline.StatusSnapshotting {
 		p.status = pipeline.StatusRunning
-		metrics.PipelineStatus.WithLabelValues(p.id).Set(metrics.StatusToFloat["running"])
+		pipeline.PipelineStatus.WithLabelValues(p.id).Set(pipeline.StatusToFloat["running"])
 	}
 	p.mu.Unlock()
 
-	// Periodic gauge-style metrics.
+	// Periodic gauge-style pipeline.
 	metricsTicker := time.NewTicker(5 * time.Second)
 	defer metricsTicker.Stop()
 	go func() {
@@ -285,13 +284,13 @@ func (p *Pipeline) run(ctx context.Context) {
 			case <-metricsTicker.C:
 				p.mu.RLock()
 				if !p.startedAt.IsZero() {
-					metrics.PipelineUptimeSeconds.WithLabelValues(p.id).Set(time.Since(p.startedAt).Seconds())
+					pipeline.PipelineUptimeSeconds.WithLabelValues(p.id).Set(time.Since(p.startedAt).Seconds())
 				}
 				p.mu.RUnlock()
-				metrics.EventsBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBuffered()))
-				metrics.BytesBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBufferedBytes()))
+				pipeline.EventsBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBuffered()))
+				pipeline.BytesBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBufferedBytes()))
 				if p.src != nil {
-					metrics.ConfirmedLSN.WithLabelValues(p.id).Set(float64(p.src.FlushedLSN()))
+					pipeline.ConfirmedLSN.WithLabelValues(p.id).Set(float64(p.src.FlushedLSN()))
 				}
 			}
 		}
@@ -372,7 +371,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				p.lastWrittenLSN = event.LSN
 			}
 			p.rowsProcessed++
-			metrics.RowsProcessedTotal.WithLabelValues(p.id, event.Table, event.Operation.String()).Inc()
+			pipeline.RowsProcessedTotal.WithLabelValues(p.id, event.Table, event.Operation.String()).Inc()
 
 			if p.snk.TotalBuffered() >= flushRows {
 				if err := p.doFlush(ctx); err != nil {
@@ -470,15 +469,15 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 	})
 	duration := time.Since(start).Seconds()
 
-	metrics.FlushDurationSeconds.WithLabelValues(p.id).Observe(duration)
-	metrics.FlushTotal.WithLabelValues(p.id).Inc()
+	pipeline.FlushDurationSeconds.WithLabelValues(p.id).Observe(duration)
+	pipeline.FlushTotal.WithLabelValues(p.id).Inc()
 
 	if err == nil {
 		p.bytesProcessed += flushedBytes
-		metrics.BytesProcessedTotal.WithLabelValues(p.id).Add(float64(flushedBytes))
-		metrics.FlushRowsTotal.WithLabelValues(p.id).Add(float64(flushedRows))
+		pipeline.BytesProcessedTotal.WithLabelValues(p.id).Add(float64(flushedBytes))
+		pipeline.FlushRowsTotal.WithLabelValues(p.id).Add(float64(flushedRows))
 	} else {
-		metrics.FlushErrorsTotal.WithLabelValues(p.id).Inc()
+		pipeline.FlushErrorsTotal.WithLabelValues(p.id).Inc()
 	}
 	return err
 }
@@ -507,7 +506,7 @@ func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
-	metrics.SnapshotTablesCompleted.WithLabelValues(p.id).Inc()
+	pipeline.SnapshotTablesCompleted.WithLabelValues(p.id).Inc()
 	log.Printf("[logical:%s] snapshot table %s complete, checkpoint saved", p.id, table)
 	return nil
 }
@@ -535,7 +534,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	}
 
 	p.setStatus(pipeline.StatusRunning, nil)
-	metrics.SnapshotInProgress.WithLabelValues(p.id).Set(0)
+	pipeline.SnapshotInProgress.WithLabelValues(p.id).Set(0)
 	log.Printf("[logical:%s] initial snapshot complete, checkpoint saved", p.id)
 	return nil
 }
@@ -619,8 +618,8 @@ func (p *Pipeline) monitorWALLag(ctx context.Context) {
 				continue
 			}
 
-			metrics.ReplicationLagBytes.WithLabelValues(p.id).Set(float64(lagBytes))
-			metrics.WALRetainedBytes.WithLabelValues(p.id).Set(float64(walSizeBytes))
+			pipeline.ReplicationLagBytes.WithLabelValues(p.id).Set(float64(lagBytes))
+			pipeline.WALRetainedBytes.WithLabelValues(p.id).Set(float64(walSizeBytes))
 		}
 	}
 }

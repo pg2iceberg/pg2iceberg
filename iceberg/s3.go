@@ -11,7 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/pg2iceberg/pg2iceberg/metrics"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
 )
 
 // ObjectStorage abstracts file upload and download operations.
@@ -56,12 +56,12 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 		Key:    &key,
 		Body:   bytes.NewReader(data),
 	})
-	metrics.S3OperationDurationSeconds.WithLabelValues("upload").Observe(time.Since(start).Seconds())
+	pipeline.S3OperationDurationSeconds.WithLabelValues("upload").Observe(time.Since(start).Seconds())
 	if err != nil {
-		metrics.S3ErrorsTotal.WithLabelValues("upload").Inc()
+		pipeline.S3ErrorsTotal.WithLabelValues("upload").Inc()
 		return "", fmt.Errorf("upload %s: %w", key, err)
 	}
-	metrics.S3BytesUploadedTotal.Add(float64(len(data)))
+	pipeline.S3BytesUploadedTotal.Add(float64(len(data)))
 	return fmt.Sprintf("s3://%s/%s", c.bucket, key), nil
 }
 
@@ -72,15 +72,15 @@ func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 		Bucket: &c.bucket,
 		Key:    aws.String(key),
 	})
-	metrics.S3OperationDurationSeconds.WithLabelValues("download").Observe(time.Since(start).Seconds())
+	pipeline.S3OperationDurationSeconds.WithLabelValues("download").Observe(time.Since(start).Seconds())
 	if err != nil {
-		metrics.S3ErrorsTotal.WithLabelValues("download").Inc()
+		pipeline.S3ErrorsTotal.WithLabelValues("download").Inc()
 		return nil, fmt.Errorf("download %s: %w", key, err)
 	}
 	defer out.Body.Close()
 	data, err := io.ReadAll(out.Body)
 	if err == nil {
-		metrics.S3BytesDownloadedTotal.Add(float64(len(data)))
+		pipeline.S3BytesDownloadedTotal.Add(float64(len(data)))
 	}
 	return data, err
 }
@@ -94,15 +94,15 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 		Key:    aws.String(key),
 		Range:  &rangeHeader,
 	})
-	metrics.S3OperationDurationSeconds.WithLabelValues("download_range").Observe(time.Since(start).Seconds())
+	pipeline.S3OperationDurationSeconds.WithLabelValues("download_range").Observe(time.Since(start).Seconds())
 	if err != nil {
-		metrics.S3ErrorsTotal.WithLabelValues("download_range").Inc()
+		pipeline.S3ErrorsTotal.WithLabelValues("download_range").Inc()
 		return nil, fmt.Errorf("download range %s: %w", key, err)
 	}
 	defer out.Body.Close()
 	data, err := io.ReadAll(out.Body)
 	if err == nil {
-		metrics.S3BytesDownloadedTotal.Add(float64(len(data)))
+		pipeline.S3BytesDownloadedTotal.Add(float64(len(data)))
 	}
 	return data, err
 }
@@ -114,9 +114,9 @@ func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
 		Bucket: &c.bucket,
 		Key:    aws.String(key),
 	})
-	metrics.S3OperationDurationSeconds.WithLabelValues("head").Observe(time.Since(start).Seconds())
+	pipeline.S3OperationDurationSeconds.WithLabelValues("head").Observe(time.Since(start).Seconds())
 	if err != nil {
-		metrics.S3ErrorsTotal.WithLabelValues("head").Inc()
+		pipeline.S3ErrorsTotal.WithLabelValues("head").Inc()
 		return 0, fmt.Errorf("head %s: %w", key, err)
 	}
 	return *out.ContentLength, nil

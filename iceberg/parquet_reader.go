@@ -10,7 +10,7 @@ import (
 	"time"
 
 	pq "github.com/parquet-go/parquet-go"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
@@ -26,7 +26,7 @@ func DownloadWithRetry(ctx context.Context, s3 ObjectStorage, key string) ([]byt
 }
 
 // ReadParquetRows reads a parquet file and returns rows as maps.
-func ReadParquetRows(data []byte, ts *schema.TableSchema) ([]map[string]any, error) {
+func ReadParquetRows(data []byte, ts *postgres.TableSchema) ([]map[string]any, error) {
 	reader := pq.NewReader(bytes.NewReader(data))
 
 	colNames := make([]string, len(reader.Schema().Fields()))
@@ -93,7 +93,7 @@ func ReadParquetPKKeysFromReaderAt(r io.ReaderAt, size int64, pk []string) ([]st
 
 	pqSchema := file.Schema()
 
-	// Find PK column indices in the parquet schema.
+	// Find PK column indices in the parquet postgres.
 	pkColIdx := make(map[string]int, len(pk))
 	for i, f := range pqSchema.Fields() {
 		for _, p := range pk {

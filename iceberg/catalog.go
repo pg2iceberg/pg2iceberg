@@ -9,18 +9,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pg2iceberg/pg2iceberg/metrics"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
 // Catalog abstracts Iceberg catalog operations.
 type Catalog interface {
 	EnsureNamespace(ns string) error
 	LoadTable(ns, table string) (*TableMetadata, error)
-	CreateTable(ns, table string, ts *schema.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error)
+	CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error)
 	CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error
 	CommitTransaction(ns string, commits []TableCommit) error
-	EvolveSchema(ns, table string, currentSchemaID int, newSchema *schema.TableSchema) (int, error)
+	EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error)
 }
 
 // CatalogClient interacts with the Iceberg REST catalog.
@@ -114,9 +114,9 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 	start := time.Now()
 	resp, err := c.get(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table))
-	metrics.CatalogOperationDurationSeconds.WithLabelValues("load_table").Observe(time.Since(start).Seconds())
+	pipeline.CatalogOperationDurationSeconds.WithLabelValues("load_table").Observe(time.Since(start).Seconds())
 	if err != nil {
-		metrics.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
+		pipeline.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -125,7 +125,7 @@ func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 		return nil, nil // table doesn't exist
 	}
 	if resp.StatusCode != 200 {
-		metrics.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
+		pipeline.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
 		return nil, c.readError(resp)
 	}
 
@@ -137,8 +137,8 @@ func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 }
 
 // CreateTable creates a new Iceberg table.
-func (c *CatalogClient) CreateTable(ns, table string, ts *schema.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
-	icebergSchema := schema.IcebergSchemaJSON(ts)
+func (c *CatalogClient) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
+	icebergSchema := postgres.IcebergSchemaJSON(ts)
 
 	partitionSpec := map[string]any{
 		"spec-id": 0,
@@ -185,7 +185,7 @@ func (c *CatalogClient) CreateTable(ns, table string, ts *schema.TableSchema, lo
 // CommitSnapshot commits a new snapshot to the table.
 func (c *CatalogClient) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
 	defer func(start time.Time) {
-		metrics.CatalogOperationDurationSeconds.WithLabelValues("commit_snapshot").Observe(time.Since(start).Seconds())
+		pipeline.CatalogOperationDurationSeconds.WithLabelValues("commit_snapshot").Observe(time.Since(start).Seconds())
 	}(time.Now())
 	// Build requirements
 	var requirements []map[string]any
@@ -267,7 +267,7 @@ type TableCommit struct {
 // the Iceberg REST catalog's multi-table transaction endpoint.
 func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) error {
 	defer func(start time.Time) {
-		metrics.CatalogOperationDurationSeconds.WithLabelValues("commit_transaction").Observe(time.Since(start).Seconds())
+		pipeline.CatalogOperationDurationSeconds.WithLabelValues("commit_transaction").Observe(time.Since(start).Seconds())
 	}(time.Now())
 	if len(commits) == 0 {
 		return nil
@@ -347,11 +347,11 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 }
 
 // EvolveSchema updates the Iceberg table schema via the REST catalog.
-// It adds a new schema version and sets it as the current schema.
+// It adds a new schema version and sets it as the current postgres.
 // Returns the new schema ID.
-func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newSchema *schema.TableSchema) (int, error) {
+func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	defer func(start time.Time) {
-		metrics.CatalogOperationDurationSeconds.WithLabelValues("evolve_schema").Observe(time.Since(start).Seconds())
+		pipeline.CatalogOperationDurationSeconds.WithLabelValues("evolve_schema").Observe(time.Since(start).Seconds())
 	}(time.Now())
 	newSchemaID := currentSchemaID + 1
 
@@ -365,7 +365,7 @@ func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newS
 		"updates": []map[string]any{
 			{
 				"action": "add-schema",
-				"schema": schema.IcebergSchemaJSONWithID(newSchema, newSchemaID),
+				"schema": postgres.IcebergSchemaJSONWithID(newSchema, newSchemaID),
 			},
 			{
 				"action":    "set-current-schema",

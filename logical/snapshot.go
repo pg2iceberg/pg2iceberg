@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/pg2iceberg/pg2iceberg/metrics"
-	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/pg2iceberg/pg2iceberg/worker"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
 // TxFactory creates a new transaction for snapshot queries. Each table gets
@@ -23,7 +23,7 @@ type TxFactory func(ctx context.Context) (pgx.Tx, func(context.Context), error)
 // SnapshotTable describes a table to be snapshotted.
 type SnapshotTable struct {
 	Name   string
-	Schema *schema.TableSchema
+	Schema *postgres.TableSchema
 }
 
 // Snapshotter performs bulk SELECT * table copies using per-table transactions
@@ -31,7 +31,7 @@ type SnapshotTable struct {
 type Snapshotter struct {
 	tables     []SnapshotTable
 	txFactory  TxFactory
-	pool       *worker.Pool
+	pool       *utils.Pool
 	pipelineID string
 }
 
@@ -52,25 +52,25 @@ func NewSnapshotter(tables []SnapshotTable, txFactory TxFactory, concurrency int
 	return &Snapshotter{
 		tables:     tables,
 		txFactory:  txFactory,
-		pool:       worker.NewPool(concurrency),
+		pool:       utils.NewPool(concurrency),
 		pipelineID: pid,
 	}
 }
 
 // Workers returns a snapshot of all worker statuses.
-func (s *Snapshotter) Workers() []worker.Status {
+func (s *Snapshotter) Workers() []utils.Status {
 	return s.pool.Workers()
 }
 
 // Run snapshots all tables using the worker pool, emitting rows as ChangeEvents.
 // After each table completes, an OpSnapshotTableComplete event is sent.
-func (s *Snapshotter) Run(ctx context.Context, events chan<- ChangeEvent) ([]worker.Result, error) {
-	tasks := make([]worker.Task, len(s.tables))
+func (s *Snapshotter) Run(ctx context.Context, events chan<- ChangeEvent) ([]utils.Result, error) {
+	tasks := make([]utils.Task, len(s.tables))
 	for i, tbl := range s.tables {
 		tbl := tbl
-		tasks[i] = worker.Task{
+		tasks[i] = utils.Task{
 			Name: tbl.Name,
-			Fn: func(ctx context.Context, progress *worker.Progress) error {
+			Fn: func(ctx context.Context, progress *utils.Progress) error {
 				if err := s.snapshotOneTable(ctx, tbl, events, progress); err != nil {
 					return err
 				}
@@ -102,7 +102,7 @@ func (s *Snapshotter) Run(ctx context.Context, events chan<- ChangeEvent) ([]wor
 // snapshotOneTable copies all rows from a single table. It obtains its own
 // transaction from the TxFactory. This is the future hook point for CTID
 // range splitting and parallel workers.
-func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, events chan<- ChangeEvent, progress *worker.Progress) error {
+func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, events chan<- ChangeEvent, progress *utils.Progress) error {
 	tx, cleanup, err := s.txFactory(ctx)
 	if err != nil {
 		return fmt.Errorf("create tx for %s: %w", tbl.Name, err)
@@ -144,7 +144,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, e
 			return ctx.Err()
 		}
 		progress.Add(1)
-		metrics.SnapshotRowsTotal.WithLabelValues(s.pipelineID, tbl.Name).Inc()
+		pipeline.SnapshotRowsTotal.WithLabelValues(s.pipelineID, tbl.Name).Inc()
 	}
 	rows.Close()
 

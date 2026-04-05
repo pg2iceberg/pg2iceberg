@@ -13,16 +13,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
-	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/pg2iceberg/pg2iceberg/source"
-	"github.com/pg2iceberg/pg2iceberg/worker"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"golang.org/x/sync/errgroup"
 )
 
 // txBuffer holds events for a single in-flight PG transaction.
 type txBuffer struct {
 	xid       uint32
-	events    []source.ChangeEvent
+	events    []postgres.ChangeEvent
 	tables    map[string]bool // which tables this tx touches
 	committed bool
 	commitTS  time.Time // PG commit timestamp
@@ -76,9 +75,9 @@ type partitionedWriter struct {
 
 type tableSink struct {
 	// Source schema (user columns only).
-	srcSchema *schema.TableSchema
+	srcSchema *postgres.TableSchema
 	// Events table schema (metadata + user columns, all user cols nullable).
-	eventsSchema *schema.TableSchema
+	eventsSchema *postgres.TableSchema
 
 	icebergName       string // materialized table name in Iceberg (e.g. "orders")
 	eventsIcebergName string // events table name in Iceberg (e.g. "orders_events")
@@ -150,7 +149,7 @@ func (s *Sink) Tables() map[string]*tableSink { return s.tables }
 // RegisterTable sets up writers for a table and ensures both the events table
 // and materialized table exist in the catalog. The sink writes to the events
 // table; the materializer reads from it and writes to the materialized table.
-func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {
+func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) error {
 	icebergTable := pgTableToIceberg(ts.Table)
 	eventsTable := EventsTableName(icebergTable)
 
@@ -246,7 +245,7 @@ func (s *Sink) UnregisterTable(pgTable string) {
 // EvolveSchema applies a schema change to a table: updates the in-memory schema,
 // evolves both the events and materialized Iceberg tables, and rebuilds writers.
 // The caller must flush all buffered data before calling this.
-func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.SchemaChange) error {
+func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgres.SchemaChange) error {
 	ts, ok := s.tables[pgTable]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", pgTable)
@@ -258,7 +257,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 	nextFieldID := ts.srcSchema.MaxFieldID() + 1
 
 	for _, col := range change.AddedColumns {
-		ts.srcSchema.Columns = append(ts.srcSchema.Columns, schema.Column{
+		ts.srcSchema.Columns = append(ts.srcSchema.Columns, postgres.Column{
 			Name:       col.Name,
 			PGType:     col.PGType,
 			IsNullable: true,
@@ -281,8 +280,8 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 	for _, tc := range change.TypeChanges {
 		for i, col := range ts.srcSchema.Columns {
 			if col.Name == tc.Name {
-				oldIceberg := schema.IcebergType(col.PGType)
-				newIceberg := schema.IcebergType(tc.NewType)
+				oldIceberg := postgres.IcebergType(col.PGType)
+				newIceberg := postgres.IcebergType(tc.NewType)
 				ts.srcSchema.Columns[i].PGType = tc.NewType
 				if oldIceberg != newIceberg {
 					icebergChanged = true
@@ -311,7 +310,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		log.Printf("[sink] schema change for %s is a no-op at Iceberg level, skipping catalog evolution", pgTable)
 	}
 
-	// Rebuild writers with the new events schema.
+	// Rebuild writers with the new events postgres.
 	for key, pw := range ts.partitions {
 		ts.partitions[key] = &partitionedWriter{
 			dataWriter: NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
@@ -343,15 +342,15 @@ func (ts *tableSink) getEventsWriter(row map[string]any) *partitionedWriter {
 // Write buffers a ChangeEvent for the next flush. DML events are held in
 // per-transaction buffers until the corresponding OpCommit arrives, so
 // flushes always align to PG transaction boundaries.
-func (s *Sink) Write(event source.ChangeEvent) error {
+func (s *Sink) Write(event postgres.ChangeEvent) error {
 	switch event.Operation {
-	case source.OpBegin:
+	case postgres.OpBegin:
 		s.openTxns[event.TransactionID] = &txBuffer{
 			xid:    event.TransactionID,
 			tables: make(map[string]bool),
 		}
 		return nil
-	case source.OpCommit:
+	case postgres.OpCommit:
 		tx, ok := s.openTxns[event.TransactionID]
 		if !ok {
 			return nil // no tracked DML in this tx
@@ -383,7 +382,7 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 
 // writeDirect writes a change event to the events table as an append-only row.
 // No TOAST resolution, no equality deletes — just append the event with metadata.
-func (s *Sink) writeDirect(event source.ChangeEvent) error {
+func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 	ts, ok := s.tables[event.Table]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", event.Table)
@@ -394,16 +393,16 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	// to avoid a per-row map allocation.
 	var row map[string]any
 	switch event.Operation {
-	case source.OpInsert:
+	case postgres.OpInsert:
 		row = event.After
 		row["_op"] = "I"
-	case source.OpUpdate:
+	case postgres.OpUpdate:
 		row = event.After
 		row["_op"] = "U"
 		if len(event.UnchangedCols) > 0 {
 			row["_unchanged_cols"] = iceberg.UnchangedColsString(event.UnchangedCols)
 		}
-	case source.OpDelete:
+	case postgres.OpDelete:
 		row = event.Before
 		row["_op"] = "D"
 	default:
@@ -423,12 +422,12 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	return nil
 }
 
-// toChangeEvent converts a source.ChangeEvent into a materializer ChangeEvent,
+// toChangeEvent converts a postgres.ChangeEvent into a materializer ChangeEvent,
 // using the given seq value. Reuses the source event's map directly — the source
 // allocates a fresh map per event so no copy is needed. The map is shared with
 // writeDirect (which adds metadata keys like _lsn, _op); the materializer only
 // accesses user columns by name so the extra keys are harmless.
-func (s *Sink) toChangeEvent(event source.ChangeEvent, seq int64) ChangeEvent {
+func (s *Sink) toChangeEvent(event postgres.ChangeEvent, seq int64) ChangeEvent {
 	ce := ChangeEvent{
 		lsn:           int64(event.LSN),
 		seq:           seq,
@@ -436,13 +435,13 @@ func (s *Sink) toChangeEvent(event source.ChangeEvent, seq int64) ChangeEvent {
 	}
 
 	switch event.Operation {
-	case source.OpInsert:
+	case postgres.OpInsert:
 		ce.op = "I"
 		ce.row = event.After
-	case source.OpUpdate:
+	case postgres.OpUpdate:
 		ce.op = "U"
 		ce.row = event.After
-	case source.OpDelete:
+	case postgres.OpDelete:
 		ce.op = "D"
 		ce.row = event.Before
 	}
@@ -590,7 +589,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	var mu sync.Mutex
 	partResults := make(map[string][]uploadResult)
 
-	var tasks []worker.Task
+	var tasks []utils.Task
 	for _, t := range tablesToFlush {
 		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.eventsIcebergName)
 		for partKey, pw := range t.ts.partitions {
@@ -604,9 +603,9 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 				partPath = partKey // partKey is already in "field=value" format
 			}
 
-			tasks = append(tasks, worker.Task{
+			tasks = append(tasks, utils.Task{
 				Name: pgTable,
-				Fn: func(ctx context.Context, progress *worker.Progress) error {
+				Fn: func(ctx context.Context, progress *utils.Progress) error {
 					uploads, err := serializeEventsPartition(pw, basePath, partPath)
 					if err != nil {
 						return err
@@ -628,7 +627,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	if len(tasks) < concurrency {
 		concurrency = len(tasks)
 	}
-	pool := worker.NewPool(concurrency)
+	pool := utils.NewPool(concurrency)
 	if _, err := pool.Run(ctx, tasks); err != nil {
 		return nil, err
 	}

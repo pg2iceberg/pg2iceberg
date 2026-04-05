@@ -15,7 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
 const fieldIDKey = "PARQUET:field_id"
@@ -29,7 +29,7 @@ type colSizer struct {
 }
 
 // buildColSizers precomputes sizing info from column types.
-func buildColSizers(columns []schema.Column) []colSizer {
+func buildColSizers(columns []postgres.Column) []colSizer {
 	sizers := make([]colSizer, len(columns))
 	for i, col := range columns {
 		sizers[i].name = col.Name
@@ -57,7 +57,7 @@ type colAppender struct {
 }
 
 // buildColAppenders precomputes Arrow builder append functions for each column.
-func buildColAppenders(columns []schema.Column) []colAppender {
+func buildColAppenders(columns []postgres.Column) []colAppender {
 	appenders := make([]colAppender, len(columns))
 	for i, col := range columns {
 		ca := colAppender{
@@ -178,7 +178,7 @@ func pgToArrowType(pgType string) arrow.DataType {
 }
 
 // buildArrowSchema creates an Arrow schema from the column definitions.
-func buildArrowSchema(columns []schema.Column) *arrow.Schema {
+func buildArrowSchema(columns []postgres.Column) *arrow.Schema {
 	fields := make([]arrow.Field, len(columns))
 	for i, col := range columns {
 		fields[i] = arrow.Field{
@@ -212,9 +212,9 @@ var parquetWriterProps = apq.NewWriterProperties(
 // them as a Parquet file via pqarrow. Values are appended directly into
 // typed builders in Add(), eliminating intermediate row storage.
 type ParquetWriter struct {
-	tableSchema    *schema.TableSchema
+	tableSchema    *postgres.TableSchema
 	arrowSchema    *arrow.Schema
-	columns        []schema.Column
+	columns        []postgres.Column
 	colSizers      []colSizer
 	colAppenders   []colAppender
 	builders       []array.Builder
@@ -223,7 +223,7 @@ type ParquetWriter struct {
 	outBuf         bytes.Buffer
 }
 
-func newParquetWriter(ts *schema.TableSchema, columns []schema.Column) *ParquetWriter {
+func newParquetWriter(ts *postgres.TableSchema, columns []postgres.Column) *ParquetWriter {
 	arrowSchema := buildArrowSchema(columns)
 	return &ParquetWriter{
 		tableSchema:  ts,
@@ -236,13 +236,13 @@ func newParquetWriter(ts *schema.TableSchema, columns []schema.Column) *ParquetW
 }
 
 // NewDataWriter creates a writer for data files (all columns).
-func NewDataWriter(ts *schema.TableSchema) *ParquetWriter {
+func NewDataWriter(ts *postgres.TableSchema) *ParquetWriter {
 	return newParquetWriter(ts, ts.Columns)
 }
 
 // NewDeleteWriter creates a writer for equality delete files (PK columns only).
-func NewDeleteWriter(ts *schema.TableSchema) *ParquetWriter {
-	pkCols := make([]schema.Column, 0)
+func NewDeleteWriter(ts *postgres.TableSchema) *ParquetWriter {
+	pkCols := make([]postgres.Column, 0)
 	for _, pk := range ts.PK {
 		for _, col := range ts.Columns {
 			if col.Name == pk {
@@ -360,15 +360,15 @@ type FileChunk struct {
 // RollingWriter wraps a ParquetWriter and automatically splits into
 // multiple files when the estimated size exceeds the target.
 type RollingWriter struct {
-	schema     *schema.TableSchema
-	newWriter  func(*schema.TableSchema) *ParquetWriter
+	schema     *postgres.TableSchema
+	newWriter  func(*postgres.TableSchema) *ParquetWriter
 	writer     *ParquetWriter
 	targetSize int64
 	completed  []FileChunk
 }
 
 // NewRollingDataWriter creates a rolling writer for data files.
-func NewRollingDataWriter(ts *schema.TableSchema, targetSize int64) *RollingWriter {
+func NewRollingDataWriter(ts *postgres.TableSchema, targetSize int64) *RollingWriter {
 	return &RollingWriter{
 		schema:     ts,
 		newWriter:  NewDataWriter,
@@ -378,7 +378,7 @@ func NewRollingDataWriter(ts *schema.TableSchema, targetSize int64) *RollingWrit
 }
 
 // NewRollingDeleteWriter creates a rolling writer for equality delete files.
-func NewRollingDeleteWriter(ts *schema.TableSchema, targetSize int64) *RollingWriter {
+func NewRollingDeleteWriter(ts *postgres.TableSchema, targetSize int64) *RollingWriter {
 	return &RollingWriter{
 		schema:     ts,
 		newWriter:  NewDeleteWriter,

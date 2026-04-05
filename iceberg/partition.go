@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/spaolacci/murmur3"
 )
 
@@ -25,7 +25,7 @@ type PartitionField struct {
 	TransformParam int    // N for bucket[N], W for truncate[W]
 
 	// Cached column metadata for hot-path lookups (set by BuildPartitionSpec).
-	sourceCol *schema.Column
+	sourceCol *postgres.Column
 }
 
 // PartitionSpec describes the partition spec for an Iceberg table.
@@ -76,10 +76,10 @@ func parsePartitionExpr(expr string) (transform, column string, param int, err e
 	return "identity", expr, 0, nil
 }
 
-// BuildPartitionSpec builds a PartitionSpec from config expressions and table schema.
+// BuildPartitionSpec builds a PartitionSpec from config expressions and table postgres.
 // Each expression is either "transform(column)" (e.g. "day(created_at)") or just
 // "column" for identity transform (e.g. "region").
-func BuildPartitionSpec(exprs []string, ts *schema.TableSchema) (*PartitionSpec, error) {
+func BuildPartitionSpec(exprs []string, ts *postgres.TableSchema) (*PartitionSpec, error) {
 	if len(exprs) == 0 {
 		return &PartitionSpec{}, nil
 	}
@@ -146,7 +146,7 @@ func (ps *PartitionSpec) IsUnpartitioned() bool {
 // PartitionKey computes the partition key string for a row.
 // Returns only the string key — use PartitionValues separately when the
 // partition value map is needed (e.g. on cache miss).
-func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *schema.TableSchema) string {
+func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *postgres.TableSchema) string {
 	if ps.IsUnpartitioned() {
 		return ""
 	}
@@ -182,7 +182,7 @@ func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *schema.TableSchema
 
 // PartitionValues computes the partition value map for a row.
 // Only needed when persisting partition metadata (e.g. new partition creation).
-func (ps *PartitionSpec) PartitionValues(row map[string]any, ts *schema.TableSchema) map[string]any {
+func (ps *PartitionSpec) PartitionValues(row map[string]any, ts *postgres.TableSchema) map[string]any {
 	values := make(map[string]any, len(ps.Fields))
 	for _, field := range ps.Fields {
 		col := field.sourceCol
@@ -277,7 +277,7 @@ func (f *PartitionField) transformString() string {
 }
 
 // PartitionRecordSchemaAvro returns the Avro schema for the partition tuple in manifest entries.
-func (ps *PartitionSpec) PartitionRecordSchemaAvro(ts *schema.TableSchema) string {
+func (ps *PartitionSpec) PartitionRecordSchemaAvro(ts *postgres.TableSchema) string {
 	if ps.IsUnpartitioned() {
 		return `{"type": "record", "name": "r102", "fields": []}`
 	}
@@ -293,7 +293,7 @@ func (ps *PartitionSpec) PartitionRecordSchemaAvro(ts *schema.TableSchema) strin
 }
 
 // PartitionAvroValue returns the partition values formatted for Avro encoding in manifest entries.
-func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *schema.TableSchema) map[string]any {
+func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *postgres.TableSchema) map[string]any {
 	if ps.IsUnpartitioned() || len(partValues) == 0 {
 		return map[string]any{}
 	}
@@ -314,7 +314,7 @@ func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *schem
 // ParsePartitionPath reverses a partition path like "seq_truncate=0" back into
 // partition values. Used when the original row is not available (e.g. DELETE
 // events resolved from the file index).
-func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema) map[string]any {
+func (ps *PartitionSpec) ParsePartitionPath(path string, ts *postgres.TableSchema) map[string]any {
 	values := make(map[string]any, len(ps.Fields))
 	parts := strings.Split(path, "/")
 	for _, part := range parts {
@@ -366,7 +366,7 @@ func ExtractPartBucketKey(filePath string) string {
 
 // --- helpers ---
 
-func findColumn(ts *schema.TableSchema, name string) *schema.Column {
+func findColumn(ts *postgres.TableSchema, name string) *postgres.Column {
 	for i := range ts.Columns {
 		if ts.Columns[i].Name == name {
 			return &ts.Columns[i]
@@ -375,7 +375,7 @@ func findColumn(ts *schema.TableSchema, name string) *schema.Column {
 	return nil
 }
 
-func findColumnByID(ts *schema.TableSchema, fieldID int) *schema.Column {
+func findColumnByID(ts *postgres.TableSchema, fieldID int) *postgres.Column {
 	for i := range ts.Columns {
 		if ts.Columns[i].FieldID == fieldID {
 			return &ts.Columns[i]
@@ -774,7 +774,7 @@ func ToTime(v any, pgType string) time.Time {
 }
 
 // partitionFieldAvroType returns the Avro type for a partition field's transformed value.
-func partitionFieldAvroType(transform string, ts *schema.TableSchema, sourceID int) string {
+func partitionFieldAvroType(transform string, ts *postgres.TableSchema, sourceID int) string {
 	switch transform {
 	case "year", "month", "day", "hour", "bucket":
 		return "int"
@@ -783,13 +783,13 @@ func partitionFieldAvroType(transform string, ts *schema.TableSchema, sourceID i
 		if col == nil {
 			return "string"
 		}
-		return icebergToAvroType(schema.IcebergType(col.PGType))
+		return icebergToAvroType(postgres.IcebergType(col.PGType))
 	case "identity":
 		col := findColumnByID(ts, sourceID)
 		if col == nil {
 			return "string"
 		}
-		return icebergToAvroType(schema.IcebergType(col.PGType))
+		return icebergToAvroType(postgres.IcebergType(col.PGType))
 	default:
 		return "string"
 	}

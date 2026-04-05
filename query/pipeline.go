@@ -10,9 +10,8 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
-	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
-	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
 // Pipeline is the query-mode replication pipeline. It polls PostgreSQL via
@@ -25,7 +24,7 @@ type Pipeline struct {
 	poller  *Poller
 	buffers map[string]*Buffer              // per-table PK dedup buffer
 	writers map[string]*iceberg.TableWriter // per-table Iceberg writer
-	schemas map[string]*schema.TableSchema
+	schemas map[string]*postgres.TableSchema
 
 	catalog iceberg.Catalog
 	s3      iceberg.ObjectStorage
@@ -110,7 +109,7 @@ func (p *Pipeline) Status() (pipeline.Status, error) {
 	return p.status, p.err
 }
 
-// Metrics returns a snapshot of pipeline metrics.
+// Metrics returns a snapshot of pipeline pipeline.
 func (p *Pipeline) Metrics() pipeline.Metrics {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -250,7 +249,7 @@ func (p *Pipeline) run(ctx context.Context) {
 	p.mu.Lock()
 	p.startedAt = time.Now()
 	p.status = pipeline.StatusRunning
-	metrics.PipelineStatus.WithLabelValues(p.id).Set(metrics.StatusToFloat["running"])
+	pipeline.PipelineStatus.WithLabelValues(p.id).Set(pipeline.StatusToFloat["running"])
 	p.mu.Unlock()
 
 	pollInterval := p.cfg.Source.Query.PollDuration()
@@ -331,7 +330,7 @@ func (p *Pipeline) pollAndBuffer(ctx context.Context) error {
 			buf.Upsert(row)
 		}
 		p.rowsProcessed += int64(len(r.Rows))
-		metrics.RowsProcessedTotal.WithLabelValues(p.id, r.Table, "INSERT").Add(float64(len(r.Rows)))
+		pipeline.RowsProcessedTotal.WithLabelValues(p.id, r.Table, "INSERT").Add(float64(len(r.Rows)))
 	}
 	return nil
 }
