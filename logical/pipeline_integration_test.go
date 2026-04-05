@@ -99,7 +99,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	// Wait for pipeline to be running (snapshot complete).
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*logical.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -286,7 +286,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*logical.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -435,7 +435,7 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*logical.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -651,7 +651,7 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*logical.LogicalSource)
+	ls := p.Source(); ok := ls != nil
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -886,7 +886,7 @@ func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	if _, ok := p.Source().(*logical.LogicalSource); !ok {
+	if p.Source() == nil {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
 
@@ -1302,7 +1302,7 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*logical.LogicalSource)
+	ls := p.Source()
 	lsnAfterSnapshot := ls.FlushedLSN()
 
 	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
@@ -1350,7 +1350,7 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*logical.LogicalSource)
+	ls := p.Source()
 	lsnAfterSnapshot := ls.FlushedLSN()
 
 	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
@@ -1466,7 +1466,7 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*logical.LogicalSource)
+	ls := p.Source()
 
 	// Phase 1: Confirm streaming works.
 	pgDirectHost, _ := pgCtr.Host(ctx)
