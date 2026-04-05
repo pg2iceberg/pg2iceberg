@@ -63,8 +63,8 @@ func (s *Snapshotter) Workers() []utils.Status {
 }
 
 // Run snapshots all tables using the worker pool, emitting rows as ChangeEvents.
-// After each table completes, an OpSnapshotTableComplete event is sent.
-func (s *Snapshotter) Run(ctx context.Context, events chan<- ChangeEvent) ([]utils.Result, error) {
+// After each table completes, an postgres.OpSnapshotTableComplete event is sent.
+func (s *Snapshotter) Run(ctx context.Context, events chan<- postgres.ChangeEvent) ([]utils.Result, error) {
 	tasks := make([]utils.Task, len(s.tables))
 	for i, tbl := range s.tables {
 		tbl := tbl
@@ -77,9 +77,9 @@ func (s *Snapshotter) Run(ctx context.Context, events chan<- ChangeEvent) ([]uti
 
 				// Signal that this table's snapshot is complete.
 				select {
-				case events <- ChangeEvent{
+				case events <- postgres.ChangeEvent{
 					Table:     tbl.Name,
-					Operation: OpSnapshotTableComplete,
+					Operation: postgres.OpSnapshotTableComplete,
 				}:
 				case <-ctx.Done():
 					return ctx.Err()
@@ -102,7 +102,7 @@ func (s *Snapshotter) Run(ctx context.Context, events chan<- ChangeEvent) ([]uti
 // snapshotOneTable copies all rows from a single table. It obtains its own
 // transaction from the TxFactory. This is the future hook point for CTID
 // range splitting and parallel workers.
-func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, events chan<- ChangeEvent, progress *utils.Progress) error {
+func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, events chan<- postgres.ChangeEvent, progress *utils.Progress) error {
 	tx, cleanup, err := s.txFactory(ctx)
 	if err != nil {
 		return fmt.Errorf("create tx for %s: %w", tbl.Name, err)
@@ -131,9 +131,9 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, e
 
 		now := time.Now()
 		select {
-		case events <- ChangeEvent{
+		case events <- postgres.ChangeEvent{
 			Table:              tbl.Name,
-			Operation:          OpInsert,
+			Operation:          postgres.OpInsert,
 			After:              row,
 			PK:                 tbl.Schema.PK,
 			SourceTimestamp:     now,

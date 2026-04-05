@@ -327,6 +327,13 @@ func (cfg *Config) Validate() error {
 				errs = append(errs, fmt.Sprintf("tables[%d].watermark_column: required for query mode", i))
 			}
 		}
+		// Warn about logical-only settings that have no effect in query mode.
+		if cfg.Sink.EventsPartition != "" {
+			errs = append(errs, "sink.events_partition: not applicable in query mode (no events table)")
+		}
+		if cfg.Sink.MaterializerInterval != "" {
+			errs = append(errs, "sink.materializer_interval: not applicable in query mode (no materializer)")
+		}
 	}
 
 	// Sink

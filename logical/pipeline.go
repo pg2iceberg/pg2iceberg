@@ -11,7 +11,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
-	"github.com/pg2iceberg/pg2iceberg/sink"
+
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
@@ -25,7 +25,7 @@ type Pipeline struct {
 	err    error
 
 	src     *LogicalSource
-	snk     *sink.Sink
+	snk     *Sink
 	store   pipeline.CheckpointStore
 	schemas map[string]*postgres.TableSchema
 
@@ -35,8 +35,8 @@ type Pipeline struct {
 	bytesProcessed int64
 	lastWrittenLSN uint64
 
-	materializer *sink.Materializer
-	eventBuf     *sink.ChangeEventBuffer
+	materializer *Materializer
+	eventBuf     *ChangeEventBuffer
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -50,8 +50,8 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		return nil, fmt.Errorf("create checkpoint store: %w", err)
 	}
 
-	eventBuf := sink.NewChangeEventBuffer()
-	snk, err := sink.BuildSink(cfg.Sink, cfg.Tables, id, eventBuf)
+	eventBuf := NewChangeEventBuffer()
+	snk, err := BuildSink(cfg.Sink, cfg.Tables, id, eventBuf)
 	if err != nil {
 		cpStore.Close()
 		return nil, fmt.Errorf("create sink: %w", err)
@@ -69,7 +69,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 }
 
 // NewPipeline creates a Pipeline with injected dependencies (for tests).
-func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store pipeline.CheckpointStore) *Pipeline {
+func NewPipeline(id string, cfg *config.Config, snk *Sink, store pipeline.CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:     id,
 		cfg:    cfg,
@@ -81,7 +81,7 @@ func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store pipeline.C
 }
 
 // SetEventBuf sets the change event buffer. Must be called before Start.
-func (p *Pipeline) SetEventBuf(buf *sink.ChangeEventBuffer) { p.eventBuf = buf }
+func (p *Pipeline) SetEventBuf(buf *ChangeEventBuffer) { p.eventBuf = buf }
 
 // Config returns the pipeline configuration.
 func (p *Pipeline) Config() *config.Config { return p.cfg }
@@ -235,7 +235,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	go p.monitorWALLag(ctx)
 
 	// Start materializer.
-	materializer := sink.NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.eventBuf)
+	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.eventBuf)
 	if cp.MaterializerSnapshots != nil {
 		for pgTable, snapID := range cp.MaterializerSnapshots {
 			materializer.SetLastEventsSnapshot(pgTable, snapID)
@@ -296,7 +296,7 @@ func (p *Pipeline) run(ctx context.Context) {
 		}
 	}()
 
-	events := make(chan ChangeEvent, 1000)
+	events := make(chan postgres.ChangeEvent, 1000)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -325,7 +325,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				return
 			}
 
-			if event.Operation == OpSnapshotTableComplete {
+			if event.Operation == postgres.OpSnapshotTableComplete {
 				if err := p.flushSnapshotTable(ctx, event.Table); err != nil {
 					log.Printf("[logical:%s] snapshot table %s flush error: %v", p.id, event.Table, err)
 					p.setStatus(pipeline.StatusError, err)
@@ -334,7 +334,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 
-			if event.Operation == OpSnapshotComplete {
+			if event.Operation == postgres.OpSnapshotComplete {
 				if err := p.flushSnapshotComplete(ctx); err != nil {
 					log.Printf("[logical:%s] snapshot complete flush error: %v", p.id, err)
 					p.setStatus(pipeline.StatusError, err)
@@ -343,7 +343,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 
-			if event.Operation == OpSchemaChange {
+			if event.Operation == postgres.OpSchemaChange {
 				if err := p.handleSchemaChange(ctx, event); err != nil {
 					log.Printf("[logical:%s] schema change error: %v", p.id, err)
 					p.setStatus(pipeline.StatusError, err)
@@ -352,7 +352,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 
-			if event.Operation == OpBegin || event.Operation == OpCommit {
+			if event.Operation == postgres.OpBegin || event.Operation == postgres.OpCommit {
 				if err := p.snk.Write(event); err != nil {
 					p.setStatus(pipeline.StatusError, fmt.Errorf("write error: %w", err))
 					return
@@ -403,7 +403,7 @@ func (p *Pipeline) run(ctx context.Context) {
 					if !ok {
 						goto drained
 					}
-					if event.Operation == OpBegin || event.Operation == OpCommit {
+					if event.Operation == postgres.OpBegin || event.Operation == postgres.OpCommit {
 						if writeErr := p.snk.Write(event); writeErr != nil {
 							drainErr = writeErr
 							goto drained
@@ -411,9 +411,9 @@ func (p *Pipeline) run(ctx context.Context) {
 						if event.LSN > p.lastWrittenLSN {
 							p.lastWrittenLSN = event.LSN
 						}
-					} else if event.Operation != OpSnapshotTableComplete &&
-						event.Operation != OpSnapshotComplete &&
-						event.Operation != OpSchemaChange {
+					} else if event.Operation != postgres.OpSnapshotTableComplete &&
+						event.Operation != postgres.OpSnapshotComplete &&
+						event.Operation != postgres.OpSchemaChange {
 						if writeErr := p.snk.Write(event); writeErr != nil {
 							drainErr = writeErr
 							goto drained
@@ -539,7 +539,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	return nil
 }
 
-func (p *Pipeline) handleSchemaChange(ctx context.Context, event ChangeEvent) error {
+func (p *Pipeline) handleSchemaChange(ctx context.Context, event postgres.ChangeEvent) error {
 	sc := event.SchemaChange
 	if sc == nil {
 		return nil

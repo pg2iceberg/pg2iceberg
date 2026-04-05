@@ -266,6 +266,29 @@ func (p *Pipeline) run(ctx context.Context) {
 	log.Printf("[query:%s] started (poll_interval=%s, flush_interval=%s, flush_rows=%d, flush_bytes=%dMB)",
 		p.id, pollInterval, flushInterval, flushRows, flushBytes/(1024*1024))
 
+	// Periodic gauge-style metrics.
+	metricsTicker := time.NewTicker(5 * time.Second)
+	defer metricsTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-metricsTicker.C:
+				p.mu.RLock()
+				if !p.startedAt.IsZero() {
+					pipeline.PipelineUptimeSeconds.WithLabelValues(p.id).Set(time.Since(p.startedAt).Seconds())
+				}
+				p.mu.RUnlock()
+				for table, wm := range p.poller.Watermarks() {
+					if !wm.IsZero() {
+						pipeline.QueryWatermarkLagSeconds.WithLabelValues(p.id, table).Set(time.Since(wm).Seconds())
+					}
+				}
+			}
+		}
+	}()
+
 	// Immediate first poll.
 	if err := p.pollAndBuffer(ctx); err != nil {
 		p.setStatus(pipeline.StatusError, fmt.Errorf("initial poll: %w", err))
@@ -317,7 +340,10 @@ func (p *Pipeline) run(ctx context.Context) {
 }
 
 func (p *Pipeline) pollAndBuffer(ctx context.Context) error {
+	start := time.Now()
 	results, err := p.poller.PollWithRetry(ctx)
+	pipeline.QueryPollDurationSeconds.WithLabelValues(p.id).Observe(time.Since(start).Seconds())
+	pipeline.QueryPollTotal.WithLabelValues(p.id).Inc()
 	if err != nil {
 		return err
 	}
@@ -331,11 +357,15 @@ func (p *Pipeline) pollAndBuffer(ctx context.Context) error {
 		}
 		p.rowsProcessed += int64(len(r.Rows))
 		pipeline.RowsProcessedTotal.WithLabelValues(p.id, r.Table, "INSERT").Add(float64(len(r.Rows)))
+		pipeline.QueryPollRowsTotal.WithLabelValues(p.id, r.Table).Add(float64(len(r.Rows)))
+		pipeline.QueryBufferRows.WithLabelValues(p.id, r.Table).Set(float64(buf.Len()))
 	}
 	return nil
 }
 
 func (p *Pipeline) flush(ctx context.Context) error {
+	start := time.Now()
+
 	// Prepare commits for all tables with buffered data.
 	var commits []iceberg.TableCommit
 	type tablePrep struct {
@@ -349,11 +379,13 @@ func (p *Pipeline) flush(ctx context.Context) error {
 			continue
 		}
 		rows := buf.Drain()
+		pipeline.QueryBufferRows.WithLabelValues(p.id, pgTable).Set(0)
 		tw := p.writers[pgTable]
 		ts := p.schemas[pgTable]
 
 		prepared, err := tw.Prepare(ctx, rows, ts.PK)
 		if err != nil {
+			pipeline.QueryFlushErrorsTotal.WithLabelValues(p.id).Inc()
 			return fmt.Errorf("prepare %s: %w", pgTable, err)
 		}
 		if prepared == nil {
@@ -369,12 +401,18 @@ func (p *Pipeline) flush(ctx context.Context) error {
 
 	// Atomic multi-table commit.
 	if err := p.catalog.CommitTransaction(p.cfg.Sink.Namespace, commits); err != nil {
+		pipeline.QueryFlushErrorsTotal.WithLabelValues(p.id).Inc()
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	// Post-commit: update manifest caches.
+	pipeline.QueryFlushTotal.WithLabelValues(p.id).Inc()
+	pipeline.QueryFlushDurationSeconds.WithLabelValues(p.id).Observe(time.Since(start).Seconds())
+
+	// Post-commit: update manifest caches + emit per-table metrics.
 	for _, tp := range preps {
 		p.writers[tp.pgTable].ApplyPostCommit(tp.prepared)
+		pipeline.QueryDataFilesWrittenTotal.WithLabelValues(p.id, tp.pgTable).Add(float64(tp.prepared.DataCount))
+		pipeline.QueryDeleteFilesWrittenTotal.WithLabelValues(p.id, tp.pgTable).Add(float64(tp.prepared.DeleteCount))
 		log.Printf("[query:%s] flushed %s: %d data files, %d delete files",
 			p.id, tp.pgTable, tp.prepared.DataCount, tp.prepared.DeleteCount)
 	}

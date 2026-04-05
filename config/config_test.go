@@ -145,6 +145,25 @@ func TestValidate_InvalidDuration(t *testing.T) {
 	}
 }
 
+func TestValidate_QueryModeRejectsLogicalSettings(t *testing.T) {
+	cfg := validConfig()
+	cfg.Source.Mode = "query"
+	cfg.Source.Logical = LogicalConfig{}
+	cfg.Tables = []TableConfig{{Name: "public.orders", PrimaryKey: []string{"id"}, WatermarkColumn: "updated_at"}}
+	cfg.Sink.EventsPartition = "day(_ts)"
+	cfg.Sink.MaterializerInterval = "10s"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for logical-only settings in query mode")
+	}
+	if !strings.Contains(err.Error(), "events_partition") {
+		t.Errorf("expected error to mention events_partition: %v", err)
+	}
+	if !strings.Contains(err.Error(), "materializer_interval") {
+		t.Errorf("expected error to mention materializer_interval: %v", err)
+	}
+}
+
 func TestValidate_MultipleErrors(t *testing.T) {
 	cfg := Config{}
 	cfg.ApplyDefaults()
