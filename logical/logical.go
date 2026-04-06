@@ -156,18 +156,9 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.Chan
 		l.tables[tc.Name] = ts
 	}
 
-	// Validate publication exists.
-	var pubExists bool
-	err = l.queryConn.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
-		l.cfg.PublicationName,
-	).Scan(&pubExists)
-	if err != nil {
-		return fmt.Errorf("check publication: %w", err)
-	}
-	if !pubExists {
-		return fmt.Errorf("publication %q does not exist; create it with: CREATE PUBLICATION %s FOR TABLE ...",
-			l.cfg.PublicationName, l.cfg.PublicationName)
+	// Ensure publication exists, creating or updating it if needed.
+	if err := l.ensurePublication(ctx); err != nil {
+		return fmt.Errorf("ensure publication: %w", err)
 	}
 
 	// Open replication connection first — ensureSlot uses it so the exported
@@ -450,6 +441,80 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 // It uses l.replConn (which must already be open) so that the exported
 // snapshot remains valid for the initial COPY.
 // Returns the snapshot name (non-empty only when a new slot was created).
+// ensurePublication creates the publication if it doesn't exist, and ensures
+// it covers all configured tables. If tables are added to the config, they are
+// added to the publication; tables removed from config are left in the publication
+// (safe — they just produce ignored events).
+func (l *LogicalSource) ensurePublication(ctx context.Context) error {
+	pubName := l.cfg.PublicationName
+
+	var pubExists bool
+	err := l.queryConn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
+		pubName,
+	).Scan(&pubExists)
+	if err != nil {
+		return fmt.Errorf("check publication: %w", err)
+	}
+
+	// Collect configured table names.
+	tableNames := make([]string, 0, len(l.tableCfgs))
+	for _, tc := range l.tableCfgs {
+		tableNames = append(tableNames, tc.Name)
+	}
+
+	if !pubExists {
+		// CREATE PUBLICATION requires table names inlined (not parameterized).
+		tablesSQL := strings.Join(tableNames, ", ")
+		_, err := l.queryConn.Exec(ctx,
+			fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pgx.Identifier{pubName}.Sanitize(), tablesSQL))
+		if err != nil {
+			return fmt.Errorf("create publication: %w", err)
+		}
+		log.Printf("[logical] created publication %q for tables: %s", pubName, tablesSQL)
+		return nil
+	}
+
+	// Publication exists — check if all configured tables are included.
+	rows, err := l.queryConn.Query(ctx,
+		"SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = $1",
+		pubName)
+	if err != nil {
+		return fmt.Errorf("list publication tables: %w", err)
+	}
+	defer rows.Close()
+
+	published := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("scan publication table: %w", err)
+		}
+		published[name] = true
+	}
+
+	var missing []string
+	for _, t := range tableNames {
+		if !published[t] {
+			missing = append(missing, t)
+		}
+	}
+
+	if len(missing) > 0 {
+		tablesSQL := strings.Join(missing, ", ")
+		_, err := l.queryConn.Exec(ctx,
+			fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s", pgx.Identifier{pubName}.Sanitize(), tablesSQL))
+		if err != nil {
+			return fmt.Errorf("alter publication: %w", err)
+		}
+		log.Printf("[logical] added tables to publication %q: %s", pubName, tablesSQL)
+	} else {
+		log.Printf("[logical] publication %q exists with all configured tables", pubName)
+	}
+
+	return nil
+}
+
 func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 	var exists bool
 	err := l.queryConn.QueryRow(ctx,
