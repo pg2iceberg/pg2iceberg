@@ -384,37 +384,32 @@ func findColumnByID(ts *postgres.TableSchema, fieldID int) *postgres.Column {
 	return nil
 }
 
-func isTemporalType(pgType string) bool {
-	switch strings.ToLower(pgType) {
-	case "date", "timestamp", "timestamp without time zone",
-		"timestamptz", "timestamp with time zone":
+func isTemporalType(pgType postgres.Type) bool {
+	switch pgType {
+	case postgres.Date, postgres.Timestamp, postgres.TimestampTZ:
 		return true
 	}
 	return false
 }
 
-func isBucketableType(pgType string) bool {
-	switch strings.ToLower(pgType) {
-	case "integer", "int", "int4", "serial", "smallint", "int2",
-		"bigint", "int8", "bigserial",
-		"numeric", "decimal",
-		"date",
-		"timestamp", "timestamp without time zone",
-		"timestamptz", "timestamp with time zone",
-		"text", "varchar", "character varying", "char", "character", "name",
-		"uuid", "bytea":
+func isBucketableType(pgType postgres.Type) bool {
+	switch pgType {
+	case postgres.Int2, postgres.Int4, postgres.Int8, postgres.OID,
+		postgres.Numeric,
+		postgres.Date, postgres.Timestamp, postgres.TimestampTZ,
+		postgres.Text, postgres.Varchar, postgres.Bpchar, postgres.Name,
+		postgres.UUID, postgres.Bytea:
 		return true
 	}
 	return false
 }
 
-func isTruncatableType(pgType string) bool {
-	switch strings.ToLower(pgType) {
-	case "integer", "int", "int4", "serial", "smallint", "int2",
-		"bigint", "int8", "bigserial",
-		"numeric", "decimal",
-		"text", "varchar", "character varying", "char", "character", "name",
-		"bytea":
+func isTruncatableType(pgType postgres.Type) bool {
+	switch pgType {
+	case postgres.Int2, postgres.Int4, postgres.Int8, postgres.OID,
+		postgres.Numeric,
+		postgres.Text, postgres.Varchar, postgres.Bpchar, postgres.Name,
+		postgres.Bytea:
 		return true
 	}
 	return false
@@ -422,7 +417,7 @@ func isTruncatableType(pgType string) bool {
 
 
 // applyTransform applies a partition transform to a value.
-func applyTransform(transform string, param int, value any, pgType string) any {
+func applyTransform(transform string, param int, value any, pgType postgres.Type) any {
 	switch transform {
 	case "identity":
 		return value
@@ -463,7 +458,7 @@ func applyTransform(transform string, param int, value any, pgType string) any {
 
 // applyBucketTransform computes bucket[N] using Murmur3 x86 32-bit hash (seed 0).
 // Per Iceberg spec: (murmur3_x86_32_hash(bytes) & Integer.MAX_VALUE) % N
-func applyBucketTransform(n int, value any, pgType string) int32 {
+func applyBucketTransform(n int, value any, pgType postgres.Type) int32 {
 	b := valueToHashBytes(value, pgType)
 	if b == nil {
 		return 0
@@ -474,11 +469,9 @@ func applyBucketTransform(n int, value any, pgType string) int32 {
 
 // valueToHashBytes converts a value to its byte representation for Murmur3 hashing,
 // following the Iceberg spec's hash requirements per type.
-func valueToHashBytes(value any, pgType string) []byte {
-	lowerType := strings.ToLower(pgType)
-
-	switch lowerType {
-	case "integer", "int", "int4", "serial":
+func valueToHashBytes(value any, pgType postgres.Type) []byte {
+	switch pgType {
+	case postgres.Int4, postgres.OID:
 		n, err := ToInt32(value)
 		if err != nil {
 			return nil
@@ -486,7 +479,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		buf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(buf, uint32(n))
 		return buf
-	case "bigint", "int8", "bigserial":
+	case postgres.Int8:
 		n, err := ToInt64(value)
 		if err != nil {
 			return nil
@@ -494,7 +487,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		buf := make([]byte, 8)
 		binary.LittleEndian.PutUint64(buf, uint64(n))
 		return buf
-	case "smallint", "int2":
+	case postgres.Int2:
 		n, err := ToInt32(value)
 		if err != nil {
 			return nil
@@ -502,7 +495,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		buf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(buf, uint32(n))
 		return buf
-	case "date":
+	case postgres.Date:
 		// Hash as days since epoch (int32 LE).
 		t := ToTime(value, pgType)
 		if t.IsZero() {
@@ -513,8 +506,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		buf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(buf, uint32(days))
 		return buf
-	case "timestamp", "timestamp without time zone",
-		"timestamptz", "timestamp with time zone":
+	case postgres.Timestamp, postgres.TimestampTZ:
 		// Hash as microseconds since epoch (int64 LE).
 		t := ToTime(value, pgType)
 		if t.IsZero() {
@@ -525,16 +517,16 @@ func valueToHashBytes(value any, pgType string) []byte {
 		buf := make([]byte, 8)
 		binary.LittleEndian.PutUint64(buf, uint64(micros))
 		return buf
-	case "text", "varchar", "character varying", "char", "character", "name":
+	case postgres.Text, postgres.Varchar, postgres.Bpchar, postgres.Name:
 		return []byte(ToString(value))
-	case "uuid":
+	case postgres.UUID:
 		return []byte(ToString(value))
-	case "bytea":
+	case postgres.Bytea:
 		if b, ok := value.([]byte); ok {
 			return b
 		}
 		return []byte(ToString(value))
-	case "numeric", "decimal":
+	case postgres.Numeric:
 		return decimalToHashBytes(value)
 	default:
 		// Fall back to string hash.
@@ -564,28 +556,26 @@ func decimalToHashBytes(value any) []byte {
 }
 
 // applyTruncateTransform computes truncate[W].
-func applyTruncateTransform(w int, value any, pgType string) any {
-	lowerType := strings.ToLower(pgType)
-
-	switch lowerType {
-	case "integer", "int", "int4", "serial", "smallint", "int2":
+func applyTruncateTransform(w int, value any, pgType postgres.Type) any {
+	switch pgType {
+	case postgres.Int2, postgres.Int4, postgres.OID:
 		v, err := ToInt32(value)
 		if err != nil {
 			return value
 		}
 		return truncateInt32(v, int32(w))
-	case "bigint", "int8", "bigserial":
+	case postgres.Int8:
 		v, err := ToInt64(value)
 		if err != nil {
 			return value
 		}
 		return truncateInt64(v, int64(w))
-	case "numeric", "decimal":
+	case postgres.Numeric:
 		s := ToString(value)
 		return truncateDecimal(s, w)
-	case "bytea":
+	case postgres.Bytea:
 		return truncateBytes(value, w)
-	case "text", "varchar", "character varying", "char", "character", "name":
+	case postgres.Text, postgres.Varchar, postgres.Bpchar, postgres.Name:
 		s := ToString(value)
 		return truncateString(s, w)
 	default:
@@ -742,7 +732,7 @@ func formatUnscaled(unscaled *big.Int, scale int) string {
 // Uses FastParseTimestamp (microseconds) to avoid time.Parse overhead.
 // Also handles int64 (microseconds since epoch) and int32 (days since epoch)
 // for values roundtripped through parquet.
-func ToTime(v any, pgType string) time.Time {
+func ToTime(v any, pgType postgres.Type) time.Time {
 	switch x := v.(type) {
 	case time.Time:
 		return x
@@ -754,7 +744,7 @@ func ToTime(v any, pgType string) time.Time {
 		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 		return epoch.AddDate(0, 0, int(x))
 	case string:
-		if strings.ToLower(pgType) == "date" {
+		if pgType == postgres.Date {
 			if len(x) >= 10 && x[4] == '-' && x[7] == '-' {
 				year := atoi4(x[0:4])
 				month := atoi2(x[5:7])
@@ -783,13 +773,15 @@ func partitionFieldAvroType(transform string, ts *postgres.TableSchema, sourceID
 		if col == nil {
 			return "string"
 		}
-		return icebergToAvroType(postgres.IcebergType(col.PGType))
+		iceType, _ := col.IcebergType()
+		return icebergToAvroType(iceType)
 	case "identity":
 		col := findColumnByID(ts, sourceID)
 		if col == nil {
 			return "string"
 		}
-		return icebergToAvroType(postgres.IcebergType(col.PGType))
+		iceType, _ := col.IcebergType()
+		return icebergToAvroType(iceType)
 	default:
 		return "string"
 	}

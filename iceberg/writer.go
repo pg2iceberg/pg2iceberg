@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/big"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -33,13 +32,14 @@ func buildColSizers(columns []postgres.Column) []colSizer {
 	sizers := make([]colSizer, len(columns))
 	for i, col := range columns {
 		sizers[i].name = col.Name
-		switch strings.ToLower(col.PGType) {
-		case "int2", "smallint", "int4", "integer", "serial", "float4", "real", "date":
+		switch col.PGType {
+		case postgres.Int2, postgres.Int4, postgres.OID, postgres.Float4, postgres.Date:
 			sizers[i].fixedSize = 4
-		case "int8", "bigint", "bigserial", "float8", "double precision",
-			"timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
+		case postgres.Int8, postgres.Float8,
+			postgres.TimestampTZ, postgres.Timestamp,
+			postgres.Time, postgres.TimeTZ:
 			sizers[i].fixedSize = 8
-		case "bool", "boolean":
+		case postgres.Bool:
 			sizers[i].fixedSize = 1
 		}
 	}
@@ -65,8 +65,8 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 			idx:      i,
 			nullable: col.IsNullable,
 		}
-		switch strings.ToLower(col.PGType) {
-		case "int2", "smallint", "int4", "integer", "serial":
+		switch col.PGType {
+		case postgres.Int2, postgres.Int4, postgres.OID:
 			ca.appendVal = func(b array.Builder, v any) error {
 				n, err := ToInt32(v)
 				if err != nil {
@@ -76,7 +76,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 				return nil
 			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Int32Builder).Append(0) }
-		case "int8", "bigint", "bigserial":
+		case postgres.Int8:
 			ca.appendVal = func(b array.Builder, v any) error {
 				n, err := ToInt64(v)
 				if err != nil {
@@ -86,7 +86,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 				return nil
 			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Int64Builder).Append(0) }
-		case "float4", "real":
+		case postgres.Float4:
 			ca.appendVal = func(b array.Builder, v any) error {
 				f, err := ToFloat32(v)
 				if err != nil {
@@ -96,7 +96,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 				return nil
 			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Float32Builder).Append(0) }
-		case "float8", "double precision":
+		case postgres.Float8:
 			ca.appendVal = func(b array.Builder, v any) error {
 				f, err := ToFloat64(v)
 				if err != nil {
@@ -106,7 +106,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 				return nil
 			}
 			ca.appendZero = func(b array.Builder) { b.(*array.Float64Builder).Append(0) }
-		case "bool", "boolean":
+		case postgres.Bool:
 			ca.appendVal = func(b array.Builder, v any) error {
 				val, err := ToBool(v)
 				if err != nil {
@@ -116,7 +116,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 				return nil
 			}
 			ca.appendZero = func(b array.Builder) { b.(*array.BooleanBuilder).Append(false) }
-		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
+		case postgres.TimestampTZ, postgres.Timestamp:
 			ca.appendVal = func(b array.Builder, v any) error {
 				us, err := ToTimestampMicros(v)
 				if err != nil {
@@ -128,7 +128,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) {
 				b.(*array.TimestampBuilder).Append(0)
 			}
-		case "date":
+		case postgres.Date:
 			ca.appendVal = func(b array.Builder, v any) error {
 				d, err := ToDateDays(v)
 				if err != nil {
@@ -139,6 +139,18 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 			}
 			ca.appendZero = func(b array.Builder) {
 				b.(*array.Date32Builder).Append(0)
+			}
+		case postgres.Time, postgres.TimeTZ:
+			ca.appendVal = func(b array.Builder, v any) error {
+				us, err := ToTimeMicros(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.Time64Builder).Append(arrow.Time64(us))
+				return nil
+			}
+			ca.appendZero = func(b array.Builder) {
+				b.(*array.Time64Builder).Append(0)
 			}
 		default:
 			// text, varchar, numeric, json, uuid, etc. → string
@@ -154,24 +166,26 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 }
 
 // pgToArrowType maps a PostgreSQL column type to an Arrow data type.
-func pgToArrowType(pgType string) arrow.DataType {
-	switch strings.ToLower(pgType) {
-	case "int2", "smallint", "int4", "integer", "serial":
+func pgToArrowType(pgType postgres.Type) arrow.DataType {
+	switch pgType {
+	case postgres.Int2, postgres.Int4, postgres.OID:
 		return arrow.PrimitiveTypes.Int32
-	case "int8", "bigint", "bigserial":
+	case postgres.Int8:
 		return arrow.PrimitiveTypes.Int64
-	case "float4", "real":
+	case postgres.Float4:
 		return arrow.PrimitiveTypes.Float32
-	case "float8", "double precision":
+	case postgres.Float8:
 		return arrow.PrimitiveTypes.Float64
-	case "bool", "boolean":
+	case postgres.Bool:
 		return arrow.FixedWidthTypes.Boolean
-	case "timestamptz", "timestamp with time zone":
+	case postgres.TimestampTZ:
 		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
-	case "timestamp", "timestamp without time zone":
+	case postgres.Timestamp:
 		return &arrow.TimestampType{Unit: arrow.Microsecond}
-	case "date":
+	case postgres.Date:
 		return arrow.FixedWidthTypes.Date32
+	case postgres.Time, postgres.TimeTZ:
+		return arrow.FixedWidthTypes.Time64us
 	default:
 		return arrow.BinaryTypes.String
 	}
@@ -716,6 +730,61 @@ func ToDateDays(v any) (int32, error) {
 	default:
 		return 0, fmt.Errorf("unsupported type %T for date", v)
 	}
+}
+
+// ToTimeMicros converts a value to microseconds since midnight for Iceberg time type.
+// Handles PG text format "HH:MM:SS.ffffff" and "HH:MM:SS.ffffff+ZZ" (timetz).
+func ToTimeMicros(v any) (int64, error) {
+	switch x := v.(type) {
+	case int64:
+		return x, nil // already microseconds since midnight (e.g. from parquet roundtrip)
+	case string:
+		us, ok := fastParseTime(x)
+		if !ok {
+			return 0, fmt.Errorf("parse time %q", x)
+		}
+		return us, nil
+	default:
+		return 0, fmt.Errorf("unsupported type %T for time", v)
+	}
+}
+
+// fastParseTime parses PG time format "HH:MM:SS[.ffffff][+/-ZZ[:ZZ]]"
+// and returns microseconds since midnight. Timezone offset is ignored (time is
+// stored as local time of day per the Iceberg spec).
+func fastParseTime(s string) (int64, bool) {
+	// Minimum: "HH:MM:SS" = 8 chars
+	if len(s) < 8 || s[2] != ':' || s[5] != ':' {
+		return 0, false
+	}
+	h := atoi2(s[0:2])
+	m := atoi2(s[3:5])
+	sec := atoi2(s[6:8])
+	if h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 59 {
+		return 0, false
+	}
+
+	var micros int
+	rest := s[8:]
+	if len(rest) > 0 && rest[0] == '.' {
+		rest = rest[1:]
+		digits := 0
+		for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+			digits++
+		}
+		if digits == 0 {
+			return 0, false
+		}
+		micros = atoiN(rest[:digits])
+		for i := digits; i < 6; i++ {
+			micros *= 10
+		}
+		for i := 6; i < digits; i++ {
+			micros /= 10
+		}
+	}
+
+	return int64(h)*3_600_000_000 + int64(m)*60_000_000 + int64(sec)*1_000_000 + int64(micros), true
 }
 
 func ToString(v any) string {

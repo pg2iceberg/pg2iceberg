@@ -79,6 +79,32 @@ pg2iceberg/
 
 Both modes share `iceberg.TableWriter` for the final write path (partition bucketing, Parquet serialization, S3 upload, manifest assembly, catalog commit). Logical mode adds a two-tier architecture (events table + materializer) on top, query mode calls the TableWriter directly.
 
+## Type mapping
+
+pg2iceberg maps PostgreSQL column types to Iceberg types automatically during schema discovery. Aliases (e.g. `integer`, `serial`) are normalized to their canonical form.
+
+| PostgreSQL type | Iceberg type | Notes |
+|---|---|---|
+| `smallint` | `int` | |
+| `integer`, `serial`, `oid` | `int` | |
+| `bigint`, `bigserial` | `long` | |
+| `real` | `float` | |
+| `double precision` | `double` | |
+| `numeric(p,s)` | `decimal(p,s)` | Precision and scale clamped to 38 max |
+| `numeric` (unconstrained) | `decimal(38,38)` | Truncation warning logged |
+| `boolean` | `boolean` | |
+| `text`, `varchar`, `char`, `name` | `string` | |
+| `bytea` | `binary` | |
+| `date` | `date` | |
+| `time`, `timetz` | `time` | Microsecond precision |
+| `timestamp` | `timestamp` | Microsecond precision |
+| `timestamptz` | `timestamptz` | Microsecond precision |
+| `uuid` | `uuid` | |
+| `json`, `jsonb` | `string` | |
+| Other (`inet`, `interval`, `xml`, ...) | `string` | Stored as text |
+
+Support for `geometry` and `geography` types will be added soon!
+
 ## Quickstart
 
 ```sh

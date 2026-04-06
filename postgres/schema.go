@@ -3,25 +3,168 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
 
+// Type represents a canonical PostgreSQL column type.
+type Type string
+
+const (
+	Int2        Type = "int2"
+	Int4        Type = "int4"
+	Int8        Type = "int8"
+	Float4      Type = "float4"
+	Float8      Type = "float8"
+	Numeric     Type = "numeric"
+	Bool        Type = "bool"
+	Text        Type = "text"
+	Varchar     Type = "varchar"
+	Bpchar      Type = "bpchar"
+	Name        Type = "name"
+	Bytea       Type = "bytea"
+	Date        Type = "date"
+	Time        Type = "time"
+	TimeTZ      Type = "timetz"
+	Timestamp   Type = "timestamp"
+	TimestampTZ Type = "timestamptz"
+	UUID        Type = "uuid"
+	JSON        Type = "json"
+	JSONB       Type = "jsonb"
+	OID         Type = "oid"
+)
+
+// ParseType normalizes a PostgreSQL type name (as returned by udt_name or
+// format_type) into its canonical Type constant.
+func ParseType(name string) Type {
+	switch strings.ToLower(name) {
+	case "int2", "smallint":
+		return Int2
+	case "int4", "integer", "serial":
+		return Int4
+	case "int8", "bigint", "bigserial":
+		return Int8
+	case "float4", "real":
+		return Float4
+	case "float8", "double precision":
+		return Float8
+	case "numeric", "decimal":
+		return Numeric
+	case "bool", "boolean":
+		return Bool
+	case "text":
+		return Text
+	case "varchar", "character varying":
+		return Varchar
+	case "bpchar", "char", "character":
+		return Bpchar
+	case "name":
+		return Name
+	case "bytea":
+		return Bytea
+	case "date":
+		return Date
+	case "time", "time without time zone":
+		return Time
+	case "timetz", "time with time zone":
+		return TimeTZ
+	case "timestamp", "timestamp without time zone":
+		return Timestamp
+	case "timestamptz", "timestamp with time zone":
+		return TimestampTZ
+	case "uuid":
+		return UUID
+	case "json":
+		return JSON
+	case "jsonb":
+		return JSONB
+	case "oid":
+		return OID
+	default:
+		return Text
+	}
+}
+
 // Column represents a table column with type information.
 type Column struct {
 	Name       string
-	PGType     string // e.g. "integer", "text", "timestamp with time zone"
+	PGType     Type
 	IsNullable bool
 	FieldID    int // Iceberg field ID (1-based, assigned in order)
+	Precision  int // numeric precision; 0 = unspecified
+	Scale      int // numeric scale; 0 = unspecified
+}
+
+// IcebergType maps the column's PostgreSQL type to an Iceberg type string.
+// The returned bool is true when the mapping required truncation (e.g. decimal
+// precision clamped to 38), so callers can log a warning.
+// Reference: https://iceberg.apache.org/spec/#primitive-types
+func (c Column) IcebergType() (string, bool) {
+	switch c.PGType {
+	case Int2:
+		return "int", false
+	case Int4, OID:
+		return "int", false
+	case Int8:
+		return "long", false
+	case Float4:
+		return "float", false
+	case Float8:
+		return "double", false
+	case Numeric:
+		return icebergDecimal(c.Precision, c.Scale)
+	case Bool:
+		return "boolean", false
+	case Text, Varchar, Bpchar, Name:
+		return "string", false
+	case Bytea:
+		return "binary", false
+	case Date:
+		return "date", false
+	case Time, TimeTZ:
+		return "time", false
+	case Timestamp:
+		return "timestamp", false
+	case TimestampTZ:
+		return "timestamptz", false
+	case UUID:
+		return "uuid", false
+	case JSON, JSONB:
+		return "string", false
+	default:
+		return "string", false
+	}
+}
+
+const maxIcebergDecimalPrecision = 38
+
+// icebergDecimal returns the Iceberg decimal type string for the given
+// precision and scale, clamping to Iceberg's maximum of decimal(38,38).
+func icebergDecimal(precision, scale int) (string, bool) {
+	if precision <= 0 {
+		// Unconstrained PG numeric (up to 1000 digits), clamp to max
+		return fmt.Sprintf("decimal(%d,%d)", maxIcebergDecimalPrecision, maxIcebergDecimalPrecision), true
+	}
+	truncated := false
+	if precision > maxIcebergDecimalPrecision {
+		precision = maxIcebergDecimalPrecision
+		truncated = true
+	}
+	if scale > precision {
+		scale = precision
+		truncated = true
+	}
+	return fmt.Sprintf("decimal(%d,%d)", precision, scale), truncated
 }
 
 // TableSchema holds discovered schema for a single table.
 type TableSchema struct {
-	Table              string   // fully qualified: schema.table
-	Columns            []Column
-	PK                 []string // primary key column names
-	ReplicaIdentityFull bool   // true if table uses REPLICA IDENTITY FULL
+	Table               string   // fully qualified: schema.table
+	Columns             []Column
+	PK                  []string // primary key column names
+	ReplicaIdentityFull bool     // true if table uses REPLICA IDENTITY FULL
 }
 
 // PKFieldIDs returns the Iceberg field IDs corresponding to primary key columns.
@@ -55,7 +198,8 @@ func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSc
 
 	// Discover columns
 	rows, err := conn.Query(ctx, `
-		SELECT column_name, udt_name, is_nullable
+		SELECT column_name, udt_name, is_nullable,
+		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
 		FROM information_schema.columns
 		WHERE table_schema = $1 AND table_name = $2
 		ORDER BY ordinal_position
@@ -69,15 +213,22 @@ func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSc
 	fieldID := 1
 	for rows.Next() {
 		var name, udtName, nullable string
-		if err := rows.Scan(&name, &udtName, &nullable); err != nil {
+		var precision, scale int
+		if err := rows.Scan(&name, &udtName, &nullable, &precision, &scale); err != nil {
 			return nil, fmt.Errorf("scan column: %w", err)
 		}
-		ts.Columns = append(ts.Columns, Column{
+		col := Column{
 			Name:       name,
-			PGType:     udtName,
+			PGType:     ParseType(udtName),
 			IsNullable: nullable == "YES",
 			FieldID:    fieldID,
-		})
+			Precision:  precision,
+			Scale:      scale,
+		}
+		if iceType, truncated := col.IcebergType(); truncated {
+			log.Printf("WARN: column %s.%s type %s(%d,%d) truncated to Iceberg %s", table, name, udtName, precision, scale, iceType)
+		}
+		ts.Columns = append(ts.Columns, col)
 		fieldID++
 	}
 
@@ -126,42 +277,6 @@ func splitTableName(table string) (string, string) {
 	return "public", parts[0]
 }
 
-// IcebergType maps a PostgreSQL type to an Iceberg type string.
-func IcebergType(pgType string) string {
-	switch strings.ToLower(pgType) {
-	case "int2", "smallint":
-		return "int"
-	case "int4", "integer", "serial":
-		return "int"
-	case "int8", "bigint", "bigserial":
-		return "long"
-	case "float4", "real":
-		return "float"
-	case "float8", "double precision":
-		return "double"
-	case "numeric", "decimal":
-		return "decimal(38,18)"
-	case "bool", "boolean":
-		return "boolean"
-	case "text", "varchar", "character varying", "bpchar", "char", "name":
-		return "string"
-	case "bytea":
-		return "binary"
-	case "date":
-		return "date"
-	case "timestamp", "timestamp without time zone":
-		return "timestamp"
-	case "timestamptz", "timestamp with time zone":
-		return "timestamptz"
-	case "uuid":
-		return "uuid"
-	case "jsonb", "json":
-		return "string"
-	default:
-		return "string"
-	}
-}
-
 // IcebergSchemaJSON builds the Iceberg schema as a map for the REST catalog API.
 func IcebergSchemaJSON(ts *TableSchema) map[string]any {
 	return IcebergSchemaJSONWithID(ts, 0)
@@ -171,51 +286,18 @@ func IcebergSchemaJSON(ts *TableSchema) map[string]any {
 func IcebergSchemaJSONWithID(ts *TableSchema, schemaID int) map[string]any {
 	fields := make([]map[string]any, len(ts.Columns))
 	for i, col := range ts.Columns {
+		iceType, _ := col.IcebergType()
 		fields[i] = map[string]any{
 			"id":       col.FieldID,
 			"name":     col.Name,
 			"required": !col.IsNullable,
-			"type":     icebergTypeJSON(col.PGType),
+			"type":     iceType,
 		}
 	}
 	return map[string]any{
 		"type":      "struct",
 		"schema-id": schemaID,
 		"fields":    fields,
-	}
-}
-
-func icebergTypeJSON(pgType string) any {
-	switch strings.ToLower(pgType) {
-	case "int2", "smallint", "int4", "integer", "serial":
-		return "int"
-	case "int8", "bigint", "bigserial":
-		return "long"
-	case "float4", "real":
-		return "float"
-	case "float8", "double precision":
-		return "double"
-	case "numeric", "decimal":
-		// For v1, store numeric as string to avoid precision issues
-		return "string"
-	case "bool", "boolean":
-		return "boolean"
-	case "text", "varchar", "character varying", "bpchar", "char", "name":
-		return "string"
-	case "bytea":
-		return "binary"
-	case "date":
-		return "date"
-	case "timestamp", "timestamp without time zone":
-		return "timestamp"
-	case "timestamptz", "timestamp with time zone":
-		return "timestamptz"
-	case "uuid":
-		return "string" // store UUID as string for v1
-	case "jsonb", "json":
-		return "string"
-	default:
-		return "string"
 	}
 }
 
