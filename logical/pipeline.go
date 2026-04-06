@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/snapshot"
@@ -27,6 +28,7 @@ type Pipeline struct {
 
 	src     *LogicalSource
 	snk     *Sink
+	clients *iceberg.IcebergClients
 	store   pipeline.CheckpointStore
 	schemas map[string]*postgres.TableSchema
 
@@ -52,7 +54,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 	}
 
 	eventBuf := NewChangeEventBuffer()
-	snk, err := BuildSink(cfg.Sink, cfg.Tables, id, eventBuf)
+	snk, clients, err := BuildSink(cfg.Sink, cfg.Tables, id, eventBuf)
 	if err != nil {
 		cpStore.Close()
 		return nil, fmt.Errorf("create sink: %w", err)
@@ -62,6 +64,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		id:       id,
 		cfg:      cfg,
 		snk:      snk,
+		clients:  clients,
 		store:    cpStore,
 		eventBuf: eventBuf,
 		status:   pipeline.StatusStopped,
@@ -234,6 +237,15 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		if err := p.snk.RegisterTable(ctx, ts); err != nil {
 			return fmt.Errorf("register table %s: %w", ts.Table, err)
 		}
+	}
+
+	// In vended credential mode, initialize S3 after tables are created in the catalog.
+	if p.clients != nil && p.clients.S3 == nil && len(p.cfg.Tables) > 0 {
+		firstTable := postgres.TableToIceberg(p.cfg.Tables[0].Name)
+		if err := p.clients.EnsureStorage(ctx, p.cfg.Sink.Namespace, firstTable); err != nil {
+			return fmt.Errorf("ensure storage: %w", err)
+		}
+		p.snk.SetS3(p.clients.S3)
 	}
 
 	// Start WAL lag monitor.

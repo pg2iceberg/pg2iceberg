@@ -126,10 +126,77 @@ func TestValidate_MissingSinkFields(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing sink fields")
 	}
+	// In static mode (default), warehouse and s3_endpoint are required.
 	for _, field := range []string{"catalog_uri", "warehouse", "namespace", "s3_endpoint"} {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("expected error to mention %s: %v", field, err)
 		}
+	}
+}
+
+func TestValidate_VendedMode_NoS3FieldsRequired(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sink.CredentialMode = "vended"
+	cfg.Sink.Warehouse = ""
+	cfg.Sink.S3Endpoint = ""
+	cfg.Sink.S3AccessKey = ""
+	cfg.Sink.S3SecretKey = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("vended mode should not require S3 fields, got: %v", err)
+	}
+}
+
+func TestValidate_BearerAuth_RequiresToken(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sink.CatalogAuth = "bearer"
+	cfg.Sink.CatalogToken = ""
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing catalog_token with bearer auth")
+	}
+	if !strings.Contains(err.Error(), "catalog_token") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_BearerAuth_WithToken(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sink.CatalogAuth = "bearer"
+	cfg.Sink.CatalogToken = "my-token"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+}
+
+func TestValidate_InvalidCatalogAuth(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sink.CatalogAuth = "kerberos"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid catalog_auth")
+	}
+	if !strings.Contains(err.Error(), "catalog_auth") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_InvalidCredentialMode(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sink.CredentialMode = "magic"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid credential_mode")
+	}
+	if !strings.Contains(err.Error(), "credential_mode") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestApplyDefaults_CredentialMode(t *testing.T) {
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	if cfg.Sink.CredentialMode != "static" {
+		t.Errorf("CredentialMode = %q, want static", cfg.Sink.CredentialMode)
 	}
 }
 
