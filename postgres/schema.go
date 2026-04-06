@@ -218,3 +218,12 @@ func icebergTypeJSON(pgType string) any {
 		return "string"
 	}
 }
+
+// TableToIceberg converts a fully qualified PG table name like "public.orders"
+// to the short Iceberg table name "orders".
+func TableToIceberg(pgTable string) string {
+	if idx := strings.LastIndex(pgTable, "."); idx >= 0 {
+		return pgTable[idx+1:]
+	}
+	return pgTable
+}

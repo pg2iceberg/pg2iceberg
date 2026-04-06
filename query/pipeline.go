@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/snapshot"
 )
 
 // Pipeline is the query-mode replication pipeline. It polls PostgreSQL via
@@ -35,6 +38,8 @@ type Pipeline struct {
 	startedAt     time.Time
 	lastFlushAt   time.Time
 	rowsProcessed int64
+
+	snapshotNeeded bool // true if initial snapshot is required (no checkpoint)
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -74,6 +79,19 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		status:  pipeline.StatusStopped,
 		done:    make(chan struct{}),
 	}, nil
+}
+
+// NewPipeline creates a Pipeline with injected dependencies (for tests).
+func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.Catalog, store pipeline.CheckpointStore) *Pipeline {
+	return &Pipeline{
+		id:      id,
+		cfg:     cfg,
+		catalog: catalog,
+		s3:      s3,
+		store:   store,
+		status:  pipeline.StatusStopped,
+		done:    make(chan struct{}),
+	}
 }
 
 // Start initializes and runs the pipeline. Setup is synchronous; the event
@@ -160,7 +178,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	}
 	p.schemas = p.poller.Schemas()
 
-	// Restore watermarks from checkpoint.
+	// Restore watermarks from checkpoint or mark snapshot as needed.
 	if cp.Mode == "query" {
 		if cp.QueryWatermarks != nil {
 			for table, wmStr := range cp.QueryWatermarks {
@@ -179,7 +197,13 @@ func (p *Pipeline) setup(ctx context.Context) error {
 				}
 				log.Printf("[query:%s] restored watermark (legacy): %v", p.id, t)
 			}
+		} else {
+			// Query checkpoint exists but no watermarks — needs snapshot.
+			p.snapshotNeeded = true
 		}
+	} else if cp.Mode == "" {
+		// No checkpoint at all — needs initial snapshot.
+		p.snapshotNeeded = true
 	}
 
 	// Ensure namespace exists.
@@ -248,9 +272,26 @@ func (p *Pipeline) run(ctx context.Context) {
 
 	p.mu.Lock()
 	p.startedAt = time.Now()
-	p.status = pipeline.StatusRunning
-	pipeline.PipelineStatus.WithLabelValues(p.id).Set(pipeline.StatusToFloat["running"])
+	if p.snapshotNeeded {
+		p.status = pipeline.StatusSnapshotting
+		pipeline.PipelineStatus.WithLabelValues(p.id).Set(pipeline.StatusToFloat["snapshotting"])
+		pipeline.SnapshotInProgress.WithLabelValues(p.id).Set(1)
+	} else {
+		p.status = pipeline.StatusRunning
+		pipeline.PipelineStatus.WithLabelValues(p.id).Set(pipeline.StatusToFloat["running"])
+	}
 	p.mu.Unlock()
+
+	// Initial snapshot: bulk-copy all existing rows via CTID chunks.
+	if p.snapshotNeeded {
+		if err := p.runSnapshot(ctx); err != nil {
+			p.setStatus(pipeline.StatusError, fmt.Errorf("initial snapshot: %w", err))
+			return
+		}
+		p.snapshotNeeded = false
+		p.setStatus(pipeline.StatusRunning, nil)
+		pipeline.SnapshotInProgress.WithLabelValues(p.id).Set(0)
+	}
 
 	pollInterval := p.cfg.Source.Query.PollDuration()
 	pollTicker := time.NewTicker(pollInterval)
@@ -454,27 +495,117 @@ func (p *Pipeline) totalBufferedBytes() int64 {
 	return total
 }
 
-// pgTableToIceberg converts "public.orders" to "orders" for the Iceberg table name.
 func pgTableToIceberg(pgTable string) string {
-	parts := make([]string, 0, 2)
-	for _, p := range splitDot(pgTable) {
-		parts = append(parts, p)
-	}
-	if len(parts) > 1 {
-		return parts[len(parts)-1]
-	}
-	return pgTable
+	return postgres.TableToIceberg(pgTable)
 }
 
-func splitDot(s string) []string {
-	var result []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '.' {
-			result = append(result, s[start:i])
-			start = i + 1
+// runSnapshot performs the initial snapshot for all tables using CTID chunking.
+// Before snapshotting, it captures MAX(watermark_column) per table as a fence.
+// After the snapshot, the watermark is set to the fence value so the poller
+// starts from there — catching any rows modified during the snapshot.
+func (p *Pipeline) runSnapshot(ctx context.Context) error {
+	log.Printf("[query:%s] starting initial snapshot", p.id)
+
+	// Step 1: Capture watermark fence per table.
+	fenceConn, err := pgx.Connect(ctx, p.cfg.Source.Postgres.DSN())
+	if err != nil {
+		return fmt.Errorf("fence connect: %w", err)
+	}
+	defer fenceConn.Close(ctx)
+
+	fences := make(map[string]time.Time)
+	for _, tc := range p.cfg.Tables {
+		if tc.WatermarkColumn == "" {
+			continue
+		}
+		quotedTable := pgx.Identifier(strings.Split(tc.Name, ".")).Sanitize()
+		quotedCol := pgx.Identifier{tc.WatermarkColumn}.Sanitize()
+		var maxWM *time.Time
+		err := fenceConn.QueryRow(ctx,
+			fmt.Sprintf("SELECT MAX(%s) FROM %s", quotedCol, quotedTable),
+		).Scan(&maxWM)
+		if err != nil {
+			return fmt.Errorf("fence query for %s: %w", tc.Name, err)
+		}
+		if maxWM != nil {
+			fences[tc.Name] = *maxWM
+			log.Printf("[query:%s] snapshot fence for %s: %v", p.id, tc.Name, *maxWM)
 		}
 	}
-	result = append(result, s[start:])
-	return result
+	fenceConn.Close(ctx)
+
+	// Step 2: Build snapshot tables and run.
+	var tables []snapshot.Table
+	for _, tc := range p.cfg.Tables {
+		ts := p.schemas[tc.Name]
+		if ts == nil {
+			continue
+		}
+		tables = append(tables, snapshot.Table{Name: tc.Name, Schema: ts})
+	}
+
+	if len(tables) == 0 {
+		return nil
+	}
+
+	dsn := p.cfg.Source.Postgres.DSN()
+	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return nil, nil, fmt.Errorf("snapshot connect: %w", err)
+		}
+		cleanup := func(ctx context.Context) { conn.Close(ctx) }
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			cleanup(ctx)
+			return nil, nil, fmt.Errorf("begin snapshot tx: %w", err)
+		}
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			tx.Rollback(ctx)
+			cleanup(ctx)
+			return nil, nil, fmt.Errorf("set isolation level: %w", err)
+		}
+		return tx, cleanup, nil
+	}
+
+	deps := snapshot.Deps{
+		Catalog:    p.catalog,
+		S3:         p.s3,
+		SinkCfg:    p.cfg.Sink,
+		LogicalCfg: p.cfg.Source.Logical,
+		TableCfgs:  p.cfg.Tables,
+		Schemas:    p.schemas,
+		Store:      p.store,
+		PipelineID: p.id,
+	}
+
+	concurrency := p.cfg.Source.Logical.SnapshotConcurrencyOrDefault()
+	snap := snapshot.NewSnapshotter(tables, txFactory, concurrency, deps)
+	if _, err := snap.Run(ctx); err != nil {
+		return err
+	}
+
+	// Step 3: Set watermarks to fence values and checkpoint.
+	for table, fence := range fences {
+		p.poller.SetWatermark(table, fence)
+	}
+
+	cp, err := p.store.Load(p.id)
+	if err != nil {
+		return fmt.Errorf("load checkpoint after snapshot: %w", err)
+	}
+	cp.Mode = "query"
+	cp.SnapshotComplete = true
+	cp.SnapshotedTables = nil
+	cp.SnapshotChunks = nil
+	cp.QueryWatermarks = make(map[string]string, len(fences))
+	for table, fence := range fences {
+		cp.QueryWatermarks[table] = fence.Format(time.RFC3339Nano)
+	}
+	if err := p.store.Save(p.id, cp); err != nil {
+		return fmt.Errorf("save checkpoint after snapshot: %w", err)
+	}
+
+	log.Printf("[query:%s] initial snapshot complete, watermarks set to fence values", p.id)
+	return nil
 }

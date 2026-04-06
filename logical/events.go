@@ -883,6 +883,5 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 
 // pgTableToIceberg converts "public.orders" to "orders" for the Iceberg table name.
 func pgTableToIceberg(pgTable string) string {
-	parts := strings.Split(pgTable, ".")
-	return parts[len(parts)-1]
+	return postgres.TableToIceberg(pgTable)
 }
