@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
-	"github.com/pg2iceberg/pg2iceberg/utils"
+	"golang.org/x/sync/errgroup"
 )
 
 // SnapshotWriterConfig holds configuration for direct snapshot writes
@@ -21,12 +20,15 @@ type SnapshotWriterConfig struct {
 	PartSpec    *PartitionSpec
 	SchemaID    int
 	TargetSize  int64
-	Concurrency int
 }
 
 // SnapshotWriter accumulates rows into per-partition RollingWriters and
 // commits directly to the materialized Iceberg table. This is an append-only
 // writer (no equality deletes, no file index, no TOAST resolution).
+//
+// Concurrency is managed externally by the Snapshotter's worker pool —
+// one table per worker, chunks sequential within a table. The SnapshotWriter
+// does not create its own goroutines or pools.
 type SnapshotWriter struct {
 	cfg     SnapshotWriterConfig
 	catalog Catalog
@@ -96,28 +98,6 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
 
 	// Flush all partition writers to get file chunks.
-	type partFlush struct {
-		key      string
-		sp       *snapshotPartition
-		chunks   []FileChunk
-	}
-
-	var flushes []partFlush
-	for key, sp := range sw.partitions {
-		chunks, err := sp.writer.FlushAll()
-		if err != nil {
-			return 0, fmt.Errorf("flush partition %q: %w", key, err)
-		}
-		if len(chunks) > 0 {
-			flushes = append(flushes, partFlush{key: key, sp: sp, chunks: chunks})
-		}
-	}
-
-	if len(flushes) == 0 {
-		return 0, nil
-	}
-
-	// Build pending files for upload.
 	type pendingFile struct {
 		key             string
 		chunk           FileChunk
@@ -125,15 +105,23 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 	}
 
 	var pending []pendingFile
-	for _, pf := range flushes {
-		var avroPartValues map[string]any
-		if partitioned && pf.sp.partValues != nil {
-			avroPartValues = cfg.PartSpec.PartitionAvroValue(pf.sp.partValues, cfg.SrcSchema)
+	for key, sp := range sw.partitions {
+		chunks, err := sp.writer.FlushAll()
+		if err != nil {
+			return 0, fmt.Errorf("flush partition %q: %w", key, err)
 		}
-		for i, chunk := range pf.chunks {
+		if len(chunks) == 0 {
+			continue
+		}
+
+		var avroPartValues map[string]any
+		if partitioned && sp.partValues != nil {
+			avroPartValues = cfg.PartSpec.PartitionAvroValue(sp.partValues, cfg.SrcSchema)
+		}
+		for i, chunk := range chunks {
 			var fileKey string
-			if partitioned && pf.sp.partPath != "" {
-				fileKey = fmt.Sprintf("%s/data/%s/%s-snap-%d.parquet", basePath, pf.sp.partPath, uuid.New().String(), i)
+			if partitioned && sp.partPath != "" {
+				fileKey = fmt.Sprintf("%s/data/%s/%s-snap-%d.parquet", basePath, sp.partPath, uuid.New().String(), i)
 			} else {
 				fileKey = fmt.Sprintf("%s/data/%s-snap-%d.parquet", basePath, uuid.New().String(), i)
 			}
@@ -145,39 +133,30 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		}
 	}
 
-	// Upload all files in parallel.
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	// Upload files concurrently — I/O-bound, no pooling needed.
 	type uploadedFile struct {
 		uri string
 		pf  pendingFile
 	}
-
-	var mu sync.Mutex
-	var uploaded []uploadedFile
-
-	uploadTasks := make([]utils.Task, len(pending))
+	uploaded := make([]uploadedFile, len(pending))
+	g, gctx := errgroup.WithContext(ctx)
 	for i, pf := range pending {
-		pf := pf
-		uploadTasks[i] = utils.Task{
-			Name: pf.key,
-			Fn: func(ctx context.Context, _ *utils.Progress) error {
-				uri, err := sw.s3.Upload(ctx, pf.key, pf.chunk.Data)
-				if err != nil {
-					return fmt.Errorf("upload %s: %w", pf.key, err)
-				}
-				mu.Lock()
-				uploaded = append(uploaded, uploadedFile{uri: uri, pf: pf})
-				mu.Unlock()
-				return nil
-			},
-		}
+		i, pf := i, pf
+		g.Go(func() error {
+			uri, err := sw.s3.Upload(gctx, pf.key, pf.chunk.Data)
+			if err != nil {
+				return fmt.Errorf("upload %s: %w", pf.key, err)
+			}
+			// Each goroutine writes to its own index — no mutex needed.
+			uploaded[i] = uploadedFile{uri: uri, pf: pf}
+			return nil
+		})
 	}
-
-	concurrency := sw.concurrency()
-	if len(uploadTasks) < concurrency {
-		concurrency = len(uploadTasks)
-	}
-	uploadPool := utils.NewPool(concurrency)
-	if _, err := uploadPool.Run(ctx, uploadTasks); err != nil {
+	if err := g.Wait(); err != nil {
 		return 0, fmt.Errorf("upload snapshot files: %w", err)
 	}
 
@@ -300,12 +279,4 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 // the manifest cache (which carries forward between chunks).
 func (sw *SnapshotWriter) Reset() {
 	sw.partitions = make(map[string]*snapshotPartition)
-}
-
-func (sw *SnapshotWriter) concurrency() int {
-	c := sw.cfg.Concurrency
-	if c <= 0 {
-		c = 8
-	}
-	return c
 }

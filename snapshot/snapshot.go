@@ -46,11 +46,12 @@ type Deps struct {
 
 // Snapshotter performs chunked table copies using CTID range scans and writes
 // directly to materialized Iceberg tables. Tables are snapshotted concurrently
-// via a WorkerPool.
+// via a WorkerPool. S3 uploads within each commit use goroutines (I/O-bound,
+// no pooling needed).
 type Snapshotter struct {
 	tables    []Table
 	txFactory TxFactory
-	pool      *utils.Pool
+	pool      *utils.Pool // table-level concurrency (CPU-bound work)
 	deps      Deps
 }
 
