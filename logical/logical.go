@@ -150,6 +150,9 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.Chan
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
+		if err := ts.Validate(); err != nil {
+			return err
+		}
 		l.tables[tc.Name] = ts
 	}
 
@@ -660,14 +663,29 @@ func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *pos
 	// Build a minimal schema from the relation message
 	ts := &postgres.TableSchema{Table: table}
 	for i, col := range rel.Columns {
+		pgType := oidToPGType(col.DataType)
+		precision, scale := numericTypmod(pgType, col.TypeModifier)
 		ts.Columns = append(ts.Columns, postgres.Column{
-			Name:    col.Name,
-			PGType:  oidToPGType(col.DataType),
-			FieldID: i + 1,
+			Name:      col.Name,
+			PGType:    pgType,
+			FieldID:   i + 1,
+			Precision: precision,
+			Scale:     scale,
 		})
 	}
 	l.tables[table] = ts
 	return ts
+}
+
+// numericTypmod decodes precision and scale from a PostgreSQL type modifier
+// for numeric types. Returns (0, 0) for non-numeric types or unconstrained numeric.
+func numericTypmod(pgType postgres.Type, typmod int32) (precision, scale int) {
+	if pgType != postgres.Numeric || typmod < 0 {
+		return 0, 0
+	}
+	// PostgreSQL stores numeric typmod as ((precision << 16) | scale) + VARHDRSZ(4)
+	mod := int(typmod - 4)
+	return (mod >> 16) & 0xFFFF, mod & 0xFFFF
 }
 
 
@@ -679,33 +697,36 @@ func fqTable(namespace, name string) string {
 	return namespace + "." + name
 }
 
-// pgOIDToType maps well-known PostgreSQL type OIDs to their canonical type names.
-// Unknown OIDs default to "text".
-var pgOIDToType = map[uint32]string{
-	16:   "bool",
-	17:   "bytea",
-	20:   "int8",
-	21:   "int2",
-	23:   "int4",
-	25:   "text",
-	114:  "json",
-	700:  "float4",
-	701:  "float8",
-	1042: "bpchar",
-	1043: "varchar",
-	1082: "date",
-	1114: "timestamp",
-	1184: "timestamptz",
-	1700: "numeric",
-	2950: "uuid",
-	3802: "jsonb",
+// pgOIDToType maps well-known PostgreSQL type OIDs to their canonical type.
+// Unknown OIDs default to Text.
+var pgOIDToType = map[uint32]postgres.Type{
+	16:   postgres.Bool,
+	17:   postgres.Bytea,
+	20:   postgres.Int8,
+	21:   postgres.Int2,
+	23:   postgres.Int4,
+	25:   postgres.Text,
+	26:   postgres.OID,
+	114:  postgres.JSON,
+	700:  postgres.Float4,
+	701:  postgres.Float8,
+	1042: postgres.Bpchar,
+	1043: postgres.Varchar,
+	1082: postgres.Date,
+	1083: postgres.Time,
+	1114: postgres.Timestamp,
+	1184: postgres.TimestampTZ,
+	1266: postgres.TimeTZ,
+	1700: postgres.Numeric,
+	2950: postgres.UUID,
+	3802: postgres.JSONB,
 }
 
-func oidToPGType(oid uint32) string {
+func oidToPGType(oid uint32) postgres.Type {
 	if t, ok := pgOIDToType[oid]; ok {
 		return t
 	}
-	return "text"
+	return postgres.Text
 }
 
 // diffRelation compares two RelationMessageV2 and returns a postgres.SchemaChange if

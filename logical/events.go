@@ -280,8 +280,12 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgre
 	for _, tc := range change.TypeChanges {
 		for i, col := range ts.srcSchema.Columns {
 			if col.Name == tc.Name {
-				oldIceberg := postgres.IcebergType(col.PGType)
-				newIceberg := postgres.IcebergType(tc.NewType)
+				oldIceberg, _ := col.IcebergType()
+				newCol := postgres.Column{PGType: tc.NewType}
+				newIceberg, truncated := newCol.IcebergType()
+				if truncated {
+					log.Printf("WARN: column %s.%s type %s truncated to Iceberg %s", pgTable, tc.Name, tc.NewType, newIceberg)
+				}
 				ts.srcSchema.Columns[i].PGType = tc.NewType
 				if oldIceberg != newIceberg {
 					icebergChanged = true

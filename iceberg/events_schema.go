@@ -19,11 +19,11 @@ func EventsTableName(icebergTable string) string {
 func EventsTableSchema(src *postgres.TableSchema) *postgres.TableSchema {
 	// Metadata columns use field IDs starting at 1.
 	metaCols := []postgres.Column{
-		{Name: "_op", PGType: "text", IsNullable: false, FieldID: 1},
-		{Name: "_lsn", PGType: "int8", IsNullable: false, FieldID: 2},
-		{Name: "_ts", PGType: "timestamptz", IsNullable: false, FieldID: 3},
-		{Name: "_seq", PGType: "int8", IsNullable: false, FieldID: 4},
-		{Name: "_unchanged_cols", PGType: "text", IsNullable: true, FieldID: 5},
+		{Name: "_op", PGType: postgres.Text, IsNullable: false, FieldID: 1},
+		{Name: "_lsn", PGType: postgres.Int8, IsNullable: false, FieldID: 2},
+		{Name: "_ts", PGType: postgres.TimestampTZ, IsNullable: false, FieldID: 3},
+		{Name: "_seq", PGType: postgres.Int8, IsNullable: false, FieldID: 4},
+		{Name: "_unchanged_cols", PGType: postgres.Text, IsNullable: true, FieldID: 5},
 	}
 
 	// User columns are offset by 5 (the number of metadata columns) from the
@@ -38,6 +38,8 @@ func EventsTableSchema(src *postgres.TableSchema) *postgres.TableSchema {
 			PGType:     col.PGType,
 			IsNullable: true, // always nullable in events table
 			FieldID:    5 + col.FieldID,
+			Precision:  col.Precision,
+			Scale:      col.Scale,
 		})
 	}
 

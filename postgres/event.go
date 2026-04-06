@@ -56,14 +56,14 @@ type SchemaChange struct {
 // SchemaColumn describes a column discovered from a RelationMessage.
 type SchemaColumn struct {
 	Name   string
-	PGType string // resolved from OID, e.g. "int4", "text"
+	PGType Type // resolved from OID, e.g. Int4, Text
 }
 
 // TypeChange records an OID-level type change for a single column.
 type TypeChange struct {
 	Name    string
-	OldType string
-	NewType string
+	OldType Type
+	NewType Type
 }
 
 // ChangeEvent is the unified event emitted by all source modes.

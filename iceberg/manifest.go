@@ -334,7 +334,7 @@ func IcebergSchemaJSONString(ts *postgres.TableSchema) string {
 		if i > 0 {
 			fields += ","
 		}
-		iceType := postgres.IcebergType(col.PGType)
+		iceType, _ := col.IcebergType()
 		// Map high-level Iceberg types back to JSON type strings
 		typeJSON := `"` + iceType + `"`
 		fields += fmt.Sprintf(`{"id":%d,"name":"%s","required":%t,"type":%s}`,
