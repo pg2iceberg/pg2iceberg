@@ -38,6 +38,9 @@ func main() {
 
 	// Iceberg / S3
 	icebergCatalogURL := flag.String("iceberg-catalog-url", "", "Iceberg REST catalog URL (env: ICEBERG_CATALOG_URL)")
+	catalogAuth := flag.String("catalog-auth", "", "catalog auth mode: none, sigv4, bearer (env: CATALOG_AUTH)")
+	catalogToken := flag.String("catalog-token", "", "Bearer token for catalog auth (env: CATALOG_TOKEN)")
+	credentialMode := flag.String("credential-mode", "", "credential mode: static or vended (env: CREDENTIAL_MODE)")
 	warehouse := flag.String("warehouse", "", "Iceberg warehouse path (env: WAREHOUSE)")
 	namespace := flag.String("namespace", "", "Iceberg namespace (env: NAMESPACE)")
 	s3Endpoint := flag.String("s3-endpoint", "", "S3 endpoint URL (env: S3_ENDPOINT)")
@@ -81,6 +84,9 @@ func main() {
 		slotName:          *slotName,
 		pubName:           *pubName,
 		icebergCatalogURL: *icebergCatalogURL,
+		catalogAuth:       *catalogAuth,
+		catalogToken:      *catalogToken,
+		credentialMode:    *credentialMode,
 		warehouse:         *warehouse,
 		namespace:         *namespace,
 		s3Endpoint:        *s3Endpoint,
@@ -114,6 +120,9 @@ type cliOverrides struct {
 	slotName          string
 	pubName           string
 	icebergCatalogURL string
+	catalogAuth       string
+	catalogToken      string
+	credentialMode    string
 	warehouse         string
 	namespace         string
 	s3Endpoint        string
@@ -164,6 +173,15 @@ func buildConfig(configPath string, cli cliOverrides) (*config.Config, error) {
 	}
 	if cli.icebergCatalogURL != "" {
 		cfg.Sink.CatalogURI = cli.icebergCatalogURL
+	}
+	if cli.catalogAuth != "" {
+		cfg.Sink.CatalogAuth = cli.catalogAuth
+	}
+	if cli.catalogToken != "" {
+		cfg.Sink.CatalogToken = cli.catalogToken
+	}
+	if cli.credentialMode != "" {
+		cfg.Sink.CredentialMode = cli.credentialMode
 	}
 	if cli.warehouse != "" {
 		cfg.Sink.Warehouse = cli.warehouse
@@ -287,20 +305,11 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 	pgConn.Close(ctx)
 
 	// Iceberg catalog and S3.
-	var httpClient *http.Client
-	if cfg.Sink.CatalogAuth == "sigv4" {
-		transport, err := iceberg.NewSigV4Transport(cfg.Sink.S3Region)
-		if err != nil {
-			return fmt.Errorf("create sigv4 transport: %w", err)
-		}
-		httpClient = &http.Client{Transport: transport}
-	}
-	catalog := iceberg.NewCatalogClient(cfg.Sink.CatalogURI, httpClient)
-
-	s3Client, err := iceberg.NewS3Client(cfg.Sink.S3Endpoint, cfg.Sink.S3AccessKey, cfg.Sink.S3SecretKey, cfg.Sink.S3Region, cfg.Sink.Warehouse)
+	clients, err := iceberg.NewClients(cfg.Sink)
 	if err != nil {
-		return fmt.Errorf("create s3 client: %w", err)
+		return fmt.Errorf("create iceberg clients: %w", err)
 	}
+	catalog := clients.Catalog
 
 	// Ensure namespace and create/load Iceberg tables.
 	if err := catalog.EnsureNamespace(cfg.Sink.Namespace); err != nil {
@@ -327,11 +336,21 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("load table %s: %w", icebergName, err)
 		}
 		if matTm == nil {
-			location := fmt.Sprintf("%s%s.db/%s", cfg.Sink.Warehouse, cfg.Sink.Namespace, icebergName)
+			var location string
+			if wh := clients.Warehouse(); wh != "" {
+				location = fmt.Sprintf("%s%s.db/%s", wh, cfg.Sink.Namespace, icebergName)
+			}
 			if _, err := catalog.CreateTable(cfg.Sink.Namespace, icebergName, ts, location, partSpec); err != nil {
 				return fmt.Errorf("create table %s: %w", icebergName, err)
 			}
 			log.Printf("[snapshot] created table %s.%s", cfg.Sink.Namespace, icebergName)
+		}
+
+		// In vended mode, initialize storage after first LoadTable/CreateTable.
+		if clients.S3 == nil {
+			if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, icebergName); err != nil {
+				return fmt.Errorf("ensure storage: %w", err)
+			}
 		}
 	}
 
@@ -367,7 +386,7 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 
 	deps := snapshot.Deps{
 		Catalog:    catalog,
-		S3:         s3Client,
+		S3:         clients.S3,
 		SinkCfg:    cfg.Sink,
 		LogicalCfg: cfg.Source.Logical,
 		TableCfgs:  cfg.Tables,

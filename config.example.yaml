@@ -40,8 +40,18 @@ source:
 
 sink:
   catalog_uri: http://localhost:8181
-  # catalog_auth: sigv4           # enable AWS SigV4 signing for Glue Iceberg REST endpoint
-  #                                # catalog_uri: https://glue.us-east-1.amazonaws.com/iceberg
+
+  # Catalog authentication mode: "sigv4" (AWS Glue), "bearer" (R2, Databricks), or empty (none).
+  # catalog_auth: sigv4
+  #   catalog_uri: https://glue.us-east-1.amazonaws.com/iceberg
+  # catalog_auth: bearer
+  #   catalog_token: "your-api-token"
+
+  # Credential mode: "static" (default) uses explicit S3 keys below.
+  # "vended" uses temporary credentials provided by the catalog (LoadTable response).
+  # When vended, s3_endpoint/s3_access_key/s3_secret_key/warehouse can be omitted.
+  # credential_mode: vended
+
   warehouse: s3://warehouse/
   namespace: default
   s3_endpoint: http://localhost:9000

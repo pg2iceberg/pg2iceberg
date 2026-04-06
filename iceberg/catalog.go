@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type Catalog interface {
 // CatalogClient interacts with the Iceberg REST catalog.
 type CatalogClient struct {
 	baseURL string
+	prefix  string // optional path prefix from GET /v1/config (e.g. "502bab72-...")
 	client  *http.Client
 }
 
@@ -39,9 +41,25 @@ func NewCatalogClient(baseURL string, httpClient *http.Client) *CatalogClient {
 	}
 }
 
+// SetPrefix sets the path prefix returned by GET /v1/config.
+// When set, all catalog paths use /v1/{prefix}/... instead of /v1/...
+func (c *CatalogClient) SetPrefix(prefix string) {
+	c.prefix = prefix
+}
+
+// v1Path builds a versioned catalog path, inserting the prefix if set.
+// e.g. with prefix "abc": "/v1/abc/namespaces/default/tables/orders"
+func (c *CatalogClient) v1Path(path string) string {
+	if c.prefix != "" {
+		return "/v1/" + c.prefix + path
+	}
+	return "/v1" + path
+}
+
 // TableMetadata holds the relevant fields from the Iceberg REST catalog response.
 type TableMetadata struct {
-	MetadataLocation string `json:"metadata-location"`
+	MetadataLocation string            `json:"metadata-location"`
+	Config           map[string]string `json:"config"` // vended credentials and storage config
 	Metadata         struct {
 		FormatVersion      int    `json:"format-version"`
 		TableUUID          string `json:"table-uuid"`
@@ -63,6 +81,35 @@ type TableMetadata struct {
 	} `json:"metadata"`
 }
 
+// VendedCreds holds temporary storage credentials returned by the catalog.
+type VendedCreds struct {
+	AccessKeyID    string
+	SecretAccessKey string
+	SessionToken   string
+	Region         string
+	Endpoint       string
+}
+
+// VendedCredentials extracts S3 credentials from the catalog config map.
+// Returns nil if no credentials are present.
+func (tm *TableMetadata) VendedCredentials() *VendedCreds {
+	if tm == nil || tm.Config == nil {
+		return nil
+	}
+	ak := tm.Config["s3.access-key-id"]
+	sk := tm.Config["s3.secret-access-key"]
+	if ak == "" || sk == "" {
+		return nil
+	}
+	return &VendedCreds{
+		AccessKeyID:    ak,
+		SecretAccessKey: sk,
+		SessionToken:   tm.Config["s3.session-token"],
+		Region:         tm.Config["s3.region"],
+		Endpoint:       tm.Config["s3.endpoint"],
+	}
+}
+
 // CurrentManifestList returns the manifest-list URI of the current snapshot, or empty if no snapshots.
 func (tm *TableMetadata) CurrentManifestList() string {
 	if tm.Metadata.CurrentSnapshotID <= 0 {
@@ -81,7 +128,7 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 	// Check existence first — the Iceberg REST catalog's JdbcCatalog
 	// backend returns 500 (not 409) on concurrent create attempts due
 	// to a primary key constraint violation in the properties table.
-	req, err := http.NewRequest("HEAD", c.baseURL+fmt.Sprintf("/v1/namespaces/%s", ns), nil)
+	req, err := http.NewRequest("HEAD", c.baseURL+c.v1Path(fmt.Sprintf("/namespaces/%s", ns)), nil)
 	if err != nil {
 		return err
 	}
@@ -97,7 +144,7 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 	body := map[string]any{
 		"namespace": []string{ns},
 	}
-	resp, err := c.post("/v1/namespaces", body)
+	resp, err := c.post(c.v1Path("/namespaces"), body)
 	if err != nil {
 		return err
 	}
@@ -113,7 +160,7 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 // LoadTable fetches table metadata from the catalog.
 func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 	start := time.Now()
-	resp, err := c.get(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table))
+	resp, err := c.get(c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)))
 	pipeline.CatalogOperationDurationSeconds.WithLabelValues("load_table").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
@@ -165,7 +212,7 @@ func (c *CatalogClient) CreateTable(ns, table string, ts *postgres.TableSchema, 
 		body["location"] = location
 	}
 
-	resp, err := c.post(fmt.Sprintf("/v1/namespaces/%s/tables", ns), body)
+	resp, err := c.post(c.v1Path(fmt.Sprintf("/namespaces/%s/tables", ns)), body)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +280,7 @@ func (c *CatalogClient) CommitSnapshot(ns, table string, currentSnapshotID int64
 		"updates":      updates,
 	}
 
-	resp, err := c.post(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table), body)
+	resp, err := c.post(c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
 	if err != nil {
 		return err
 	}
@@ -334,7 +381,7 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 		"table-changes": tableChanges,
 	}
 
-	resp, err := c.post("/v1/transactions/commit", body)
+	resp, err := c.post(c.v1Path("/transactions/commit"), body)
 	if err != nil {
 		return err
 	}
@@ -374,7 +421,7 @@ func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newS
 		},
 	}
 
-	resp, err := c.post(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table), body)
+	resp, err := c.post(c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
 	if err != nil {
 		return 0, fmt.Errorf("evolve schema: %w", err)
 	}
@@ -411,4 +458,37 @@ func (c *CatalogClient) post(path string, body any) (*http.Response, error) {
 func (c *CatalogClient) readError(resp *http.Response) error {
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("catalog error %d: %s", resp.StatusCode, string(body))
+}
+
+// CatalogConfig holds the response from GET /v1/config.
+type CatalogConfig struct {
+	Defaults  map[string]string `json:"defaults"`
+	Overrides map[string]string `json:"overrides"`
+}
+
+// GetConfig fetches catalog-wide configuration defaults.
+// Returns nil without error if the endpoint is not available (404/405).
+func (c *CatalogClient) GetConfig(warehouse string) (*CatalogConfig, error) {
+	path := "/v1/config"
+	if warehouse != "" {
+		path += "?warehouse=" + url.QueryEscape(warehouse)
+	}
+	resp, err := c.get(path)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 || resp.StatusCode == 405 {
+		return nil, nil
+	}
+	if resp.StatusCode != 200 {
+		return nil, c.readError(resp)
+	}
+
+	var cc CatalogConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cc); err != nil {
+		return nil, fmt.Errorf("decode catalog config: %w", err)
+	}
+	return &cc, nil
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -53,28 +52,26 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		return nil, fmt.Errorf("create checkpoint store: %w", err)
 	}
 
-	var httpClient *http.Client
-	if cfg.Sink.CatalogAuth == "sigv4" {
-		transport, err := iceberg.NewSigV4Transport(cfg.Sink.S3Region)
-		if err != nil {
-			cpStore.Close()
-			return nil, fmt.Errorf("create sigv4 transport: %w", err)
-		}
-		httpClient = &http.Client{Transport: transport}
-	}
-	catalog := iceberg.NewCatalogClient(cfg.Sink.CatalogURI, httpClient)
-
-	s3Client, err := iceberg.NewS3Client(cfg.Sink.S3Endpoint, cfg.Sink.S3AccessKey, cfg.Sink.S3SecretKey, cfg.Sink.S3Region, cfg.Sink.Warehouse)
+	clients, err := iceberg.NewClients(cfg.Sink)
 	if err != nil {
 		cpStore.Close()
-		return nil, fmt.Errorf("create s3 client: %w", err)
+		return nil, fmt.Errorf("create iceberg clients: %w", err)
+	}
+
+	// In vended credential mode, initialize storage from the catalog.
+	if clients.S3 == nil && len(cfg.Tables) > 0 {
+		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+			cpStore.Close()
+			return nil, fmt.Errorf("ensure storage: %w", err)
+		}
 	}
 
 	return &Pipeline{
 		id:      id,
 		cfg:     cfg,
-		catalog: catalog,
-		s3:      s3Client,
+		catalog: clients.Catalog,
+		s3:      clients.S3,
 		store:   cpStore,
 		status:  pipeline.StatusStopped,
 		done:    make(chan struct{}),
@@ -238,7 +235,10 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		}
 		var schemaID int
 		if matTm == nil {
-			location := fmt.Sprintf("%s%s.db/%s", p.cfg.Sink.Warehouse, p.cfg.Sink.Namespace, icebergName)
+			var location string
+			if iceberg.IsStorageURI(p.cfg.Sink.Warehouse) {
+				location = fmt.Sprintf("%s%s.db/%s", p.cfg.Sink.Warehouse, p.cfg.Sink.Namespace, icebergName)
+			}
 			matTm, err = p.catalog.CreateTable(p.cfg.Sink.Namespace, icebergName, ts, location, partSpec)
 			if err != nil {
 				return fmt.Errorf("create table %s: %w", icebergName, err)

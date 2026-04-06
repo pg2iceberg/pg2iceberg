@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -99,23 +98,13 @@ type tableSink struct {
 // BuildSink creates a fully-wired Sink from config, constructing the default
 // S3 and catalog clients. Use NewSink when you need to inject custom
 // dependencies (e.g. in tests).
-func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, eventBuf EventBuffer) (*Sink, error) {
-	var httpClient *http.Client
-	if cfg.CatalogAuth == "sigv4" {
-		transport, err := iceberg.NewSigV4Transport(cfg.S3Region)
-		if err != nil {
-			return nil, fmt.Errorf("create sigv4 transport: %w", err)
-		}
-		httpClient = &http.Client{Transport: transport}
-	}
-	catalog := iceberg.NewCatalogClient(cfg.CatalogURI, httpClient)
-
-	s3Client, err := iceberg.NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
+func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, eventBuf EventBuffer) (*Sink, *iceberg.IcebergClients, error) {
+	clients, err := iceberg.NewClients(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create s3 client: %w", err)
+		return nil, nil, fmt.Errorf("create iceberg clients: %w", err)
 	}
 
-	return NewSink(cfg, tableCfgs, pipelineID, s3Client, catalog, eventBuf), nil
+	return NewSink(cfg, tableCfgs, pipelineID, clients.S3, clients.Catalog, eventBuf), clients, nil
 }
 
 // NewSink creates a Sink with the given dependencies.
@@ -136,6 +125,10 @@ func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID s
 
 // Close is a no-op. Retained for interface compatibility.
 func (s *Sink) Close() {}
+
+// SetS3 updates the S3 storage client. Used when vended credentials
+// are initialized after Sink construction.
+func (s *Sink) SetS3(s3 iceberg.ObjectStorage) { s.s3 = s3 }
 
 // Catalog returns the catalog client.
 func (s *Sink) Catalog() iceberg.Catalog { return s.catalog }
@@ -178,7 +171,10 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 	}
 	var matSchemaID int
 	if matTm == nil {
-		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, icebergTable)
+		var location string
+		if iceberg.IsStorageURI(s.cfg.Warehouse) {
+			location = fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, icebergTable)
+		}
 		matTm, err = s.catalog.CreateTable(s.cfg.Namespace, icebergTable, ts, location, partSpec)
 		if err != nil {
 			return fmt.Errorf("create materialized table: %w", err)
@@ -204,7 +200,10 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 	}
 	var eventsSchemaID int
 	if eventsTm == nil {
-		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, eventsTable)
+		var location string
+		if iceberg.IsStorageURI(s.cfg.Warehouse) {
+			location = fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, eventsTable)
+		}
 		eventsTm, err = s.catalog.CreateTable(s.cfg.Namespace, eventsTable, eventsSchema, location, eventsPartSpec)
 		if err != nil {
 			return fmt.Errorf("create events table: %w", err)

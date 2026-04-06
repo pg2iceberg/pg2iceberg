@@ -134,13 +134,17 @@ func (c LogicalConfig) SnapshotTargetFileSizeOrDefault() int64 {
 }
 
 type SinkConfig struct {
-	CatalogURI  string `yaml:"catalog_uri" json:"catalog_uri"`
-	CatalogAuth string `yaml:"catalog_auth" json:"catalog_auth,omitempty"` // "" (none) or "sigv4" (AWS SigV4)
-	Warehouse   string `yaml:"warehouse" json:"warehouse"`
+	CatalogURI   string `yaml:"catalog_uri" json:"catalog_uri"`
+	CatalogAuth  string `yaml:"catalog_auth" json:"catalog_auth,omitempty"`   // "" (none), "sigv4", or "bearer"
+	CatalogToken string `yaml:"catalog_token" json:"catalog_token,omitempty"` // Bearer token (required when catalog_auth=bearer)
+
+	CredentialMode string `yaml:"credential_mode" json:"credential_mode,omitempty"` // "static" (default) or "vended"
+
+	Warehouse   string `yaml:"warehouse" json:"warehouse,omitempty"`
 	Namespace   string `yaml:"namespace" json:"namespace"`
-	S3Endpoint  string `yaml:"s3_endpoint" json:"s3_endpoint"`
-	S3AccessKey string `yaml:"s3_access_key" json:"s3_access_key"`
-	S3SecretKey string `yaml:"s3_secret_key" json:"s3_secret_key"`
+	S3Endpoint  string `yaml:"s3_endpoint" json:"s3_endpoint,omitempty"`
+	S3AccessKey string `yaml:"s3_access_key" json:"s3_access_key,omitempty"`
+	S3SecretKey string `yaml:"s3_secret_key" json:"s3_secret_key,omitempty"`
 	S3Region    string `yaml:"s3_region" json:"s3_region"`
 	FlushInterval  string `yaml:"flush_interval" json:"flush_interval"`
 	FlushRows      int    `yaml:"flush_rows" json:"flush_rows"`
@@ -344,6 +348,15 @@ func (cfg *Config) ApplyEnv() error {
 	if v := os.Getenv("ICEBERG_CATALOG_URL"); v != "" {
 		cfg.Sink.CatalogURI = v
 	}
+	if v := os.Getenv("CATALOG_AUTH"); v != "" {
+		cfg.Sink.CatalogAuth = v
+	}
+	if v := os.Getenv("CATALOG_TOKEN"); v != "" {
+		cfg.Sink.CatalogToken = v
+	}
+	if v := os.Getenv("CREDENTIAL_MODE"); v != "" {
+		cfg.Sink.CredentialMode = v
+	}
 	if v := os.Getenv("WAREHOUSE"); v != "" {
 		cfg.Sink.Warehouse = v
 	}
@@ -413,6 +426,9 @@ func (cfg *Config) ApplyDefaults() {
 	}
 	if cfg.Sink.FlushRows == 0 {
 		cfg.Sink.FlushRows = 1000
+	}
+	if cfg.Sink.CredentialMode == "" {
+		cfg.Sink.CredentialMode = "static"
 	}
 	if cfg.Sink.S3Region == "" {
 		cfg.Sink.S3Region = "us-east-1"
@@ -494,14 +510,35 @@ func (cfg *Config) Validate() error {
 	if cfg.Sink.CatalogURI == "" {
 		errs = append(errs, "sink.catalog_uri: required")
 	}
-	if cfg.Sink.Warehouse == "" {
-		errs = append(errs, "sink.warehouse: required")
-	}
 	if cfg.Sink.Namespace == "" {
 		errs = append(errs, "sink.namespace: required")
 	}
-	if cfg.Sink.S3Endpoint == "" {
-		errs = append(errs, "sink.s3_endpoint: required")
+
+	// Validate catalog_auth.
+	switch cfg.Sink.CatalogAuth {
+	case "", "none", "sigv4", "bearer":
+	default:
+		errs = append(errs, fmt.Sprintf("sink.catalog_auth: must be \"sigv4\", \"bearer\", or empty, got %q", cfg.Sink.CatalogAuth))
+	}
+	if cfg.Sink.CatalogAuth == "bearer" && cfg.Sink.CatalogToken == "" {
+		errs = append(errs, "sink.catalog_token: required when catalog_auth is \"bearer\"")
+	}
+
+	// Validate credential_mode.
+	switch cfg.Sink.CredentialMode {
+	case "static", "vended":
+	default:
+		errs = append(errs, fmt.Sprintf("sink.credential_mode: must be \"static\" or \"vended\", got %q", cfg.Sink.CredentialMode))
+	}
+
+	// S3 fields and warehouse are only required in static credential mode.
+	if cfg.Sink.CredentialMode == "static" {
+		if cfg.Sink.Warehouse == "" {
+			errs = append(errs, "sink.warehouse: required for static credential mode")
+		}
+		if cfg.Sink.S3Endpoint == "" {
+			errs = append(errs, "sink.s3_endpoint: required for static credential mode")
+		}
 	}
 
 	if cfg.Sink.FlushInterval != "" {
