@@ -60,16 +60,24 @@ type PostgresConfig struct {
 	Database string `yaml:"database" json:"database"`
 	User     string `yaml:"user" json:"user"`
 	Password string `yaml:"password" json:"password"`
+	SSLMode  string `yaml:"sslmode" json:"sslmode,omitempty"` // disable, require, verify-ca, verify-full
+}
+
+func (p PostgresConfig) sslmode() string {
+	if p.SSLMode != "" {
+		return p.SSLMode
+	}
+	return "disable"
 }
 
 func (p PostgresConfig) DSN() string {
-	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
-		p.Host, p.Port, p.Database, p.User, p.Password)
+	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
+		p.Host, p.Port, p.Database, p.User, p.Password, p.sslmode())
 }
 
 func (p PostgresConfig) ReplicationDSN() string {
-	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable replication=database",
-		p.Host, p.Port, p.Database, p.User, p.Password)
+	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s replication=database",
+		p.Host, p.Port, p.Database, p.User, p.Password, p.sslmode())
 }
 
 type QueryConfig struct {
@@ -298,6 +306,10 @@ func ParsePostgresURL(connURL string) (PostgresConfig, error) {
 		pg.Password = pw
 	}
 
+	if sslmode := u.Query().Get("sslmode"); sslmode != "" {
+		pg.SSLMode = sslmode
+	}
+
 	return pg, nil
 }
 
@@ -327,6 +339,9 @@ func (cfg *Config) ApplyEnv() error {
 	}
 	if v := os.Getenv("POSTGRES_USER"); v != "" {
 		cfg.Source.Postgres.User = v
+	}
+	if v := os.Getenv("POSTGRES_SSLMODE"); v != "" {
+		cfg.Source.Postgres.SSLMode = v
 	}
 	if v := os.Getenv("POSTGRES_PASSWORD"); v != "" {
 		cfg.Source.Postgres.Password = v

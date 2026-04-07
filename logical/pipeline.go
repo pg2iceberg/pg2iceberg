@@ -211,12 +211,23 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
 
-	// Discover schemas.
+	// Connect to postgres and check prerequisites before doing anything else.
 	pgConn, err := pgx.Connect(ctx, p.cfg.Source.Postgres.DSN())
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
 
+	var walLevel string
+	if err := pgConn.QueryRow(ctx, "SHOW wal_level").Scan(&walLevel); err != nil {
+		pgConn.Close(ctx)
+		return fmt.Errorf("check wal_level: %w", err)
+	}
+	if walLevel != "logical" {
+		pgConn.Close(ctx)
+		return fmt.Errorf("wal_level is %q, must be \"logical\"; enable logical replication in your database settings", walLevel)
+	}
+
+	// Discover schemas.
 	p.schemas = make(map[string]*postgres.TableSchema)
 	for _, tc := range p.cfg.Tables {
 		ts, err := postgres.DiscoverSchema(ctx, pgConn, tc.Name)
