@@ -121,6 +121,7 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 			snapshot_complete       BOOLEAN NOT NULL DEFAULT FALSE,
 			last_snapshot_id        BIGINT NOT NULL DEFAULT 0,
 			last_sequence_number    BIGINT NOT NULL DEFAULT 0,
+			seq_counter             BIGINT NOT NULL DEFAULT 0,
 			snapshoted_tables       JSONB,
 			snapshot_chunks         JSONB,
 			materializer_snapshots  JSONB,
@@ -145,14 +146,14 @@ func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, checksum, written_by, revision, mode, lsn, watermark,
 		       snapshot_complete, last_snapshot_id, last_sequence_number,
-		       snapshoted_tables, snapshot_chunks, materializer_snapshots,
+		       seq_counter, snapshoted_tables, snapshot_chunks, materializer_snapshots,
 		       query_watermarks, updated_at
 		FROM _pg2iceberg.checkpoints
 		WHERE pipeline_id = $1
 	`, pipelineID).Scan(
 		&cp.Version, &cp.Checksum, &cp.WrittenBy, &cp.Revision, &cp.Mode, &cp.LSN, &cp.Watermark,
 		&cp.SnapshotComplete, &cp.LastSnapshotID, &cp.LastSequenceNumber,
-		&snapshotedTables, &snapshotChunks, &matSnapshots,
+		&cp.SeqCounter, &snapshotedTables, &snapshotChunks, &matSnapshots,
 		&queryWatermarks, &cp.UpdatedAt,
 	)
 
@@ -188,7 +189,11 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cp.UpdatedAt = time.Now()
+	// Truncate to microsecond precision to match PostgreSQL's TIMESTAMPTZ,
+	// which discards nanoseconds. Without this, the checksum computed here
+	// (with nanoseconds) won't match the checksum recomputed after Load
+	// (without nanoseconds).
+	cp.UpdatedAt = time.Now().Truncate(time.Microsecond)
 	cp.Seal()
 
 	snapshotedTables, _ := json.Marshal(cp.SnapshotedTables)
@@ -203,21 +208,22 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 		_, err := s.pool.Exec(ctx, `
 			INSERT INTO _pg2iceberg.checkpoints (
 				pipeline_id, version, checksum, written_by, revision, mode, lsn, watermark,
-				snapshot_complete, last_snapshot_id, last_sequence_number,
+				snapshot_complete, last_snapshot_id, last_sequence_number, seq_counter,
 				snapshoted_tables, snapshot_chunks, materializer_snapshots,
 				query_watermarks, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 			ON CONFLICT (pipeline_id) DO UPDATE SET
 				version = $2, checksum = $3, written_by = $4, revision = $5,
 				mode = $6, lsn = $7, watermark = $8,
 				snapshot_complete = $9, last_snapshot_id = $10, last_sequence_number = $11,
-				snapshoted_tables = $12, snapshot_chunks = $13, materializer_snapshots = $14,
-				query_watermarks = $15, updated_at = now()
+				seq_counter = $12, snapshoted_tables = $13, snapshot_chunks = $14,
+				materializer_snapshots = $15, query_watermarks = $16, updated_at = $17
 			WHERE _pg2iceberg.checkpoints.revision = 0 OR _pg2iceberg.checkpoints.revision IS NULL
 		`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
 			cp.Mode, cp.LSN, cp.Watermark,
-			cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber,
-			snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks)
+			cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
+			snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
+			cp.UpdatedAt)
 		if err != nil {
 			return fmt.Errorf("save checkpoint: %w", err)
 		}
@@ -230,14 +236,14 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 			version = $2, checksum = $3, written_by = $4, revision = $5,
 			mode = $6, lsn = $7, watermark = $8,
 			snapshot_complete = $9, last_snapshot_id = $10, last_sequence_number = $11,
-			snapshoted_tables = $12, snapshot_chunks = $13, materializer_snapshots = $14,
-			query_watermarks = $15, updated_at = now()
-		WHERE pipeline_id = $1 AND revision = $16
+			seq_counter = $12, snapshoted_tables = $13, snapshot_chunks = $14,
+			materializer_snapshots = $15, query_watermarks = $16, updated_at = $17
+		WHERE pipeline_id = $1 AND revision = $18
 	`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
 		cp.Mode, cp.LSN, cp.Watermark,
-		cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber,
+		cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
 		snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
-		expectedRevision)
+		cp.UpdatedAt, expectedRevision)
 	if err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}

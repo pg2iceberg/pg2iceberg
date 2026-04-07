@@ -55,6 +55,15 @@ type Sink struct {
 	// Monotonically increasing sequence counter for ordering events within a flush.
 	seqCounter int64
 
+	// Global seq tracking for audit continuity validation.
+	// flushMinSeq/flushMaxSeq track the range assigned in the current batch
+	// (across all tables). lastCommittedMaxSeq is the max _seq from the
+	// previous successful commit. A value of -1 means no prior commit.
+	flushMinSeq         int64
+	flushMaxSeq         int64
+	flushSeqSet         bool
+	lastCommittedMaxSeq int64
+
 	// Optional event buffer for pushing events after flush (avoids S3 round-trips).
 	eventBuf EventBuffer
 
@@ -90,6 +99,13 @@ type tableSink struct {
 	partitions map[string]*partitionedWriter
 	totalRows  int
 
+	// Per-table seq tracking for snapshot summary metadata.
+	// These track the min/max _seq assigned to this table in the current
+	// flush batch. Reset after each successful flush.
+	flushMinSeq int64
+	flushMaxSeq int64
+	flushSeqSet bool // true once at least one event has been written this batch
+
 	// Cached manifest lists to avoid re-downloading from S3 every flush/materialize cycle.
 	eventsManifests []iceberg.ManifestFileInfo // events table manifests
 	matManifests    []iceberg.ManifestFileInfo // materialized table manifests
@@ -120,8 +136,20 @@ func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID s
 		tables:              make(map[string]*tableSink),
 		openTxns:            make(map[uint32]*txBuffer),
 		pendingDirectEvents: make(map[string][]MatEvent),
+		lastCommittedMaxSeq: -1,
 	}
 }
+
+// SetSeqCounter restores the sequence counter from a checkpoint so that _seq
+// remains globally monotonic across pipeline restarts. Also sets
+// lastCommittedMaxSeq so the first flush validates continuity correctly.
+func (s *Sink) SetSeqCounter(seq int64) {
+	s.seqCounter = seq
+	s.lastCommittedMaxSeq = seq - 1
+}
+
+// SeqCounter returns the current sequence counter value (for checkpointing).
+func (s *Sink) SeqCounter() int64 { return s.seqCounter }
 
 // Close is a no-op. Retained for interface compatibility.
 func (s *Sink) Close() {}
@@ -415,6 +443,25 @@ func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 	row["_lsn"] = int64(event.LSN)
 	row["_ts"] = event.SourceTimestamp
 	row["_seq"] = s.seqCounter
+
+	// Track per-table min/max _seq for snapshot summary metadata.
+	if !ts.flushSeqSet {
+		ts.flushMinSeq = s.seqCounter
+		ts.flushMaxSeq = s.seqCounter
+		ts.flushSeqSet = true
+	} else if s.seqCounter > ts.flushMaxSeq {
+		ts.flushMaxSeq = s.seqCounter
+	}
+
+	// Track global min/max _seq for continuity validation.
+	if !s.flushSeqSet {
+		s.flushMinSeq = s.seqCounter
+		s.flushMaxSeq = s.seqCounter
+		s.flushSeqSet = true
+	} else if s.seqCounter > s.flushMaxSeq {
+		s.flushMaxSeq = s.seqCounter
+	}
+
 	s.seqCounter++
 
 	pw := ts.getEventsWriter(row)
@@ -498,10 +545,40 @@ func (s *Sink) Flush(ctx context.Context) error {
 		return nil
 	}
 
-	// NOTE: seqCounter is NOT reset — it's a globally monotonic ordering key
-	// across flushes. The materializer sorts events by _seq to determine the
-	// correct application order. Using _lsn is unreliable because walEnd
-	// (walStart + len(walData)) varies with payload size.
+	// Snapshot seq state so we can restore it on failure. A failed flush
+	// (Add error, S3 upload, catalog commit) must not advance seqCounter,
+	// because doFlush retries will replay the same committedTxns — they
+	// must receive the same _seq values to maintain continuity.
+	savedSeqCounter := s.seqCounter
+	savedFlushSeqSet := s.flushSeqSet
+	savedFlushMinSeq := s.flushMinSeq
+	savedFlushMaxSeq := s.flushMaxSeq
+	type perTableSeqState struct {
+		minSeq int64
+		maxSeq int64
+		set    bool
+	}
+	savedTableSeq := make(map[string]perTableSeqState, len(s.tables))
+	for pgTable, ts := range s.tables {
+		savedTableSeq[pgTable] = perTableSeqState{
+			minSeq: ts.flushMinSeq,
+			maxSeq: ts.flushMaxSeq,
+			set:    ts.flushSeqSet,
+		}
+	}
+	restoreSeqState := func() {
+		s.seqCounter = savedSeqCounter
+		s.flushSeqSet = savedFlushSeqSet
+		s.flushMinSeq = savedFlushMinSeq
+		s.flushMaxSeq = savedFlushMaxSeq
+		for pgTable, saved := range savedTableSeq {
+			if ts, ok := s.tables[pgTable]; ok {
+				ts.flushMinSeq = saved.minSeq
+				ts.flushMaxSeq = saved.maxSeq
+				ts.flushSeqSet = saved.set
+			}
+		}
+	}
 
 	// Discard stale completed chunks from a previous failed flush.
 	for _, ts := range s.tables {
@@ -520,7 +597,21 @@ func (s *Sink) Flush(ctx context.Context) error {
 		}
 	}
 
+	// Count expected DML events before writing so we can verify none were
+	// silently dropped during the loop.
+	var expectedEvents int64
+	for _, tx := range s.committedTxns {
+		for _, event := range tx.events {
+			switch event.Operation {
+			case postgres.OpInsert, postgres.OpUpdate, postgres.OpDelete:
+				expectedEvents++
+			}
+		}
+	}
+
 	// Drain committed transactions into per-table writers.
+	// seqCounter is a globally monotonic ordering key (NOT reset across flushes).
+	// The materializer sorts events by _seq to determine application order.
 	for _, tx := range s.committedTxns {
 		for _, event := range tx.events {
 			// Capture seq before writeDirect increments seqCounter.
@@ -529,16 +620,48 @@ func (s *Sink) Flush(ctx context.Context) error {
 				bufferedEvents[event.Table] = append(bufferedEvents[event.Table], ce)
 			}
 			if err := s.writeDirect(event); err != nil {
+				restoreSeqState()
 				return fmt.Errorf("replay tx %d: %w", tx.xid, err)
 			}
+		}
+	}
+
+	// Verify that every expected event was assigned a seq. The seq counter
+	// should have advanced by exactly expectedEvents; any mismatch means
+	// writeDirect silently skipped or double-counted an event.
+	actualWritten := s.seqCounter - savedSeqCounter
+	if actualWritten != expectedEvents {
+		restoreSeqState()
+		return fmt.Errorf("seq count mismatch: expected %d events to be written, "+
+			"but seqCounter advanced by %d — possible silent event drop",
+			expectedEvents, actualWritten)
+	}
+
+	// Validate global seq continuity before committing to Iceberg.
+	// If lastCommittedMaxSeq >= 0 (not first-ever flush), the current batch's
+	// min_seq must be exactly lastCommittedMaxSeq+1. A gap means events were lost.
+	if s.flushSeqSet && s.lastCommittedMaxSeq >= 0 {
+		expected := s.lastCommittedMaxSeq + 1
+		if s.flushMinSeq != expected {
+			restoreSeqState()
+			return fmt.Errorf("seq continuity violation: expected min_seq=%d (last committed max_seq=%d), "+
+				"got min_seq=%d; this indicates WAL events were dropped — refusing to commit",
+				expected, s.lastCommittedMaxSeq, s.flushMinSeq)
 		}
 	}
 
 	// Flush all tables: parallel S3 uploads + single atomic catalog commit.
 	snapshotIDs, err := s.flushAllTables(ctx)
 	if err != nil {
+		restoreSeqState()
 		return err
 	}
+
+	// Update global seq tracking after successful commit.
+	if s.flushSeqSet {
+		s.lastCommittedMaxSeq = s.flushMaxSeq
+	}
+	s.flushSeqSet = false
 
 	// Push events to materializer buffer only after successful S3 commit.
 	if s.eventBuf != nil {
@@ -668,6 +791,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 			pw.dataWriter.Commit()
 		}
 		pf.ts.totalRows = 0
+		pf.ts.flushSeqSet = false
 	}
 
 	return snapshotIDs, nil
@@ -862,8 +986,17 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	for _, df := range dataFiles {
 		eventCount += int(df.RecordCount)
 	}
-	log.Printf("[sink] prepared events snapshot %d for %s (seq=%d, events=%d, files=%d)",
-		snapshotID, pgTable, seqNum, eventCount, len(dataFiles))
+	log.Printf("[sink] prepared events snapshot %d for %s (seq=%d, events=%d, files=%d, seq_range=[%d,%d])",
+		snapshotID, pgTable, seqNum, eventCount, len(dataFiles), ts.flushMinSeq, ts.flushMaxSeq)
+
+	summary := map[string]string{
+		"operation": "append",
+	}
+	if ts.flushSeqSet {
+		summary["min_seq"] = fmt.Sprintf("%d", ts.flushMinSeq)
+		summary["max_seq"] = fmt.Sprintf("%d", ts.flushMaxSeq)
+		summary["event_count"] = fmt.Sprintf("%d", eventCount)
+	}
 
 	return &preparedFlush{
 		pgTable:    pgTable,
@@ -876,9 +1009,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 			TimestampMs:      now.UnixMilli(),
 			ManifestListPath: mlURI,
 			SchemaID:         ts.schemaID,
-			Summary: map[string]string{
-				"operation": "append",
-			},
+			Summary:          summary,
 		},
 	}, nil
 }

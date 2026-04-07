@@ -73,6 +73,11 @@ type Checkpoint struct {
 	// per table. Keyed by PG table name (e.g. "public.orders").
 	MaterializerSnapshots map[string]int64 `json:"materializer_snapshots,omitempty"`
 
+	// SeqCounter is the next sequence number to assign to an event in the
+	// events table. Persisted so that _seq is globally monotonic across
+	// pipeline restarts, enabling gap detection for audit.
+	SeqCounter int64 `json:"seq_counter,omitempty"`
+
 	// QueryWatermarks stores per-table watermarks for query mode.
 	// Keyed by PG table name (e.g. "public.orders"), values are RFC3339Nano timestamps.
 	// Replaces the single Watermark field which applied one value to all tables.
@@ -98,6 +103,7 @@ func (cp *Checkpoint) computeChecksum() string {
 	parts = append(parts, fmt.Sprintf("snapshot_complete=%t", cp.SnapshotComplete))
 	parts = append(parts, fmt.Sprintf("last_snapshot_id=%d", cp.LastSnapshotID))
 	parts = append(parts, fmt.Sprintf("last_sequence_number=%d", cp.LastSequenceNumber))
+	parts = append(parts, fmt.Sprintf("seq_counter=%d", cp.SeqCounter))
 	parts = append(parts, fmt.Sprintf("updated_at=%s", cp.UpdatedAt.UTC().Format(time.RFC3339Nano)))
 
 	// Deterministic serialization of maps.

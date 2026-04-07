@@ -324,6 +324,12 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	// Start WAL lag monitor.
 	go p.monitorWALLag(ctx)
 
+	// Restore sequence counter so _seq remains monotonic across restarts.
+	if cp.SeqCounter > 0 {
+		p.snk.SetSeqCounter(cp.SeqCounter)
+		log.Printf("[logical:%s] restored seq counter: %d", p.id, cp.SeqCounter)
+	}
+
 	// Start materializer.
 	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.eventBuf)
 	if cp.MaterializerSnapshots != nil {
@@ -620,6 +626,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil
 	cp.SnapshotChunks = nil
+	cp.SeqCounter = p.snk.SeqCounter()
 	// Use lastWrittenLSN if available (CDC events were flushed during snapshot),
 	// otherwise fall back to the source's flushed LSN (the slot creation point).
 	if p.lastWrittenLSN > 0 {
@@ -689,6 +696,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 
 	cp.Mode = "logical"
 	cp.LSN = p.lastWrittenLSN
+	cp.SeqCounter = p.snk.SeqCounter()
 
 	if p.materializer != nil {
 		cp.MaterializerSnapshots = p.materializer.LastEventsSnapshots()
