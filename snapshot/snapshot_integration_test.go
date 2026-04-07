@@ -309,6 +309,217 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 	}
 }
 
+// TestSnapshotter_CrashAfterChunkCommit simulates a crash between an Iceberg
+// chunk commit and the checkpoint save. On re-run, the chunk is re-executed
+// because the checkpoint doesn't know it was already committed. This test
+// verifies whether the re-run produces duplicate rows in the materialized table.
+func TestSnapshotter_CrashAfterChunkCommit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE public.orders (
+			id   SERIAL PRIMARY KEY,
+			name TEXT NOT NULL,
+			pad  TEXT NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Insert rows with wide padding to force multiple CTID chunks.
+	// Each row is ~500 bytes, 4 pages = 32KB ≈ 64 rows per chunk.
+	const rowCount = 500
+	for i := 1; i <= rowCount; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO orders (name, pad) VALUES ($1, $2)",
+			fmt.Sprintf("order-%d", i), fmt.Sprintf("%0500d", i))
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	// ANALYZE so pg_class.relpages is accurate for CTID chunk computation.
+	if _, err := conn.Exec(ctx, "ANALYZE public.orders"); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	conn.Close(ctx)
+
+	schemaConn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("schema connect: %v", err)
+	}
+	ts, err := postgres.DiscoverSchema(ctx, schemaConn, "public.orders")
+	if err != nil {
+		t.Fatalf("discover schema: %v", err)
+	}
+	schemaConn.Close(ctx)
+
+	catalog := newMemCatalog()
+	s3 := newMemStorage()
+
+	sinkCfg := config.SinkConfig{
+		Namespace: "test_ns",
+		Warehouse: "s3://test-bucket/",
+	}
+
+	_, err = catalog.CreateTable(sinkCfg.Namespace, "orders", ts,
+		fmt.Sprintf("%stest_ns.db/orders", sinkCfg.Warehouse), nil)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	logicalCfg := config.LogicalConfig{
+		SnapshotChunkPages: 4, // very small → multiple chunks
+	}
+
+	dsn := pgCfg.DSN()
+	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
+		c, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return nil, nil, err
+		}
+		cl := func(ctx context.Context) { c.Close(ctx) }
+		tx, err := c.Begin(ctx)
+		if err != nil {
+			cl(ctx)
+			return nil, nil, err
+		}
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			tx.Rollback(ctx)
+			cl(ctx)
+			return nil, nil, err
+		}
+		return tx, cl, nil
+	}
+
+	// --- Run 1: crash after first chunk's checkpoint save ---
+	// Use a store that fails on the 2nd Save (chunk 1's checkpoint).
+	// Chunk 0 commits to Iceberg + checkpoint saved.
+	// Chunk 1 commits to Iceberg, but checkpoint save fails → "crash".
+	crashStore := &crashAfterNSaves{
+		inner:   pipeline.NewMemCheckpointStore(),
+		crashAt: 2,
+	}
+
+	deps := snapshot.Deps{
+		Catalog:    catalog,
+		S3:         s3,
+		SinkCfg:    sinkCfg,
+		LogicalCfg: logicalCfg,
+		TableCfgs:  []config.TableConfig{{Name: "public.orders"}},
+		Schemas:    map[string]*postgres.TableSchema{"public.orders": ts},
+		Store:      crashStore,
+		PipelineID: "test",
+	}
+
+	tables := []snapshot.Table{{Name: "public.orders", Schema: ts}}
+	snap := snapshot.NewSnapshotter(tables, txFactory, 1, deps)
+	_, err = snap.Run(ctx)
+	if err == nil {
+		t.Fatal("expected error from simulated crash, got nil")
+	}
+	t.Logf("run 1 crashed as expected: %v", err)
+
+	// Check: chunk 0 is checkpointed, chunk 1's data is in Iceberg but not checkpointed.
+	cp, err := crashStore.inner.Load("test")
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	t.Logf("checkpoint after crash: SnapshotChunks=%v", cp.SnapshotChunks)
+
+	tm, _ := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	snapshotsAfterCrash := len(tm.Metadata.Snapshots)
+	t.Logf("Iceberg snapshots after crash: %d", snapshotsAfterCrash)
+
+	// --- Run 2: resume with the same store (checkpoint says chunk 0 done) ---
+	deps.Store = crashStore.inner // use the underlying store, no more crashes
+	snap2 := snapshot.NewSnapshotter(tables, txFactory, 1, deps)
+	results, err := snap2.Run(ctx)
+	if err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("run 2 error: %v", results[0].Err)
+	}
+
+	// Count total rows in the materialized table.
+	// BUG: chunk 1 was committed to Iceberg in run 1 but not checkpointed.
+	// Run 2 re-commits chunk 1, producing duplicate rows. This is a known
+	// limitation: snapshot crash recovery can produce duplicates because the
+	// Iceberg append is not idempotent and there's no deduplication by PK
+	// in the snapshot path.
+	tmFinal, _ := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	totalSnapshots := len(tmFinal.Metadata.Snapshots)
+	t.Logf("total Iceberg snapshots: %d (crash run: %d)", totalSnapshots, snapshotsAfterCrash)
+
+	// Expect duplicates: the crashed chunk's rows appear twice.
+	tmForCount, _ := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	mlURI := tmForCount.CurrentManifestList()
+	mlKey, _ := iceberg.KeyFromURI(mlURI)
+	mlData, _ := s3.Download(ctx, mlKey)
+	manifests, _ := iceberg.ReadManifestList(mlData)
+	var totalRows int64
+	for _, mfi := range manifests {
+		if mfi.Content != 0 {
+			continue
+		}
+		mKey, _ := iceberg.KeyFromURI(mfi.Path)
+		mData, _ := s3.Download(ctx, mKey)
+		entries, _ := iceberg.ReadManifest(mData)
+		for _, e := range entries {
+			if e.DataFile.Content == 0 {
+				totalRows += e.DataFile.RecordCount
+			}
+		}
+	}
+	t.Logf("total rows in materialized table: %d (expected %d, diff=%d duplicates)",
+		totalRows, rowCount, totalRows-int64(rowCount))
+
+	if totalRows <= int64(rowCount) {
+		t.Fatalf("expected duplicate rows from crash recovery, but got %d (no duplicates)", totalRows)
+	}
+	if totalRows > int64(rowCount) {
+		// TODO: fix snapshot crash recovery to detect already-committed chunks
+		// and skip them instead of re-appending. Track with Iceberg snapshot ID
+		// or data file UUIDs.
+		t.Logf("KNOWN ISSUE: snapshot crash recovery produced %d duplicate rows", totalRows-int64(rowCount))
+	}
+}
+
+// crashAfterNSaves wraps a CheckpointStore and returns an error on the Nth Save call.
+type crashAfterNSaves struct {
+	inner     pipeline.CheckpointStore
+	saveCount int
+	crashAt   int
+}
+
+func (s *crashAfterNSaves) Load(id string) (*pipeline.Checkpoint, error) {
+	return s.inner.Load(id)
+}
+
+func (s *crashAfterNSaves) Save(id string, cp *pipeline.Checkpoint) error {
+	s.saveCount++
+	if s.saveCount == s.crashAt {
+		return fmt.Errorf("simulated crash after save %d", s.saveCount)
+	}
+	return s.inner.Save(id, cp)
+}
+
+func (s *crashAfterNSaves) Close() {
+	s.inner.Close()
+}
+
 // TestSnapshotter_EmptyTable verifies snapshot handles tables with zero rows.
 func TestSnapshotter_EmptyTable(t *testing.T) {
 	if testing.Short() {

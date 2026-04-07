@@ -174,6 +174,35 @@ func (cp *Checkpoint) Verify() error {
 	return nil
 }
 
+func (cp *Checkpoint) clone() *Checkpoint {
+	c := *cp
+	if cp.SnapshotedTables != nil {
+		c.SnapshotedTables = make(map[string]bool, len(cp.SnapshotedTables))
+		for k, v := range cp.SnapshotedTables {
+			c.SnapshotedTables[k] = v
+		}
+	}
+	if cp.SnapshotChunks != nil {
+		c.SnapshotChunks = make(map[string]int, len(cp.SnapshotChunks))
+		for k, v := range cp.SnapshotChunks {
+			c.SnapshotChunks[k] = v
+		}
+	}
+	if cp.MaterializerSnapshots != nil {
+		c.MaterializerSnapshots = make(map[string]int64, len(cp.MaterializerSnapshots))
+		for k, v := range cp.MaterializerSnapshots {
+			c.MaterializerSnapshots[k] = v
+		}
+	}
+	if cp.QueryWatermarks != nil {
+		c.QueryWatermarks = make(map[string]string, len(cp.QueryWatermarks))
+		for k, v := range cp.QueryWatermarks {
+			c.QueryWatermarks[k] = v
+		}
+	}
+	return &c
+}
+
 // CheckpointStore abstracts checkpoint persistence.
 type CheckpointStore interface {
 	Load(pipelineID string) (*Checkpoint, error)
@@ -280,13 +309,13 @@ func (s *MemCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	if err := cp.Verify(); err != nil {
 		return nil, err
 	}
-	return cp, nil
+	return cp.clone(), nil
 }
 
 func (s *MemCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	cp.UpdatedAt = time.Now()
 	cp.Seal()
-	s.checkpoints[pipelineID] = cp
+	s.checkpoints[pipelineID] = cp.clone()
 	return nil
 }
 
