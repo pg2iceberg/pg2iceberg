@@ -71,11 +71,6 @@ func ReadParquetRowsFromReaderAt(r io.ReaderAt, size int64, schema *postgres.Tab
 // Returns nil if file counts are below thresholds (no compaction needed).
 // The caller must commit via CommitSnapshot (which updates the MetadataCache).
 func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionConfig) (*PreparedCommit, error) {
-	ctx, span := compactTracer.Start(ctx, "pg2iceberg.compact", trace.WithAttributes(
-		attribute.String("iceberg.table", tw.cfg.IcebergName),
-	))
-	defer span.End()
-
 	cfg := tw.cfg
 	ns := cfg.Namespace
 	basePath := fmt.Sprintf("%s.db/%s", ns, cfg.IcebergName)
@@ -126,6 +121,14 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	if dataFileCount < cc.DataFileThreshold && deleteFileCount < cc.DeleteFileThreshold {
 		return nil, nil // below thresholds
 	}
+
+	// Only create a span when compaction actually runs.
+	ctx, span := compactTracer.Start(ctx, "pg2iceberg.compact", trace.WithAttributes(
+		attribute.String("iceberg.table", cfg.IcebergName),
+		attribute.Int("data_files", dataFileCount),
+		attribute.Int("delete_files", deleteFileCount),
+	))
+	defer span.End()
 
 	log.Printf("[compact] %s: %d data files, %d delete files — compacting", cfg.IcebergName, dataFileCount, deleteFileCount)
 

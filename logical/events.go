@@ -757,15 +757,23 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		return nil, err
 	}
 
-	// Assemble metadata and commit all events tables.
-	prepared := make([]*preparedFlush, 0, len(tablesToFlush))
-	for _, t := range tablesToFlush {
-		results := partResults[t.pgTable]
-		pf, err := s.assembleEventsCommit(ctx, t.pgTable, t.ts, results)
-		if err != nil {
-			return nil, err
-		}
-		prepared = append(prepared, pf)
+	// Assemble metadata in parallel across tables (manifest write + S3 upload).
+	prepared := make([]*preparedFlush, len(tablesToFlush))
+	ag, agctx := errgroup.WithContext(ctx)
+	for i, t := range tablesToFlush {
+		i, t := i, t
+		ag.Go(func() error {
+			results := partResults[t.pgTable]
+			pf, err := s.assembleEventsCommit(agctx, t.pgTable, t.ts, results)
+			if err != nil {
+				return err
+			}
+			prepared[i] = pf
+			return nil
+		})
+	}
+	if err := ag.Wait(); err != nil {
+		return nil, err
 	}
 
 	tableCommits := make([]iceberg.TableCommit, len(prepared))

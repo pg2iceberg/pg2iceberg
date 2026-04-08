@@ -266,7 +266,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// --- Serialize per bucket (equality deletes + data files) ---
-	ctx, serSpan := twTracer.Start(ctx, "pg2iceberg.serialize", trace.WithAttributes(attribute.Int("buckets", len(buckets))))
+	_, serSpan := twTracer.Start(ctx, "pg2iceberg.serialize", trace.WithAttributes(attribute.Int("buckets", len(buckets))))
 	results := make([]bucketResult, len(buckets))
 
 	serializeTasks := make([]utils.Task, len(buckets))
@@ -387,7 +387,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// --- Upload all data files in parallel ---
-	ctx, uploadSpan := twTracer.Start(ctx, "pg2iceberg.upload.data", trace.WithAttributes(attribute.Int("files", len(allPending))))
+	_, uploadSpan := twTracer.Start(ctx, "pg2iceberg.upload.data", trace.WithAttributes(attribute.Int("files", len(allPending))))
 	var deleteEntries []ManifestEntry
 	var dataEntries []ManifestEntry
 	var newDataFiles []FileIndexEntry
@@ -475,7 +475,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// --- Manifest assembly + upload ---
-	ctx, metaSpan := twTracer.Start(ctx, "pg2iceberg.upload.metadata")
+	_, metaSpan := twTracer.Start(ctx, "pg2iceberg.upload.metadata")
 	// Data manifest and delete manifest are independent — upload in parallel.
 	// Manifest list references their URIs, so it uploads after.
 	type manifestUpload struct {
