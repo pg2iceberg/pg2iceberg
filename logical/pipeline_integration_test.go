@@ -120,7 +120,7 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 	// === Assertion 1: Snapshot data was written directly to materialized table ===
 	// The materialized table should have snapshot data. The events table should
 	// have NO snapshot data (snapshot bypasses events table).
-	matTm, err := cat.LoadTable("test_ns", "products")
+	matTm, err := cat.LoadTable(ctx, "test_ns", "products")
 	if err != nil {
 		t.Fatalf("load materialized table: %v", err)
 	}
@@ -162,13 +162,13 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 	// The materializer may need multiple cycles to process all 10 inserts.
 	expectedTotal := int64(snapshotRows + streamInserts)
 	waitFor(t, 30*time.Second, func() bool {
-		matTm, _ = cat.LoadTable("test_ns", "products")
+		matTm, _ = cat.LoadTable(ctx, "test_ns", "products")
 		return countDataRows(t, ctx, mem, matTm) >= expectedTotal
 	})
 	t.Logf("materializer committed %d times", len(cat.matCommits()))
 
 	// === Assertion 2: Materialized table now has snapshot + streaming rows ===
-	matTm, _ = cat.LoadTable("test_ns", "products")
+	matTm, _ = cat.LoadTable(ctx, "test_ns", "products")
 	matRows = countDataRows(t, ctx, mem, matTm)
 	if matRows != expectedTotal {
 		t.Errorf("materialized table: expected %d total rows (snapshot + streaming), got %d", expectedTotal, matRows)
@@ -195,7 +195,7 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 	// Total data rows across all files may include the old + new row,
 	// but the logical row count is unchanged. We verify the materializer
 	// produced delete files.
-	matTm, _ = cat.LoadTable("test_ns", "products")
+	matTm, _ = cat.LoadTable(ctx, "test_ns", "products")
 	hasDeletes := countDeleteFiles(t, ctx, mem, matTm) > 0
 	if !hasDeletes {
 		t.Error("expected equality delete files after updating a snapshotted row")
@@ -217,7 +217,7 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 	// After MoR: data files contain both old and new versions. The equality
 	// deletes logically remove old versions but the data files still contain them.
 	// We read ALL data file rows and apply delete dedup to get the logical view.
-	matTm, _ = cat.LoadTable("test_ns", "products")
+	matTm, _ = cat.LoadTable(ctx, "test_ns", "products")
 	allRows := readAllDataFileRows(t, ctx, mem, matTm)
 	t.Logf("total rows across all data files: %d", len(allRows))
 
@@ -1237,202 +1237,11 @@ func (c *trackingCatalog) matCommits() [][]string {
 	return result
 }
 
-// gatedEventBuffer wraps a real ChangeEventBuffer and blocks after the first
-// PushEvents call. This simulates the race where DrainAll fires between the
-// first and second PushEvents in Sink.Flush().
-type gatedEventBuffer struct {
-	buf         *logical.ChangeEventBuffer
-	pushCount   atomic.Int32
-	firstPushed chan struct{} // closed after first PushEvents completes
-	proceed     chan struct{} // test closes this to unblock second PushEvents
-}
-
-func newGatedEventBuffer(buf *logical.ChangeEventBuffer) *gatedEventBuffer {
-	return &gatedEventBuffer{
-		buf:         buf,
-		firstPushed: make(chan struct{}),
-		proceed:     make(chan struct{}),
-	}
-}
-
-func (g *gatedEventBuffer) PushEvents(pgTable string, events []logical.MatEvent, snapID int64) {
-	g.buf.PushEvents(pgTable, events, snapID)
-	if g.pushCount.Add(1) == 1 {
-		close(g.firstPushed) // signal: first table pushed
-		<-g.proceed          // block until test unblocks
-	}
-}
-
-// TestMaterializer_CrossTableAtomicCommit_RaceDrainAll verifies cross-table
-// atomicity when DrainAll fires between PushEvents calls — i.e., the
-// materializer gets one table from the buffer and the other from S3.
-//
-// Timeline:
-//  1. Sink flushes both events tables atomically to S3
-//  2. Sink calls PushEvents(table_A) → in buffer, then BLOCKS
-//  3. Materializer fires → DrainAll → gets only table_A
-//  4. Materializer prepares table_A from buffer, table_B from S3 fallback
-//  5. Materializer commits both atomically via CommitTransaction
-//  6. Test unblocks the gate
-func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	pgCfg, cleanup := startPostgres(t, ctx)
-	defer cleanup()
-
-	// Create two tables and a publication covering both.
-	conn, err := pgx.Connect(ctx, pgCfg.DSN())
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	_, err = conn.Exec(ctx, `
-		CREATE TABLE orders (
-			id SERIAL PRIMARY KEY,
-			amount INTEGER NOT NULL
-		);
-		CREATE TABLE payments (
-			id SERIAL PRIMARY KEY,
-			order_id INTEGER NOT NULL
-		);
-	`)
-	if err != nil {
-		t.Fatalf("create schema: %v", err)
-	}
-	conn.Close(ctx)
-
-	sinkCfg := config.SinkConfig{
-		FlushInterval:        "1s",
-		FlushRows:            5,
-		FlushBytes:           1 << 30,
-		Namespace:            "test_ns",
-		Warehouse:            "s3://test-bucket/",
-		MaterializerInterval: "200ms",
-	}
-
-	cfg := &config.Config{
-		Tables: []config.TableConfig{
-			{Name: "public.orders"},
-			{Name: "public.payments"},
-		},
-		Source: config.SourceConfig{
-			Mode:     "logical",
-			Postgres: pgCfg,
-			Logical: config.LogicalConfig{
-				PublicationName: "test_pub",
-				SlotName:        "test_slot_race",
-			},
-		},
-		Sink: sinkCfg,
-	}
-
-	mem := newMemStorage()
-	cat := newTrackingCatalog()
-
-	// Wire up: gated buffer wraps real buffer. Sink sees the gate (blocks
-	// between pushes), materializer sees the real buffer (can drain).
-	realBuf := logical.NewChangeEventBuffer()
-	gate := newGatedEventBuffer(realBuf)
-
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, gate)
-
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
-	p.SetEventBuf(realBuf) // materializer uses the real buffer directly
-
-	if err := p.Start(ctx); err != nil {
-		t.Fatalf("start pipeline: %v", err)
-	}
-	defer func() {
-		cancel()
-		<-p.Done()
-	}()
-
-	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-
-	if p.Source() == nil {
-		t.Fatal("pipeline source is not *LogicalSource")
-	}
-
-	// Insert rows into both tables in a single PG transaction.
-	conn, err = pgx.Connect(ctx, pgCfg.DSN())
-	if err != nil {
-		t.Fatalf("reconnect: %v", err)
-	}
-	defer conn.Close(ctx)
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-	for i := 0; i < 5; i++ {
-		if _, err := tx.Exec(ctx, "INSERT INTO orders (amount) VALUES ($1)", (i+1)*100); err != nil {
-			t.Fatalf("insert order: %v", err)
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO payments (order_id) VALUES ($1)", i+1); err != nil {
-			t.Fatalf("insert payment: %v", err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit tx: %v", err)
-	}
-
-	// Wait for the gate to fire — this means events are already committed
-	// to S3 (flushAllTables completed) and the first PushEvents went through.
-	// Sink.Flush() is now blocked waiting for the second PushEvents.
-	select {
-	case <-gate.firstPushed:
-		t.Log("gate: first PushEvents completed, second is blocked — events are on S3")
-	case <-time.After(30 * time.Second):
-		t.Fatal("timeout waiting for first PushEvents")
-	}
-
-	// The materializer is firing every 200ms. Wait for it to drain and
-	// commit while only one table is in the buffer.
-	waitFor(t, 30*time.Second, func() bool {
-		for _, tables := range cat.matCommits() {
-			if len(tables) >= 2 {
-				return true
-			}
-		}
-		return false
-	})
-
-	// Unblock the gate so the pipeline can continue.
-	close(gate.proceed)
-
-	// === Assertion: Both tables committed atomically despite the race ===
-	commits := cat.matCommits()
-	t.Logf("materialized CommitTransaction calls: %d", len(commits))
-	for i, tables := range commits {
-		t.Logf("  call %d: %v", i, tables)
-	}
-
-	found := false
-	for _, tables := range commits {
-		hasOrders := false
-		hasPayments := false
-		for _, tbl := range tables {
-			if tbl == "orders" {
-				hasOrders = true
-			}
-			if tbl == "payments" {
-				hasPayments = true
-			}
-		}
-		if hasOrders && hasPayments {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected a single CommitTransaction call with both 'orders' and 'payments', " +
-			"but they were committed separately — the DrainAll race breaks cross-table atomicity")
-	}
-}
+// Note: TestMaterializer_CrossTableAtomicCommit_RaceDrainAll was removed.
+// It tested a partial-drain race that is no longer possible with the WAL-based
+// ChangeEventBuffer (ReadAll/Ack/Rollback). Events are now consumed atomically
+// and only removed after the materializer commits, eliminating the need for S3
+// fallback during normal operation.
 
 func startPostgres(t *testing.T, ctx context.Context) (pgCfg config.PostgresConfig, cleanup func()) {
 	t.Helper()

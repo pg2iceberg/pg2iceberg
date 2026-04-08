@@ -115,15 +115,15 @@ func newMemCatalog() *memCatalog {
 	return &memCatalog{tables: make(map[string]*iceberg.TableMetadata)}
 }
 
-func (c *memCatalog) EnsureNamespace(ns string) error { return nil }
+func (c *memCatalog) EnsureNamespace(_ context.Context, ns string) error { return nil }
 
-func (c *memCatalog) LoadTable(ns, table string) (*iceberg.TableMetadata, error) {
+func (c *memCatalog) LoadTable(_ context.Context, ns, table string) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.tables[ns+"."+table], nil
 }
 
-func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
+func (c *memCatalog) CreateTable(_ context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := &iceberg.TableMetadata{}
@@ -133,7 +133,7 @@ func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, loc
 	return tm, nil
 }
 
-func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, sc iceberg.SnapshotCommit) error {
+func (c *memCatalog) CommitSnapshot(_ context.Context, ns, table string, currentSnapshotID int64, sc iceberg.SnapshotCommit) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := ns + "." + table
@@ -159,16 +159,16 @@ func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, s
 	return nil
 }
 
-func (c *memCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
+func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+func (c *memCatalog) EvolveSchema(_ context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
 }
 
