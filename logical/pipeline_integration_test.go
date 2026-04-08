@@ -1206,7 +1206,7 @@ func newTrackingCatalog() *trackingCatalog {
 	return &trackingCatalog{memCatalog: newMemCatalog()}
 }
 
-func (c *trackingCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
+func (c *trackingCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	var tables []string
 	for _, tc := range commits {
 		tables = append(tables, tc.Table)
@@ -1214,7 +1214,7 @@ func (c *trackingCatalog) CommitTransaction(ns string, commits []iceberg.TableCo
 	c.mu.Lock()
 	c.commitCalls = append(c.commitCalls, tables)
 	c.mu.Unlock()
-	return c.memCatalog.CommitTransaction(ns, commits)
+	return c.memCatalog.CommitTransaction(ctx, ns, commits)
 }
 
 // matCommits returns only the CommitTransaction calls that included at least
@@ -1538,16 +1538,16 @@ func newMemCatalog() *memCatalog {
 	}
 }
 
-func (c *memCatalog) EnsureNamespace(ns string) error { return nil }
+func (c *memCatalog) EnsureNamespace(_ context.Context, ns string) error { return nil }
 
-func (c *memCatalog) LoadTable(ns, table string) (*iceberg.TableMetadata, error) {
+func (c *memCatalog) LoadTable(_ context.Context, ns, table string) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := c.tables[ns+"."+table]
 	return tm, nil
 }
 
-func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
+func (c *memCatalog) CreateTable(_ context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := &iceberg.TableMetadata{}
@@ -1557,7 +1557,7 @@ func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, loc
 	return tm, nil
 }
 
-func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot iceberg.SnapshotCommit) error {
+func (c *memCatalog) CommitSnapshot(_ context.Context, ns, table string, currentSnapshotID int64, snapshot iceberg.SnapshotCommit) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := ns + "." + table
@@ -1586,16 +1586,16 @@ func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, s
 	return nil
 }
 
-func (c *memCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
+func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+func (c *memCatalog) EvolveSchema(_ context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
 }
 
@@ -1615,13 +1615,13 @@ func newFailOnceCatalog() *failOnceCatalog {
 	}
 }
 
-func (c *failOnceCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
+func (c *failOnceCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	n := c.commitCalls.Add(1)
 	if n == 1 {
 		c.once.Do(func() { close(c.failedCh) })
 		return fmt.Errorf("simulated catalog failure")
 	}
-	return c.memCatalog.CommitTransaction(ns, commits)
+	return c.memCatalog.CommitTransaction(ctx, ns, commits)
 }
 
 // --- Retry test doubles and helpers ---
@@ -1671,7 +1671,7 @@ func newFailNTimesCatalog(n int) *failNTimesCatalog {
 	}
 }
 
-func (c *failNTimesCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
+func (c *failNTimesCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	call := int(c.commitCalls.Add(1))
 	if call <= c.failCount {
 		if call == c.failCount {
@@ -1679,7 +1679,7 @@ func (c *failNTimesCatalog) CommitTransaction(ns string, commits []iceberg.Table
 		}
 		return fmt.Errorf("simulated catalog failure (attempt %d)", call)
 	}
-	return c.memCatalog.CommitTransaction(ns, commits)
+	return c.memCatalog.CommitTransaction(ctx, ns, commits)
 }
 
 func newTestPipelineCfg(pgCfg config.PostgresConfig, slotName string) (*config.Config, config.SinkConfig) {
