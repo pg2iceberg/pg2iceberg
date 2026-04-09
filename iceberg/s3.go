@@ -14,6 +14,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -43,6 +44,13 @@ func s3SpanName(op, key string) string {
 	return op + " " + path.Base(key)
 }
 
+// ObjectInfo describes an S3 object returned by ListObjects.
+type ObjectInfo struct {
+	Key          string
+	LastModified time.Time
+	Size         int64
+}
+
 // ObjectStorage abstracts file upload and download operations.
 type ObjectStorage interface {
 	Upload(ctx context.Context, key string, data []byte) (string, error)
@@ -55,6 +63,10 @@ type ObjectStorage interface {
 	// URIForKey returns the full URI for a key without uploading.
 	// Enables building manifests that reference files before they're uploaded.
 	URIForKey(key string) string
+	// ListObjects lists all objects under a key prefix.
+	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
+	// DeleteObjects deletes the specified keys. Silently ignores keys that don't exist.
+	DeleteObjects(ctx context.Context, keys []string) error
 }
 
 // S3Client wraps the S3 SDK for uploading and downloading files.
@@ -217,6 +229,90 @@ func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
 		return 0, fmt.Errorf("head %s: %w", key, err)
 	}
 	return *out.ContentLength, nil
+}
+
+// ListObjects lists all objects under a key prefix using pagination.
+func (c *S3Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	ctx, span := s3tracer.Start(ctx, "s3.ListObjects "+prefix, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("s3.prefix", prefix),
+		semconv.PeerService("s3"),
+	))
+	defer span.End()
+
+	start := time.Now()
+	paginator := s3.NewListObjectsV2Paginator(c.client, &s3.ListObjectsV2Input{
+		Bucket: &c.bucket,
+		Prefix: &prefix,
+	})
+
+	var objects []ObjectInfo
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			pipeline.S3OperationDurationSeconds.WithLabelValues("list").Observe(time.Since(start).Seconds())
+			pipeline.S3ErrorsTotal.WithLabelValues("list").Inc()
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, fmt.Errorf("list objects prefix %s: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			objects = append(objects, ObjectInfo{
+				Key:          aws.ToString(obj.Key),
+				LastModified: aws.ToTime(obj.LastModified),
+				Size:         aws.ToInt64(obj.Size),
+			})
+		}
+	}
+
+	pipeline.S3OperationDurationSeconds.WithLabelValues("list").Observe(time.Since(start).Seconds())
+	span.SetAttributes(attribute.Int("s3.object_count", len(objects)))
+	return objects, nil
+}
+
+// DeleteObjects deletes the specified keys in batches of 1000.
+func (c *S3Client) DeleteObjects(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	ctx, span := s3tracer.Start(ctx, "s3.DeleteObjects", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.Int("s3.delete_count", len(keys)),
+		semconv.PeerService("s3"),
+	))
+	defer span.End()
+
+	start := time.Now()
+	const batchSize = 1000
+	for i := 0; i < len(keys); i += batchSize {
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[i:end]
+
+		objects := make([]s3types.ObjectIdentifier, len(batch))
+		for j, k := range batch {
+			objects[j] = s3types.ObjectIdentifier{Key: aws.String(k)}
+		}
+
+		_, err := c.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: &c.bucket,
+			Delete: &s3types.Delete{
+				Objects: objects,
+				Quiet:   aws.Bool(true),
+			},
+		})
+		if err != nil {
+			pipeline.S3OperationDurationSeconds.WithLabelValues("delete").Observe(time.Since(start).Seconds())
+			pipeline.S3ErrorsTotal.WithLabelValues("delete").Inc()
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return fmt.Errorf("delete objects batch: %w", err)
+		}
+	}
+
+	pipeline.S3OperationDurationSeconds.WithLabelValues("delete").Observe(time.Since(start).Seconds())
+	return nil
 }
 
 // S3ReaderAt implements io.ReaderAt using S3 range reads.
