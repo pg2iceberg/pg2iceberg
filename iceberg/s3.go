@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"golang.org/x/sync/errgroup"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -269,7 +270,7 @@ func (c *S3Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo
 	return objects, nil
 }
 
-// DeleteObjects deletes the specified keys in batches of 1000.
+// DeleteObjects deletes the specified keys in batches of 1000, parallelized.
 func (c *S3Client) DeleteObjects(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
@@ -283,32 +284,32 @@ func (c *S3Client) DeleteObjects(ctx context.Context, keys []string) error {
 
 	start := time.Now()
 	const batchSize = 1000
+
+	g, gctx := errgroup.WithContext(ctx)
 	for i := 0; i < len(keys); i += batchSize {
-		end := i + batchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-		batch := keys[i:end]
-
-		objects := make([]s3types.ObjectIdentifier, len(batch))
-		for j, k := range batch {
-			objects[j] = s3types.ObjectIdentifier{Key: aws.String(k)}
-		}
-
-		_, err := c.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: &c.bucket,
-			Delete: &s3types.Delete{
-				Objects: objects,
-				Quiet:   aws.Bool(true),
-			},
+		batch := keys[i:min(i+batchSize, len(keys))]
+		g.Go(func() error {
+			objects := make([]s3types.ObjectIdentifier, len(batch))
+			for j, k := range batch {
+				objects[j] = s3types.ObjectIdentifier{Key: aws.String(k)}
+			}
+			_, err := c.client.DeleteObjects(gctx, &s3.DeleteObjectsInput{
+				Bucket: &c.bucket,
+				Delete: &s3types.Delete{
+					Objects: objects,
+					Quiet:   aws.Bool(true),
+				},
+			})
+			return err
 		})
-		if err != nil {
-			pipeline.S3OperationDurationSeconds.WithLabelValues("delete").Observe(time.Since(start).Seconds())
-			pipeline.S3ErrorsTotal.WithLabelValues("delete").Inc()
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			return fmt.Errorf("delete objects batch: %w", err)
-		}
+	}
+
+	if err := g.Wait(); err != nil {
+		pipeline.S3OperationDurationSeconds.WithLabelValues("delete").Observe(time.Since(start).Seconds())
+		pipeline.S3ErrorsTotal.WithLabelValues("delete").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return fmt.Errorf("delete objects: %w", err)
 	}
 
 	pipeline.S3OperationDurationSeconds.WithLabelValues("delete").Observe(time.Since(start).Seconds())
