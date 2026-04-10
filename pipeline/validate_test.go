@@ -118,6 +118,19 @@ func TestValidateStartup(t *testing.T) {
 			wantErr: "table \"orders\" has no snapshots",
 		},
 		{
+			name: "snapshot complete but events table has no snapshots is ok",
+			v: StartupValidation{
+				Checkpoint: &Checkpoint{Mode: "logical", LSN: 1000, SnapshotComplete: true},
+				Tables: []TableExistence{
+					table("orders", true, 5, 3),
+					table("orders_events", true, 0, 0),
+				},
+				Slot:       &SlotState{Exists: true, RestartLSN: 900},
+				ConfigMode: "logical",
+				SlotName:   "test_slot",
+			},
+		},
+		{
 			name: "snapshot in progress (crash recovery) is valid",
 			v: StartupValidation{
 				Checkpoint: &Checkpoint{
