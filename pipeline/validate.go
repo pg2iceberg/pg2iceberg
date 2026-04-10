@@ -113,9 +113,11 @@ func ValidateStartup(v StartupValidation) error {
 	}
 
 	// 8. Checkpoint says snapshot complete but table has no snapshots.
+	// Events tables are expected to be empty after snapshot (they only receive
+	// data once CDC streaming begins), so skip them.
 	if !fresh && cp.SnapshotComplete {
 		for _, t := range v.Tables {
-			if t.Existed && t.SnapshotID == 0 {
+			if t.Existed && t.SnapshotID == 0 && !strings.HasSuffix(t.IcebergName, "_events") {
 				errs = append(errs, fmt.Sprintf(
 					"checkpoint says snapshot is complete but table %q has no snapshots; "+
 						"table may have been recreated externally; "+
