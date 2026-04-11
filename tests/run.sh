@@ -213,6 +213,7 @@ sink:
 
 state:
   path: ${state_path}
+  coordinator_schema: _pg2iceberg_${table}
 YAML
 }
 

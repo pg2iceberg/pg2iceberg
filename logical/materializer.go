@@ -36,6 +36,11 @@ type Materializer struct {
 
 	// Per-table TableWriter for the shared write path (serialize → upload → manifest → commit).
 	tableWriters map[string]*iceberg.TableWriter
+
+	// cycleMu serializes materializeCycle calls. Prevents the periodic Run()
+	// goroutine and the shutdown MaterializeAll() from processing the same
+	// events concurrently (which would cause duplicate rows).
+	cycleMu sync.Mutex
 }
 
 // InvalidateFileIndices is a no-op. The SnapshotWriter now seeds the FileIndex
@@ -120,6 +125,9 @@ func (m *Materializer) Run(ctx context.Context) {
 // then commits atomically. Recovery is automatic: if the cursor was not
 // advanced, the next cycle re-reads the same entries.
 func (m *Materializer) materializeCycle(ctx context.Context) error {
+	m.cycleMu.Lock()
+	defer m.cycleMu.Unlock()
+
 	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize")
 	defer span.End()
 

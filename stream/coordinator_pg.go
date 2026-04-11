@@ -3,21 +3,33 @@ package stream
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const defaultSchema = "_pg2iceberg"
+
 // PgCoordinator implements Coordinator using PostgreSQL.
-// All state is stored under the _pg2iceberg schema in the source database.
+// All state is stored under a configurable schema (default: _pg2iceberg).
 type PgCoordinator struct {
 	pool    *pgxpool.Pool
+	schema  string
 	lockTTL time.Duration
 }
 
 // NewPgCoordinator creates a Coordinator backed by the given PostgreSQL DSN.
+// Uses the default schema "_pg2iceberg".
 func NewPgCoordinator(ctx context.Context, dsn string) (*PgCoordinator, error) {
+	return NewPgCoordinatorWithSchema(ctx, dsn, defaultSchema)
+}
+
+// NewPgCoordinatorWithSchema creates a Coordinator with a custom schema name.
+// This is useful when multiple pg2iceberg instances share the same database
+// (e.g. parallel e2e tests).
+func NewPgCoordinatorWithSchema(ctx context.Context, dsn, schema string) (*PgCoordinator, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect to coordinator: %w", err)
@@ -26,29 +38,37 @@ func NewPgCoordinator(ctx context.Context, dsn string) (*PgCoordinator, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping coordinator: %w", err)
 	}
-	return &PgCoordinator{pool: pool, lockTTL: 30 * time.Second}, nil
+	if schema == "" {
+		schema = defaultSchema
+	}
+	return &PgCoordinator{pool: pool, schema: schema, lockTTL: 30 * time.Second}, nil
 }
 
 // NewPgCoordinatorFromPool creates a Coordinator using an existing connection pool.
 func NewPgCoordinatorFromPool(pool *pgxpool.Pool) *PgCoordinator {
-	return &PgCoordinator{pool: pool, lockTTL: 30 * time.Second}
+	return &PgCoordinator{pool: pool, schema: defaultSchema, lockTTL: 30 * time.Second}
 }
 
 func (c *PgCoordinator) Close() { c.pool.Close() }
 
-// Migrate creates the coordination tables if they don't exist.
+// q qualifies a table name with the schema prefix.
+func (c *PgCoordinator) q(table string) string {
+	return c.schema + "." + table
+}
+
+// Migrate creates the schema and coordination tables if they don't exist.
 func (c *PgCoordinator) Migrate(ctx context.Context) error {
-	_, err := c.pool.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS _pg2iceberg`)
+	_, err := c.pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, c.schema))
 	if err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
 
 	for _, ddl := range []string{
-		`CREATE TABLE IF NOT EXISTS _pg2iceberg.log_seq (
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			table_name  TEXT PRIMARY KEY,
 			next_offset BIGINT NOT NULL DEFAULT 0
-		)`,
-		`CREATE TABLE IF NOT EXISTS _pg2iceberg.log_index (
+		)`, c.q("log_seq")),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			table_name   TEXT   NOT NULL,
 			end_offset   BIGINT NOT NULL,
 			start_offset BIGINT NOT NULL,
@@ -57,17 +77,17 @@ func (c *PgCoordinator) Migrate(ctx context.Context) error {
 			byte_size    BIGINT NOT NULL,
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (table_name, end_offset)
-		)`,
-		`CREATE TABLE IF NOT EXISTS _pg2iceberg.mat_cursor (
+		)`, c.q("log_index")),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			table_name     TEXT PRIMARY KEY,
 			last_offset    BIGINT NOT NULL DEFAULT -1,
 			last_committed TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`,
-		`CREATE TABLE IF NOT EXISTS _pg2iceberg.lock (
+		)`, c.q("mat_cursor")),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			table_name TEXT PRIMARY KEY,
 			worker_id  TEXT NOT NULL,
 			expires_at TIMESTAMPTZ NOT NULL
-		)`,
+		)`, c.q("lock")),
 	} {
 		if _, err := c.pool.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("migrate coordination tables: %w", err)
@@ -85,7 +105,6 @@ func (c *PgCoordinator) ClaimOffsets(ctx context.Context, appends []LogAppend) (
 	entries := make([]LogEntry, len(appends))
 
 	err := pgx.BeginTxFunc(ctx, c.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		// Collect per-table record counts for batch offset claiming.
 		type tableOffset struct {
 			totalRecords int
 			startOffset  int64
@@ -100,32 +119,26 @@ func (c *PgCoordinator) ClaimOffsets(ctx context.Context, appends []LogAppend) (
 			to.totalRecords += a.RecordCount
 		}
 
-		// Claim offset ranges per table.
 		for table, to := range tableOffsets {
-			// Ensure log_seq row exists.
 			_, err := tx.Exec(ctx,
-				`INSERT INTO _pg2iceberg.log_seq (table_name, next_offset)
-				 VALUES ($1, 0) ON CONFLICT DO NOTHING`, table)
+				fmt.Sprintf(`INSERT INTO %s (table_name, next_offset)
+				 VALUES ($1, 0) ON CONFLICT DO NOTHING`, c.q("log_seq")), table)
 			if err != nil {
 				return fmt.Errorf("ensure log_seq for %s: %w", table, err)
 			}
 
-			// Atomic increment: returns the NEW value after adding totalRecords.
 			var newOffset int64
 			err = tx.QueryRow(ctx,
-				`UPDATE _pg2iceberg.log_seq
+				fmt.Sprintf(`UPDATE %s
 				 SET next_offset = next_offset + $2
 				 WHERE table_name = $1
-				 RETURNING next_offset`, table, to.totalRecords).Scan(&newOffset)
+				 RETURNING next_offset`, c.q("log_seq")), table, to.totalRecords).Scan(&newOffset)
 			if err != nil {
 				return fmt.Errorf("claim offsets for %s: %w", table, err)
 			}
-			// start_offset = newOffset - totalRecords
 			to.startOffset = newOffset - int64(to.totalRecords)
 		}
 
-		// Assign offset ranges to each append and insert log index entries.
-		// Track running offset per table.
 		running := make(map[string]int64)
 		for table, to := range tableOffsets {
 			running[table] = to.startOffset
@@ -137,9 +150,9 @@ func (c *PgCoordinator) ClaimOffsets(ctx context.Context, appends []LogAppend) (
 			running[a.Table] = end
 
 			_, err := tx.Exec(ctx,
-				`INSERT INTO _pg2iceberg.log_index
+				fmt.Sprintf(`INSERT INTO %s
 				 (table_name, end_offset, start_offset, s3_path, record_count, byte_size)
-				 VALUES ($1, $2, $3, $4, $5, $6)`,
+				 VALUES ($1, $2, $3, $4, $5, $6)`, c.q("log_index")),
 				a.Table, end, start, a.S3Path, a.RecordCount, a.ByteSize)
 			if err != nil {
 				return fmt.Errorf("insert log entry for %s: %w", a.Table, err)
@@ -167,10 +180,10 @@ func (c *PgCoordinator) ClaimOffsets(ctx context.Context, appends []LogAppend) (
 // ReadLog returns log entries with end_offset > afterOffset, ordered ascending.
 func (c *PgCoordinator) ReadLog(ctx context.Context, table string, afterOffset int64) ([]LogEntry, error) {
 	rows, err := c.pool.Query(ctx,
-		`SELECT table_name, start_offset, end_offset, s3_path, record_count, byte_size, created_at
-		 FROM _pg2iceberg.log_index
+		fmt.Sprintf(`SELECT table_name, start_offset, end_offset, s3_path, record_count, byte_size, created_at
+		 FROM %s
 		 WHERE table_name = $1 AND end_offset > $2
-		 ORDER BY end_offset ASC`, table, afterOffset)
+		 ORDER BY end_offset ASC`, c.q("log_index")), table, afterOffset)
 	if err != nil {
 		return nil, fmt.Errorf("read log for %s: %w", table, err)
 	}
@@ -191,9 +204,9 @@ func (c *PgCoordinator) ReadLog(ctx context.Context, table string, afterOffset i
 // TruncateLog deletes entries with end_offset <= offset and returns their S3 paths.
 func (c *PgCoordinator) TruncateLog(ctx context.Context, table string, offset int64) ([]string, error) {
 	rows, err := c.pool.Query(ctx,
-		`DELETE FROM _pg2iceberg.log_index
+		fmt.Sprintf(`DELETE FROM %s
 		 WHERE table_name = $1 AND end_offset <= $2
-		 RETURNING s3_path`, table, offset)
+		 RETURNING s3_path`, c.q("log_index")), table, offset)
 	if err != nil {
 		return nil, fmt.Errorf("truncate log for %s: %w", table, err)
 	}
@@ -213,8 +226,8 @@ func (c *PgCoordinator) TruncateLog(ctx context.Context, table string, offset in
 // EnsureCursor creates a cursor row if it doesn't exist.
 func (c *PgCoordinator) EnsureCursor(ctx context.Context, table string) error {
 	_, err := c.pool.Exec(ctx,
-		`INSERT INTO _pg2iceberg.mat_cursor (table_name, last_offset)
-		 VALUES ($1, -1) ON CONFLICT DO NOTHING`, table)
+		fmt.Sprintf(`INSERT INTO %s (table_name, last_offset)
+		 VALUES ($1, -1) ON CONFLICT DO NOTHING`, c.q("mat_cursor")), table)
 	if err != nil {
 		return fmt.Errorf("ensure cursor for %s: %w", table, err)
 	}
@@ -225,7 +238,7 @@ func (c *PgCoordinator) EnsureCursor(ctx context.Context, table string) error {
 func (c *PgCoordinator) GetCursor(ctx context.Context, table string) (int64, error) {
 	var offset int64
 	err := c.pool.QueryRow(ctx,
-		`SELECT last_offset FROM _pg2iceberg.mat_cursor WHERE table_name = $1`,
+		fmt.Sprintf(`SELECT last_offset FROM %s WHERE table_name = $1`, c.q("mat_cursor")),
 		table).Scan(&offset)
 	if err == pgx.ErrNoRows {
 		return -1, nil
@@ -239,9 +252,9 @@ func (c *PgCoordinator) GetCursor(ctx context.Context, table string) (int64, err
 // SetCursor updates the materializer cursor.
 func (c *PgCoordinator) SetCursor(ctx context.Context, table string, offset int64) error {
 	_, err := c.pool.Exec(ctx,
-		`UPDATE _pg2iceberg.mat_cursor
+		fmt.Sprintf(`UPDATE %s
 		 SET last_offset = $2, last_committed = now()
-		 WHERE table_name = $1`, table, offset)
+		 WHERE table_name = $1`, c.q("mat_cursor")), table, offset)
 	if err != nil {
 		return fmt.Errorf("set cursor for %s: %w", table, err)
 	}
@@ -250,19 +263,17 @@ func (c *PgCoordinator) SetCursor(ctx context.Context, table string, offset int6
 
 // TryLock attempts to acquire a heartbeat lock. Expired locks are reclaimed.
 func (c *PgCoordinator) TryLock(ctx context.Context, table, workerID string, ttl time.Duration) (bool, error) {
-	// Expire stale locks.
 	_, err := c.pool.Exec(ctx,
-		`DELETE FROM _pg2iceberg.lock WHERE table_name = $1 AND expires_at < now()`,
+		fmt.Sprintf(`DELETE FROM %s WHERE table_name = $1 AND expires_at < now()`, c.q("lock")),
 		table)
 	if err != nil {
 		return false, fmt.Errorf("expire lock for %s: %w", table, err)
 	}
 
-	// Attempt to acquire.
 	ct, err := c.pool.Exec(ctx,
-		`INSERT INTO _pg2iceberg.lock (table_name, worker_id, expires_at)
+		fmt.Sprintf(`INSERT INTO %s (table_name, worker_id, expires_at)
 		 VALUES ($1, $2, now() + $3::interval)
-		 ON CONFLICT DO NOTHING`,
+		 ON CONFLICT DO NOTHING`, c.q("lock")),
 		table, workerID, fmt.Sprintf("%d seconds", int(ttl.Seconds())))
 	if err != nil {
 		return false, fmt.Errorf("acquire lock for %s: %w", table, err)
@@ -273,9 +284,9 @@ func (c *PgCoordinator) TryLock(ctx context.Context, table, workerID string, ttl
 // RenewLock extends the lock TTL. Returns false if the lock was lost.
 func (c *PgCoordinator) RenewLock(ctx context.Context, table, workerID string, ttl time.Duration) (bool, error) {
 	ct, err := c.pool.Exec(ctx,
-		`UPDATE _pg2iceberg.lock
+		fmt.Sprintf(`UPDATE %s
 		 SET expires_at = now() + $3::interval
-		 WHERE table_name = $1 AND worker_id = $2`,
+		 WHERE table_name = $1 AND worker_id = $2`, c.q("lock")),
 		table, workerID, fmt.Sprintf("%d seconds", int(ttl.Seconds())))
 	if err != nil {
 		return false, fmt.Errorf("renew lock for %s: %w", table, err)
@@ -286,10 +297,20 @@ func (c *PgCoordinator) RenewLock(ctx context.Context, table, workerID string, t
 // ReleaseLock releases a held lock. No-op if not held by this worker.
 func (c *PgCoordinator) ReleaseLock(ctx context.Context, table, workerID string) error {
 	_, err := c.pool.Exec(ctx,
-		`DELETE FROM _pg2iceberg.lock WHERE table_name = $1 AND worker_id = $2`,
+		fmt.Sprintf(`DELETE FROM %s WHERE table_name = $1 AND worker_id = $2`, c.q("lock")),
 		table, workerID)
 	if err != nil {
 		return fmt.Errorf("release lock for %s: %w", table, err)
 	}
 	return nil
+}
+
+// sanitizeSchema removes characters that aren't valid in a PG identifier.
+func sanitizeSchema(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, strings.ToLower(s))
 }

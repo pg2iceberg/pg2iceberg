@@ -282,8 +282,9 @@ func (s SinkConfig) FlushDuration() time.Duration {
 }
 
 type StateConfig struct {
-	Path        string `yaml:"path" json:"path,omitempty"`
-	PostgresURL string `yaml:"postgres_url" json:"postgres_url,omitempty"`
+	Path              string `yaml:"path" json:"path,omitempty"`
+	PostgresURL       string `yaml:"postgres_url" json:"postgres_url,omitempty"`
+	CoordinatorSchema string `yaml:"coordinator_schema" json:"coordinator_schema,omitempty"` // default: _pg2iceberg
 }
 
 // TableNames returns the list of table names from the top-level config.

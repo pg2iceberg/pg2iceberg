@@ -59,7 +59,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 	}
 
 	// Create coordinator using source PG DSN.
-	coord, err := stream.NewPgCoordinator(ctx, cfg.Source.Postgres.DSN())
+	coord, err := stream.NewPgCoordinatorWithSchema(ctx, cfg.Source.Postgres.DSN(), cfg.State.CoordinatorSchema)
 	if err != nil {
 		cpStore.Close()
 		return nil, fmt.Errorf("create coordinator: %w", err)
