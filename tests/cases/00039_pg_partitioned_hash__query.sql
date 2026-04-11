@@ -1,0 +1,1 @@
+SELECT id, name, score FROM iceberg.`default.e2e_pg_part_hash` ORDER BY id

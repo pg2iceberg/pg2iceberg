@@ -304,6 +304,81 @@ func TestDiscoverSchema_CompositePK(t *testing.T) {
 	}
 }
 
+// TestDiscoverSchema_PartitionedTable verifies that DiscoverSchema correctly
+// detects partitioned tables (relkind = 'p') and regular tables (relkind = 'r').
+func TestDiscoverSchema_PartitionedTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	// Create a partitioned table with child partitions.
+	_, err := conn.Exec(ctx, `
+		CREATE TABLE public.orders (
+			id         INTEGER NOT NULL,
+			created_at DATE NOT NULL,
+			name       TEXT,
+			PRIMARY KEY (id, created_at)
+		) PARTITION BY RANGE (created_at);
+
+		CREATE TABLE public.orders_2024 PARTITION OF public.orders
+			FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+		CREATE TABLE public.orders_2025 PARTITION OF public.orders
+			FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+	`)
+	if err != nil {
+		t.Fatalf("create partitioned table: %v", err)
+	}
+
+	// Create a regular (non-partitioned) table for comparison.
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE public.users (
+			id   SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create regular table: %v", err)
+	}
+
+	// Discover partitioned table — should have Partitioned = true.
+	tsPartitioned, err := postgres.DiscoverSchema(ctx, conn, "public.orders")
+	if err != nil {
+		t.Fatalf("discover partitioned schema: %v", err)
+	}
+	if !tsPartitioned.Partitioned {
+		t.Error("expected Partitioned=true for partitioned table, got false")
+	}
+
+	// Columns, PK should still be discovered correctly.
+	if len(tsPartitioned.Columns) != 3 {
+		t.Errorf("expected 3 columns for partitioned table, got %d", len(tsPartitioned.Columns))
+	}
+	wantPK := []string{"id", "created_at"}
+	if len(tsPartitioned.PK) != len(wantPK) {
+		t.Fatalf("PK = %v, want %v", tsPartitioned.PK, wantPK)
+	}
+	for i, pk := range tsPartitioned.PK {
+		if pk != wantPK[i] {
+			t.Errorf("PK[%d] = %q, want %q", i, pk, wantPK[i])
+		}
+	}
+
+	// Discover regular table — should have Partitioned = false.
+	tsRegular, err := postgres.DiscoverSchema(ctx, conn, "public.users")
+	if err != nil {
+		t.Fatalf("discover regular schema: %v", err)
+	}
+	if tsRegular.Partitioned {
+		t.Error("expected Partitioned=false for regular table, got true")
+	}
+}
+
 // TestDiscoverSchema_DecimalTruncation verifies that Validate() rejects
 // tables with numeric precision exceeding Iceberg's limit of 38.
 func TestDiscoverSchema_DecimalTruncation(t *testing.T) {

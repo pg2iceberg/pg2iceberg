@@ -180,6 +180,7 @@ type TableSchema struct {
 	Columns             []Column
 	PK                  []string // primary key column names
 	ReplicaIdentityFull bool     // true if table uses REPLICA IDENTITY FULL
+	Partitioned         bool     // true if table uses declarative partitioning (relkind = 'p')
 }
 
 // PKFieldIDs returns the Iceberg field IDs corresponding to primary key columns.
@@ -272,13 +273,14 @@ func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSc
 		ts.PK = append(ts.PK, pkCol)
 	}
 
-	// Discover replica identity.
-	var relReplIdent byte
+	// Discover replica identity and partitioning status.
+	var relReplIdent, relKind byte
 	err = conn.QueryRow(ctx,
-		`SELECT relreplident FROM pg_class WHERE oid = $1::regclass`, table,
-	).Scan(&relReplIdent)
-	if err == nil && relReplIdent == 'f' {
-		ts.ReplicaIdentityFull = true
+		`SELECT relreplident, relkind FROM pg_class WHERE oid = $1::regclass`, table,
+	).Scan(&relReplIdent, &relKind)
+	if err == nil {
+		ts.ReplicaIdentityFull = relReplIdent == 'f'
+		ts.Partitioned = relKind == 'p'
 	}
 
 	return ts, nil
