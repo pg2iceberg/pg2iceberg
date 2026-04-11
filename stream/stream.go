@@ -10,24 +10,43 @@ import (
 )
 
 // Stream is an append-only distributed log for staging WAL change events.
-// It combines S3 storage (for Parquet data) with a Coordinator (for atomic
-// offset assignment and indexing). Replaces the Iceberg events table.
-//
 // Writers call Append to stage files. Readers call Read + Download to consume.
 // No Iceberg catalog operations are on the write path.
-type Stream struct {
-	coord     Coordinator
-	s3        iceberg.ObjectStorage
-	namespace string // Iceberg namespace (e.g. "rideshare")
+//
+// Two implementations exist:
+//   - BaseStream: uploads to S3, downloads from S3 (for multi-process / materializer-only mode)
+//   - CachedStream: same, but caches recent data in memory (for combined mode — avoids S3 round-trip)
+type Stream interface {
+	// Append stages Parquet files to S3 and atomically registers them in the log.
+	Append(ctx context.Context, batches []WriteBatch) error
+
+	// Read returns log entries after the given offset for a table.
+	Read(ctx context.Context, table string, afterOffset int64) ([]LogEntry, error)
+
+	// Download fetches a staged Parquet file (from cache or S3).
+	Download(ctx context.Context, s3Path string) ([]byte, error)
+
+	// Truncate removes processed log entries and deletes their S3 files.
+	Truncate(ctx context.Context, table string, atOrBeforeOffset int64) error
+
+	// Coordinator returns the underlying coordinator for direct cursor/lock access.
+	Coordinator() Coordinator
 }
 
-// NewStream creates a Stream backed by the given coordinator and S3 client.
-func NewStream(coord Coordinator, s3 iceberg.ObjectStorage, namespace string) *Stream {
-	return &Stream{coord: coord, s3: s3, namespace: namespace}
+// BaseStream is the standard Stream implementation that always reads from S3.
+type BaseStream struct {
+	coord     Coordinator
+	s3        iceberg.ObjectStorage
+	namespace string
+}
+
+// NewStream creates a BaseStream backed by the given coordinator and S3 client.
+func NewStream(coord Coordinator, s3 iceberg.ObjectStorage, namespace string) *BaseStream {
+	return &BaseStream{coord: coord, s3: s3, namespace: namespace}
 }
 
 // Coordinator returns the underlying coordinator for direct cursor/lock access.
-func (s *Stream) Coordinator() Coordinator { return s.coord }
+func (s *BaseStream) Coordinator() Coordinator { return s.coord }
 
 // WriteBatch is a Parquet file chunk to stage in S3.
 type WriteBatch struct {
@@ -43,7 +62,7 @@ type WriteBatch struct {
 //
 // If step 2 fails, orphan S3 files are left behind but never indexed.
 // A periodic GC can clean these up.
-func (s *Stream) Append(ctx context.Context, batches []WriteBatch) error {
+func (s *BaseStream) Append(ctx context.Context, batches []WriteBatch) error {
 	if len(batches) == 0 {
 		return nil
 	}
@@ -94,17 +113,17 @@ func (s *Stream) Append(ctx context.Context, batches []WriteBatch) error {
 
 // Read returns log entries after the given offset for a table.
 // Use Coordinator().GetCursor() to obtain the current offset.
-func (s *Stream) Read(ctx context.Context, table string, afterOffset int64) ([]LogEntry, error) {
+func (s *BaseStream) Read(ctx context.Context, table string, afterOffset int64) ([]LogEntry, error) {
 	return s.coord.ReadLog(ctx, table, afterOffset)
 }
 
 // Download fetches a staged Parquet file from S3.
-func (s *Stream) Download(ctx context.Context, s3Path string) ([]byte, error) {
+func (s *BaseStream) Download(ctx context.Context, s3Path string) ([]byte, error) {
 	return s.s3.Download(ctx, s3Path)
 }
 
 // Truncate removes processed log entries and deletes their S3 files.
-func (s *Stream) Truncate(ctx context.Context, table string, atOrBeforeOffset int64) error {
+func (s *BaseStream) Truncate(ctx context.Context, table string, atOrBeforeOffset int64) error {
 	paths, err := s.coord.TruncateLog(ctx, table, atOrBeforeOffset)
 	if err != nil {
 		return err

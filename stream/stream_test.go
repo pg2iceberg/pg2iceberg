@@ -13,8 +13,9 @@ import (
 
 // memStorage is a minimal in-memory ObjectStorage for testing.
 type memStorage struct {
-	mu    sync.Mutex
-	files map[string][]byte
+	mu           sync.Mutex
+	files        map[string][]byte
+	downloadLog  []string // tracks Download calls for assertions
 }
 
 func newMemStorage() *memStorage {
@@ -37,11 +38,26 @@ func (m *memStorage) Upload(_ context.Context, key string, data []byte) (string,
 func (m *memStorage) Download(_ context.Context, key string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.downloadLog = append(m.downloadLog, key)
 	data, ok := m.files[key]
 	if !ok {
 		return nil, fmt.Errorf("not found: %s", key)
 	}
 	return data, nil
+}
+
+func (m *memStorage) downloads() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([]string, len(m.downloadLog))
+	copy(cp, m.downloadLog)
+	return cp
+}
+
+func (m *memStorage) resetDownloadLog() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.downloadLog = nil
 }
 
 func (m *memStorage) DownloadRange(_ context.Context, key string, offset, length int64) ([]byte, error) {
@@ -515,5 +531,168 @@ func TestCoordinator_ClaimOffsetsContiguous(t *testing.T) {
 	// users: first claim, [0,7).
 	if entries[1].StartOffset != 0 || entries[1].EndOffset != 7 {
 		t.Errorf("claim 3[1]: got [%d, %d), want [0, 7)", entries[1].StartOffset, entries[1].EndOffset)
+	}
+}
+
+// --- CachedStream tests ---
+
+func TestCachedStream_DownloadServesFromCache(t *testing.T) {
+	ctx := context.Background()
+	coord := NewMemCoordinator()
+	s3 := newMemStorage()
+	cs := NewCachedStream(coord, s3, "test_ns")
+
+	// Append data.
+	err := cs.Append(ctx, []WriteBatch{
+		{Table: "public.orders", Data: []byte("cached-data"), RecordCount: 5},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Read log entries to get the S3 path.
+	entries, err := cs.Read(ctx, "public.orders", -1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+
+	// Reset S3 download log.
+	s3.resetDownloadLog()
+
+	// Download should serve from cache — zero S3 downloads.
+	data, err := cs.Download(ctx, entries[0].S3Path)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if string(data) != "cached-data" {
+		t.Errorf("data: got %q, want %q", string(data), "cached-data")
+	}
+
+	if len(s3.downloads()) != 0 {
+		t.Errorf("expected zero S3 downloads (served from cache), got %d: %v",
+			len(s3.downloads()), s3.downloads())
+	}
+}
+
+func TestCachedStream_DownloadFallsBackToS3(t *testing.T) {
+	ctx := context.Background()
+	coord := NewMemCoordinator()
+	s3 := newMemStorage()
+	cs := NewCachedStream(coord, s3, "test_ns")
+
+	// Append data.
+	err := cs.Append(ctx, []WriteBatch{
+		{Table: "public.orders", Data: []byte("original-data"), RecordCount: 3},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	entries, _ := cs.Read(ctx, "public.orders", -1)
+	path := entries[0].S3Path
+
+	// Evict from cache to simulate cold start.
+	cs.Evict([]string{path})
+	s3.resetDownloadLog()
+
+	// Download should fall back to S3.
+	data, err := cs.Download(ctx, path)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if string(data) != "original-data" {
+		t.Errorf("data: got %q, want %q", string(data), "original-data")
+	}
+
+	if len(s3.downloads()) != 1 {
+		t.Errorf("expected 1 S3 download (cache miss), got %d", len(s3.downloads()))
+	}
+}
+
+func TestCachedStream_EvictAfterTruncate(t *testing.T) {
+	ctx := context.Background()
+	coord := NewMemCoordinator()
+	s3 := newMemStorage()
+	cs := NewCachedStream(coord, s3, "test_ns")
+
+	// Append 2 batches.
+	for i := 0; i < 2; i++ {
+		err := cs.Append(ctx, []WriteBatch{
+			{Table: "public.orders", Data: []byte(fmt.Sprintf("batch-%d", i)), RecordCount: 10},
+		})
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	entries, _ := cs.Read(ctx, "public.orders", -1)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+
+	// Truncate first entry.
+	if err := cs.Truncate(ctx, "public.orders", entries[0].EndOffset); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	s3.resetDownloadLog()
+
+	// First entry's path: should fall back to S3 (evicted + deleted).
+	_, err := cs.Download(ctx, entries[0].S3Path)
+	if err == nil {
+		t.Error("expected error downloading truncated file")
+	}
+
+	// Second entry's path: should still be in cache.
+	data, err := cs.Download(ctx, entries[1].S3Path)
+	if err != nil {
+		t.Fatalf("download second: %v", err)
+	}
+	if string(data) != "batch-1" {
+		t.Errorf("data: got %q, want %q", string(data), "batch-1")
+	}
+
+	// Only the first (truncated) entry should have hit S3.
+	if len(s3.downloads()) != 1 {
+		t.Errorf("expected 1 S3 download, got %d: %v", len(s3.downloads()), s3.downloads())
+	}
+}
+
+func TestCachedStream_MultiTableCacheIsolation(t *testing.T) {
+	ctx := context.Background()
+	coord := NewMemCoordinator()
+	s3 := newMemStorage()
+	cs := NewCachedStream(coord, s3, "test_ns")
+
+	// Append to two tables.
+	err := cs.Append(ctx, []WriteBatch{
+		{Table: "public.orders", Data: []byte("orders-data"), RecordCount: 5},
+		{Table: "public.users", Data: []byte("users-data"), RecordCount: 3},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	s3.resetDownloadLog()
+
+	// Download both from cache.
+	ordersEntries, _ := cs.Read(ctx, "public.orders", -1)
+	usersEntries, _ := cs.Read(ctx, "public.users", -1)
+
+	d1, _ := cs.Download(ctx, ordersEntries[0].S3Path)
+	d2, _ := cs.Download(ctx, usersEntries[0].S3Path)
+
+	if string(d1) != "orders-data" {
+		t.Errorf("orders: got %q", string(d1))
+	}
+	if string(d2) != "users-data" {
+		t.Errorf("users: got %q", string(d2))
+	}
+
+	if len(s3.downloads()) != 0 {
+		t.Errorf("expected zero S3 downloads, got %d", len(s3.downloads()))
 	}
 }

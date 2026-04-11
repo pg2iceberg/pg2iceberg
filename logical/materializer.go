@@ -32,7 +32,7 @@ type Materializer struct {
 	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
 	tables  map[string]*tableSink
-	stream  *stream.Stream
+	stream  stream.Stream
 
 	// Per-table TableWriter for the shared write path (serialize → upload → manifest → commit).
 	tableWriters map[string]*iceberg.TableWriter
@@ -58,7 +58,7 @@ func (m *Materializer) SyncTableWriter(pgTable string) {
 	tw.UpdateSchema(ts.srcSchema, ts.matSchemaID)
 }
 
-func NewMaterializer(cfg config.SinkConfig, catalog iceberg.MetadataCache, s3 iceberg.ObjectStorage, tables map[string]*tableSink, str *stream.Stream) *Materializer {
+func NewMaterializer(cfg config.SinkConfig, catalog iceberg.MetadataCache, s3 iceberg.ObjectStorage, tables map[string]*tableSink, str stream.Stream) *Materializer {
 	writers := make(map[string]*iceberg.TableWriter, len(tables))
 	for pgTable, ts := range tables {
 		writers[pgTable] = iceberg.NewTableWriter(iceberg.TableWriteConfig{

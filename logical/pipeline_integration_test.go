@@ -2181,11 +2181,16 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 	setupTestTable(t, ctx, pgCfg.DSN())
 
 	cfg, sinkCfg := newTestPipelineCfg(pgCfg, "test_slot_cat")
+	// Materializer runs on a periodic timer — make it fast so retries don't time out.
+	sinkCfg.MaterializerInterval = "500ms"
+	cfg.Sink = sinkCfg
 
 	mem := newMemStorage()
 	cat := newFailNTimesCatalog(3)
+	coord := stream.NewMemCoordinator()
 	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2205,7 +2210,8 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 		t.Fatal("timeout waiting for catalog failures")
 	}
 
-	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > lsnAfterSnapshot })
+	// Wait for the materializer to eventually succeed (the 4th+ call should work).
+	waitFor(t, 30*time.Second, func() bool { return int(cat.commitCalls.Load()) > cat.failCount })
 	t.Logf("flushedLSN advanced: %d -> %d", lsnAfterSnapshot, ls.FlushedLSN())
 
 	status, pErr := p.Status()
@@ -2473,8 +2479,8 @@ func TestMaterializer_ZeroS3ReadsAfterFirstCycle(t *testing.T) {
 	coord := stream.NewMemCoordinator()
 
 	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
-	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2535,15 +2541,15 @@ func TestMaterializer_ZeroS3ReadsAfterFirstCycle(t *testing.T) {
 	t.Logf("cycle 2+3 cumulative S3 reads: %d %v", len(reads3), reads3)
 
 	// Assert: ZERO S3 read operations after the first cycle.
-	// All catalog metadata is served from CachedCatalog, and the FileIndex
-	// is updated incrementally — no manifest downloads or parquet reads.
+	// The CachedStream serves staged file downloads from memory (no S3 round-trip).
+	// All Iceberg metadata is served from the CachedCatalog and incremental FileIndex.
 	if len(reads3) > 0 {
-		t.Errorf("expected zero S3 reads after first cycle, got %d:\n", len(reads3))
+		t.Errorf("expected zero S3 reads after first cycle, got %d:", len(reads3))
 		for _, r := range reads3 {
 			t.Errorf("  %s", r)
 		}
 	} else {
-		t.Log("confirmed: zero S3 reads after first materialization cycle")
+		t.Log("confirmed: zero S3 reads after first materialization cycle (CachedStream)")
 	}
 }
 
@@ -2606,8 +2612,8 @@ func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
 	coord := stream.NewMemCoordinator()
 
 	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
-	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2644,15 +2650,15 @@ func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
 	reads := mem.readOps()
 	t.Logf("S3 reads after snapshot: %d", len(reads))
 
-	// Assert: ZERO S3 reads. The snapshot phase seeded the FileIndex and
-	// manifest cache, so the materializer's first cycle should be fully cached.
+	// Assert: ZERO S3 reads. The CachedStream serves staged file downloads
+	// from memory, and the snapshot phase seeded the FileIndex and manifest cache.
 	if len(reads) > 0 {
 		t.Errorf("expected zero S3 reads after snapshot, got %d:", len(reads))
 		for _, r := range reads {
 			t.Errorf("  %s", r)
 		}
 	} else {
-		t.Log("confirmed: zero S3 reads after snapshot (including first materialization cycle)")
+		t.Log("confirmed: zero S3 reads after snapshot (CachedStream + seeded FileIndex)")
 	}
 }
 

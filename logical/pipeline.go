@@ -44,7 +44,7 @@ type Pipeline struct {
 
 	materializer *Materializer
 	coord        stream.Coordinator
-	str          *stream.Stream
+	str          stream.Stream
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -327,8 +327,9 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.snk.SetS3(p.clients.S3)
 	}
 
-	// Create Stream (needs S3 to be initialized).
-	p.str = stream.NewStream(p.coord, p.snk.S3(), p.cfg.Sink.Namespace)
+	// Create CachedStream for combined mode (WAL writer + materializer in same process).
+	// The cache avoids S3 round-trips for data just staged by the Sink.
+	p.str = stream.NewCachedStream(p.coord, p.snk.S3(), p.cfg.Sink.Namespace)
 	p.snk.SetStream(p.str)
 
 	// Start WAL lag monitor.

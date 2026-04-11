@@ -35,7 +35,7 @@ type Sink struct {
 
 	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
-	stream  *stream.Stream
+	stream  stream.Stream
 
 	// Per-table state: keyed by PG table name (e.g. "public.orders").
 	tables map[string]*tableSink
@@ -98,10 +98,10 @@ func (s *Sink) Close() {}
 func (s *Sink) SetS3(s3 iceberg.ObjectStorage) { s.s3 = s3 }
 
 // SetStream sets the stream used for staging events. Must be called before Start.
-func (s *Sink) SetStream(str *stream.Stream) { s.stream = str }
+func (s *Sink) SetStream(str stream.Stream) { s.stream = str }
 
 // Stream returns the stream.
-func (s *Sink) Stream() *stream.Stream { return s.stream }
+func (s *Sink) Stream() stream.Stream { return s.stream }
 
 // Catalog returns the catalog client.
 func (s *Sink) Catalog() iceberg.MetadataCache { return s.catalog }
