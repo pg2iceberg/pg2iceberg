@@ -19,6 +19,7 @@ import (
 	
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/logical"
+	"github.com/pg2iceberg/pg2iceberg/stream"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/network"
@@ -98,12 +99,12 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 	store := pipeline.NewMemCheckpointStore()
-	p := logical.NewPipeline("test", cfg, snk, store)
-	p.SetEventBuf(eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, store, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -464,12 +465,12 @@ func TestPipeline_SnapshotCheckpointLSN(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 	store := pipeline.NewMemCheckpointStore()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
-	p := logical.NewPipeline("test", cfg, snk, store)
-	p.SetEventBuf(eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, store, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -555,9 +556,9 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	mem := newMemStorage()
 	cat := newMemCatalog()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -743,8 +744,8 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	mem := newGatedStorage()
 	cat := newMemCatalog()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -891,8 +892,8 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 	mem := newMemStorage()
 	cat := newFailOnceCatalog()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1102,12 +1103,12 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
-	p.SetEventBuf(eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1316,11 +1317,11 @@ func TestMaterializer_CachedCatalogNoRedundantLoads(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
-	p.SetEventBuf(eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1404,10 +1405,8 @@ func TestMaterializer_CachedCatalogNoRedundantLoads(t *testing.T) {
 }
 
 // Note: TestMaterializer_CrossTableAtomicCommit_RaceDrainAll was removed.
-// It tested a partial-drain race that is no longer possible with the WAL-based
-// ChangeEventBuffer (ReadAll/Ack/Rollback). Events are now consumed atomically
-// and only removed after the materializer commits, eliminating the need for S3
-// fallback during normal operation.
+// It tested a partial-drain race that is no longer relevant with the
+// Stream-based architecture.
 
 // TestPipeline_PartitionedTable runs a full pipeline lifecycle with a PostgreSQL
 // partitioned table (RANGE partitioning). It verifies:
@@ -1505,12 +1504,12 @@ func TestPipeline_PartitionedTable(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test_part", mem, cat, eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test_part", mem, cat)
 	store := pipeline.NewMemCheckpointStore()
-	p := logical.NewPipeline("test_part", cfg, snk, store)
-	p.SetEventBuf(eventBuf)
+	p := logical.NewPipeline("test_part", cfg, snk, store, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2137,8 +2136,10 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 
 	mem := newFailNTimesStorage(2)
 	cat := newMemCatalog()
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	coord := stream.NewMemCoordinator()
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2182,11 +2183,16 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 	setupTestTable(t, ctx, pgCfg.DSN())
 
 	cfg, sinkCfg := newTestPipelineCfg(pgCfg, "test_slot_cat")
+	// Materializer runs on a periodic timer — make it fast so retries don't time out.
+	sinkCfg.MaterializerInterval = "500ms"
+	cfg.Sink = sinkCfg
 
 	mem := newMemStorage()
 	cat := newFailNTimesCatalog(3)
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	coord := stream.NewMemCoordinator()
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2206,7 +2212,8 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 		t.Fatal("timeout waiting for catalog failures")
 	}
 
-	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > lsnAfterSnapshot })
+	// Wait for the materializer to eventually succeed (the 4th+ call should work).
+	waitFor(t, 30*time.Second, func() bool { return int(cat.commitCalls.Load()) > cat.failCount })
 	t.Logf("flushedLSN advanced: %d -> %d", lsnAfterSnapshot, ls.FlushedLSN())
 
 	status, pErr := p.Status()
@@ -2301,8 +2308,8 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newMemCatalog()
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2471,11 +2478,11 @@ func TestMaterializer_ZeroS3ReadsAfterFirstCycle(t *testing.T) {
 
 	mem := newTrackingStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
-	p.SetEventBuf(eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2536,15 +2543,15 @@ func TestMaterializer_ZeroS3ReadsAfterFirstCycle(t *testing.T) {
 	t.Logf("cycle 2+3 cumulative S3 reads: %d %v", len(reads3), reads3)
 
 	// Assert: ZERO S3 read operations after the first cycle.
-	// All catalog metadata is served from CachedCatalog, and the FileIndex
-	// is updated incrementally — no manifest downloads or parquet reads.
+	// The CachedStream serves staged file downloads from memory (no S3 round-trip).
+	// All Iceberg metadata is served from the CachedCatalog and incremental FileIndex.
 	if len(reads3) > 0 {
-		t.Errorf("expected zero S3 reads after first cycle, got %d:\n", len(reads3))
+		t.Errorf("expected zero S3 reads after first cycle, got %d:", len(reads3))
 		for _, r := range reads3 {
 			t.Errorf("  %s", r)
 		}
 	} else {
-		t.Log("confirmed: zero S3 reads after first materialization cycle")
+		t.Log("confirmed: zero S3 reads after first materialization cycle (CachedStream)")
 	}
 }
 
@@ -2604,11 +2611,11 @@ func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
 
 	mem := newTrackingStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
-	p.SetEventBuf(eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2645,15 +2652,126 @@ func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
 	reads := mem.readOps()
 	t.Logf("S3 reads after snapshot: %d", len(reads))
 
-	// Assert: ZERO S3 reads. The snapshot phase seeded the FileIndex and
-	// manifest cache, so the materializer's first cycle should be fully cached.
+	// Assert: ZERO S3 reads. The CachedStream serves staged file downloads
+	// from memory, and the snapshot phase seeded the FileIndex and manifest cache.
 	if len(reads) > 0 {
 		t.Errorf("expected zero S3 reads after snapshot, got %d:", len(reads))
 		for _, r := range reads {
 			t.Errorf("  %s", r)
 		}
 	} else {
-		t.Log("confirmed: zero S3 reads after snapshot (including first materialization cycle)")
+		t.Log("confirmed: zero S3 reads after snapshot (CachedStream + seeded FileIndex)")
+	}
+}
+
+// TestMaterializer_NoDuplicateRowsOnShutdown verifies that when the pipeline
+// receives SIGINT during a materialization cycle, the same events are NOT
+// committed twice. This was a regression where:
+//  1. Periodic cycle committed to Iceberg but the cursor wasn't advanced
+//     (context cancelled between commit and SetCursor)
+//  2. MaterializeAll re-processed the same events, producing duplicates
+//
+// The fix uses a non-cancellable context for commit+cursor and a mutex to
+// serialize cycles.
+func TestMaterializer_NoDuplicateRowsOnShutdown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE items (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            100,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.items"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_nodup",
+				SlotName:        "test_slot_nodup",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	coord := stream.NewMemCoordinator()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+
+	// Ensure cursors exist (normally done in pipeline.setup).
+	if err := coord.EnsureCursor(ctx, "public.items"); err != nil {
+		t.Fatalf("ensure cursor: %v", err)
+	}
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// Insert rows.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO items (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	conn.Close(ctx)
+
+	// Wait for at least one materialization cycle.
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 1 })
+	t.Logf("first materialization committed (%d commits)", len(cat.matCommits()))
+
+	// Shutdown — this triggers MaterializeAll which must NOT re-process.
+	cancel()
+	<-p.Done()
+
+	// Count total data rows across all Iceberg data files.
+	matTm, _ := cat.LoadTable(ctx, "test_ns", "items")
+	if matTm == nil {
+		t.Fatal("materialized table not found")
+	}
+
+	rowCount := countDataRows(t, context.Background(), mem, matTm)
+	t.Logf("total data rows: %d (expected 5)", rowCount)
+
+	if rowCount != 5 {
+		t.Errorf("DUPLICATE ROWS: expected exactly 5 rows, got %d — "+
+			"materializer processed events more than once", rowCount)
 	}
 }
 
@@ -2712,12 +2830,12 @@ func TestPipeline_SlotSurvivesShutdown(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newMemCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
+	coord := stream.NewMemCoordinator()
 	cpStore := pipeline.NewMemCheckpointStore()
 
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
-	p := logical.NewPipeline("test", cfg, snk, cpStore)
-	p.SetEventBuf(eventBuf)
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, cpStore, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2780,11 +2898,11 @@ func TestPipeline_SlotSurvivesShutdown(t *testing.T) {
 
 	// Restart the pipeline and verify it resumes from the persisted slot.
 	// Reuse the same storage and catalog — they represent persistent Iceberg state.
-	eventBuf2 := logical.NewChangeEventBuffer()
+	coord2 := stream.NewMemCoordinator()
 
-	snk2 := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf2)
-	p2 := logical.NewPipeline("test", cfg, snk2, cpStore)
-	p2.SetEventBuf(eventBuf2)
+	snk2 := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p2 := logical.NewPipeline("test", cfg, snk2, cpStore, coord2)
+	snk2.SetStream(stream.NewStream(coord2, mem, sinkCfg.Namespace))
 
 	if err := p2.Start(ctx); err != nil {
 		t.Fatalf("restart pipeline: %v", err)
@@ -2874,11 +2992,11 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
-	eventBuf := logical.NewChangeEventBuffer()
-	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	coord := stream.NewMemCoordinator()
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 	store := pipeline.NewMemCheckpointStore()
-	p := logical.NewPipeline("test", cfg, snk, store)
-	p.SetEventBuf(eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, store, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2917,23 +3035,18 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 		t.Logf("materializer cycle %d committed", targetCommits)
 	}
 
-	// Count snapshots on materialized and events tables.
+	// Count snapshots on materialized table.
 	matSnaps := cat.snapshotCount("test_ns", "items")
-	evtSnaps := cat.snapshotCount("test_ns", "items_events")
-	t.Logf("before maintenance: materialized=%d snapshots, events=%d snapshots", matSnaps, evtSnaps)
+	t.Logf("before maintenance: materialized=%d snapshots", matSnaps)
 
 	if matSnaps < 3 {
 		t.Fatalf("expected at least 3 materialized snapshots, got %d", matSnaps)
 	}
-	if evtSnaps < 3 {
-		t.Fatalf("expected at least 3 events snapshots, got %d", evtSnaps)
-	}
 
 	// Count S3 files before maintenance.
 	allFiles, _ := mem.ListObjects(ctx, "test_ns.db/items/")
-	allEvtFiles, _ := mem.ListObjects(ctx, "test_ns.db/items_events/")
-	filesBefore := len(allFiles) + len(allEvtFiles)
-	t.Logf("before maintenance: %d S3 files (%d mat + %d events)", filesBefore, len(allFiles), len(allEvtFiles))
+	filesBefore := len(allFiles)
+	t.Logf("before maintenance: %d S3 files", filesBefore)
 
 	// Backdate all snapshots except the current one to simulate aging.
 	// This makes them eligible for expiry with a short retention.
@@ -2952,7 +3065,6 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 		}
 	}
 	backdateOldSnapshots("test_ns", "items")
-	backdateOldSnapshots("test_ns", "items_events")
 
 	// Run maintenance with 1h retention (old snapshots are 48h old → will be expired).
 	mc := iceberg.MaintenanceConfig{
@@ -2963,27 +3075,19 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 	if err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items", mc); err != nil {
 		t.Fatalf("maintain materialized table: %v", err)
 	}
-	if err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items_events", mc); err != nil {
-		t.Fatalf("maintain events table: %v", err)
-	}
 
 	// Verify snapshots were expired — only the current snapshot should remain.
 	matSnapsAfter := cat.snapshotCount("test_ns", "items")
-	evtSnapsAfter := cat.snapshotCount("test_ns", "items_events")
-	t.Logf("after maintenance: materialized=%d snapshots, events=%d snapshots", matSnapsAfter, evtSnapsAfter)
+	t.Logf("after maintenance: materialized=%d snapshots", matSnapsAfter)
 
 	if matSnapsAfter != 1 {
 		t.Errorf("expected 1 materialized snapshot after maintenance, got %d", matSnapsAfter)
 	}
-	if evtSnapsAfter != 1 {
-		t.Errorf("expected 1 events snapshot after maintenance, got %d", evtSnapsAfter)
-	}
 
 	// Verify orphan files were deleted.
 	allFilesAfter, _ := mem.ListObjects(ctx, "test_ns.db/items/")
-	allEvtFilesAfter, _ := mem.ListObjects(ctx, "test_ns.db/items_events/")
-	filesAfter := len(allFilesAfter) + len(allEvtFilesAfter)
-	t.Logf("after maintenance: %d S3 files (%d mat + %d events)", filesAfter, len(allFilesAfter), len(allEvtFilesAfter))
+	filesAfter := len(allFilesAfter)
+	t.Logf("after maintenance: %d S3 files", filesAfter)
 
 	if filesAfter >= filesBefore {
 		t.Errorf("expected fewer files after maintenance, before=%d, after=%d", filesBefore, filesAfter)
