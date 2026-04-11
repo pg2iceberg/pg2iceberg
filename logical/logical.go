@@ -442,8 +442,31 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 // it covers all configured tables. If tables are added to the config, they are
 // added to the publication; tables removed from config are left in the publication
 // (safe — they just produce ignored events).
+//
+// On PostgreSQL 13+, the publication is created/updated with
+// publish_via_partition_root = true so that WAL events for partitioned tables
+// are tagged with the root parent table name (matching the configured table).
 func (l *LogicalSource) ensurePublication(ctx context.Context) error {
 	pubName := l.cfg.PublicationName
+
+	// Check PostgreSQL version for publish_via_partition_root support (PG 13+).
+	var pgVersionNum int
+	if err := l.queryConn.QueryRow(ctx,
+		"SELECT current_setting('server_version_num')::int",
+	).Scan(&pgVersionNum); err != nil {
+		return fmt.Errorf("query pg version: %w", err)
+	}
+	supportsPartitionRoot := pgVersionNum >= 130000
+
+	if !supportsPartitionRoot {
+		// Warn if any configured table is partitioned — replication won't work correctly.
+		for _, ts := range l.tables {
+			if ts.Partitioned {
+				log.Printf("WARN: table %s is partitioned but PostgreSQL %d does not support publish_via_partition_root (requires 13+); "+
+					"WAL events will be tagged with child partition names and may be dropped", ts.Table, pgVersionNum)
+			}
+		}
+	}
 
 	var pubExists bool
 	err := l.queryConn.QueryRow(ctx,
@@ -463,8 +486,11 @@ func (l *LogicalSource) ensurePublication(ctx context.Context) error {
 	if !pubExists {
 		// CREATE PUBLICATION requires table names inlined (not parameterized).
 		tablesSQL := strings.Join(tableNames, ", ")
-		_, err := l.queryConn.Exec(ctx,
-			fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pgx.Identifier{pubName}.Sanitize(), tablesSQL))
+		createSQL := fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pgx.Identifier{pubName}.Sanitize(), tablesSQL)
+		if supportsPartitionRoot {
+			createSQL += " WITH (publish_via_partition_root = true)"
+		}
+		_, err := l.queryConn.Exec(ctx, createSQL)
 		if err != nil {
 			return fmt.Errorf("create publication: %w", err)
 		}
@@ -507,6 +533,16 @@ func (l *LogicalSource) ensurePublication(ctx context.Context) error {
 		log.Printf("[logical] added tables to publication %q: %s", pubName, tablesSQL)
 	} else {
 		log.Printf("[logical] publication %q exists with all configured tables", pubName)
+	}
+
+	// Ensure publish_via_partition_root is set on existing publications.
+	// This is idempotent and harmless for non-partitioned tables.
+	if supportsPartitionRoot {
+		_, err = l.queryConn.Exec(ctx,
+			fmt.Sprintf("ALTER PUBLICATION %s SET (publish_via_partition_root = true)", pgx.Identifier{pubName}.Sanitize()))
+		if err != nil {
+			return fmt.Errorf("set publish_via_partition_root: %w", err)
+		}
 	}
 
 	return nil

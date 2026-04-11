@@ -1,0 +1,1 @@
+SELECT id, created_at, name FROM iceberg.`default.e2e_pg_partitioned_range` ORDER BY id

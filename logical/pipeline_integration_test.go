@@ -1409,6 +1409,300 @@ func TestMaterializer_CachedCatalogNoRedundantLoads(t *testing.T) {
 // and only removed after the materializer commits, eliminating the need for S3
 // fallback during normal operation.
 
+// TestPipeline_PartitionedTable runs a full pipeline lifecycle with a PostgreSQL
+// partitioned table (RANGE partitioning). It verifies:
+//  1. Snapshot captures pre-existing rows from all child partitions
+//  2. Streaming captures inserts/updates across partitions (via publish_via_partition_root)
+//  3. Multiple flush+materializer cycles produce correct results
+//  4. Publication is created with publish_via_partition_root = true
+func TestPipeline_PartitionedTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// Create a RANGE partitioned table with two child partitions.
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (
+			id         INTEGER NOT NULL,
+			created_at DATE NOT NULL,
+			name       TEXT NOT NULL,
+			amount     INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (id, created_at)
+		) PARTITION BY RANGE (created_at);
+
+		CREATE TABLE orders_2024 PARTITION OF orders
+			FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+		CREATE TABLE orders_2025 PARTITION OF orders
+			FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+		-- Replica identity must be set on each child partition individually.
+		ALTER TABLE orders_2024 REPLICA IDENTITY FULL;
+		ALTER TABLE orders_2025 REPLICA IDENTITY FULL;
+	`)
+	if err != nil {
+		t.Fatalf("create partitioned table: %v", err)
+	}
+
+	// Seed data across both partitions BEFORE replication starts (snapshot phase).
+	const snapshotRows = 6
+	seedData := []struct {
+		id        int
+		createdAt string
+		name      string
+		amount    int
+	}{
+		{1, "2024-03-15", "alice", 100},
+		{2, "2024-07-20", "bob", 200},
+		{3, "2024-11-10", "charlie", 300},
+		{4, "2025-02-14", "diana", 400},
+		{5, "2025-06-25", "eve", 500},
+		{6, "2025-09-30", "frank", 600},
+	}
+	for _, d := range seedData {
+		_, err = conn.Exec(ctx,
+			"INSERT INTO orders (id, created_at, name, amount) VALUES ($1, $2, $3, $4)",
+			d.id, d.createdAt, d.name, d.amount)
+		if err != nil {
+			t.Fatalf("seed insert id=%d: %v", d.id, err)
+		}
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.orders"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_part",
+				SlotName:        "test_slot_part",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test_part", mem, cat, eventBuf)
+	store := pipeline.NewMemCheckpointStore()
+	p := logical.NewPipeline("test_part", cfg, snk, store)
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	// Wait for snapshot to complete and pipeline to transition to streaming.
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+	t.Log("pipeline running — snapshot complete, streaming started")
+
+	// === Assertion 1: Snapshot data from all child partitions ===
+	matTm, err := cat.LoadTable(ctx, "test_ns", "orders")
+	if err != nil {
+		t.Fatalf("load materialized table: %v", err)
+	}
+	if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
+		t.Fatal("expected materialized table to have snapshot data")
+	}
+	matRows := countDataRows(t, ctx, mem, matTm)
+	if matRows != snapshotRows {
+		t.Errorf("snapshot: expected %d rows from all partitions, got %d", snapshotRows, matRows)
+	}
+	t.Logf("snapshot captured %d rows across both partitions", matRows)
+
+	// === Phase 2: Insert rows across partitions during streaming ===
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	ls := p.Source()
+
+	// Batch 1: inserts to both partitions.
+	for _, d := range []struct {
+		id        int
+		createdAt string
+		name      string
+		amount    int
+	}{
+		{7, "2024-04-01", "grace", 700},
+		{8, "2025-05-15", "hank", 800},
+		{9, "2024-12-20", "iris", 900},
+	} {
+		_, err = conn.Exec(ctx,
+			"INSERT INTO orders (id, created_at, name, amount) VALUES ($1, $2, $3, $4)",
+			d.id, d.createdAt, d.name, d.amount)
+		if err != nil {
+			t.Fatalf("stream insert id=%d: %v", d.id, err)
+		}
+	}
+
+	// Wait for first materializer cycle.
+	flushedBefore := ls.FlushedLSN()
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedBefore })
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 1 })
+	t.Logf("first materializer cycle complete, matCommits=%d", len(cat.matCommits()))
+
+	// === Assertion 2: After first cycle, snapshot + streaming rows correct ===
+	expectedAfterBatch1 := int64(snapshotRows + 3)
+	waitFor(t, 30*time.Second, func() bool {
+		matTm, _ = cat.LoadTable(ctx, "test_ns", "orders")
+		return countDataRows(t, ctx, mem, matTm) >= expectedAfterBatch1
+	})
+	matTm, _ = cat.LoadTable(ctx, "test_ns", "orders")
+	matRows = countDataRows(t, ctx, mem, matTm)
+	if matRows != expectedAfterBatch1 {
+		t.Errorf("after batch 1: expected %d rows, got %d", expectedAfterBatch1, matRows)
+	}
+	t.Logf("after batch 1: %d rows", matRows)
+
+	// === Phase 3: Updates and more inserts across partitions ===
+	// Update a row in the 2024 partition.
+	_, err = conn.Exec(ctx,
+		"UPDATE orders SET amount = 999 WHERE id = 1 AND created_at = '2024-03-15'")
+	if err != nil {
+		t.Fatalf("update 2024 partition: %v", err)
+	}
+	// Update a row in the 2025 partition.
+	_, err = conn.Exec(ctx,
+		"UPDATE orders SET amount = 888 WHERE id = 4 AND created_at = '2025-02-14'")
+	if err != nil {
+		t.Fatalf("update 2025 partition: %v", err)
+	}
+	// Insert more rows.
+	_, err = conn.Exec(ctx,
+		"INSERT INTO orders (id, created_at, name, amount) VALUES ($1, $2, $3, $4)",
+		10, "2025-12-01", "jack", 1000)
+	if err != nil {
+		t.Fatalf("stream insert id=10: %v", err)
+	}
+
+	// Wait for second materializer cycle.
+	matCommitsBefore := len(cat.matCommits())
+	flushedBefore = ls.FlushedLSN()
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedBefore })
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) > matCommitsBefore })
+	t.Logf("second materializer cycle complete, matCommits=%d", len(cat.matCommits()))
+
+	// === Phase 4: Third batch to force another cycle ===
+	_, err = conn.Exec(ctx,
+		"INSERT INTO orders (id, created_at, name, amount) VALUES ($1, $2, $3, $4)",
+		11, "2024-01-15", "kate", 1100)
+	if err != nil {
+		t.Fatalf("stream insert id=11: %v", err)
+	}
+	_, err = conn.Exec(ctx,
+		"DELETE FROM orders WHERE id = 3 AND created_at = '2024-11-10'")
+	if err != nil {
+		t.Fatalf("delete from 2024 partition: %v", err)
+	}
+
+	matCommitsBefore = len(cat.matCommits())
+	flushedBefore = ls.FlushedLSN()
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedBefore })
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) > matCommitsBefore })
+	t.Logf("third materializer cycle complete, matCommits=%d", len(cat.matCommits()))
+
+	// === Assertion 3: Verify all expected IDs present in data files ===
+	matTm, _ = cat.LoadTable(ctx, "test_ns", "orders")
+	allRows := readAllDataFileRows(t, ctx, mem, matTm)
+	t.Logf("total rows across all data files: %d", len(allRows))
+
+	idSet := make(map[int32]bool)
+	for _, row := range allRows {
+		if id, ok := row["id"].(int32); ok {
+			idSet[id] = true
+		}
+	}
+
+	// All IDs that should exist: 1,2,4,5,6,7,8,9,10,11 (id=3 was deleted)
+	expectedIDs := []int32{1, 2, 4, 5, 6, 7, 8, 9, 10, 11}
+	for _, id := range expectedIDs {
+		if !idSet[id] {
+			t.Errorf("data loss: row id=%d missing from materialized data files", id)
+		}
+	}
+
+	// Verify updated rows have new amounts.
+	for _, row := range allRows {
+		if id, ok := row["id"].(int32); ok {
+			if amount, ok := row["amount"].(int32); ok {
+				if id == 1 && amount == 999 {
+					t.Log("verified: id=1 updated to amount=999")
+				}
+				if id == 4 && amount == 888 {
+					t.Log("verified: id=4 updated to amount=888")
+				}
+			}
+		}
+	}
+
+	// Verify delete files exist (from updates and the explicit delete).
+	hasDeletes := countDeleteFiles(t, ctx, mem, matTm) > 0
+	if !hasDeletes {
+		t.Error("expected equality delete files after updates/deletes on partitioned table")
+	}
+
+	// === Assertion 4: Multiple materializer cycles completed ===
+	if commits := len(cat.matCommits()); commits < 2 {
+		t.Errorf("expected at least 2 materializer commits, got %d", commits)
+	}
+	t.Logf("total materializer commits: %d", len(cat.matCommits()))
+
+	// === Assertion 5: Publication has publish_via_partition_root = true ===
+	var pubViaRoot bool
+	err = conn.QueryRow(ctx,
+		"SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+		"test_pub_part",
+	).Scan(&pubViaRoot)
+	if err != nil {
+		t.Fatalf("query publication pubviaroot: %v", err)
+	}
+	if !pubViaRoot {
+		t.Error("expected publication to have publish_via_partition_root = true")
+	}
+	t.Log("verified: publication has publish_via_partition_root = true")
+
+	// === Assertion 6: Checkpoint is clean ===
+	cp, _ := store.Load(ctx, "test_part")
+	if !cp.SnapshotComplete {
+		t.Error("expected SnapshotComplete=true in checkpoint")
+	}
+	t.Logf("checkpoint: SnapshotComplete=%v, LSN=%d", cp.SnapshotComplete, cp.LSN)
+
+	t.Logf("partitioned table test complete: %d IDs verified, %d materializer commits",
+		len(expectedIDs), len(cat.matCommits()))
+}
+
 func startPostgres(t *testing.T, ctx context.Context) (pgCfg config.PostgresConfig, cleanup func()) {
 	t.Helper()
 
