@@ -459,11 +459,10 @@ func (l *LogicalSource) ensurePublication(ctx context.Context) error {
 	supportsPartitionRoot := pgVersionNum >= 130000
 
 	if !supportsPartitionRoot {
-		// Warn if any configured table is partitioned — replication won't work correctly.
 		for _, ts := range l.tables {
 			if ts.Partitioned {
-				log.Printf("WARN: table %s is partitioned but PostgreSQL %d does not support publish_via_partition_root (requires 13+); "+
-					"WAL events will be tagged with child partition names and may be dropped", ts.Table, pgVersionNum)
+				return fmt.Errorf("table %s is partitioned but PostgreSQL %d does not support publish_via_partition_root (requires 13+); "+
+					"partitioned table replication is not possible on this version", ts.Table, pgVersionNum)
 			}
 		}
 	}
