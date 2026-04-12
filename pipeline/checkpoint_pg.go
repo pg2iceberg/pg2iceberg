@@ -114,7 +114,7 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS _pg2iceberg.checkpoints (
 			pipeline_id             TEXT PRIMARY KEY,
-			version                 INTEGER NOT NULL DEFAULT 2,
+			version                 INTEGER NOT NULL DEFAULT 1,
 			checksum                TEXT NOT NULL DEFAULT '',
 			written_by              TEXT NOT NULL DEFAULT '',
 			revision                BIGINT NOT NULL DEFAULT 0,

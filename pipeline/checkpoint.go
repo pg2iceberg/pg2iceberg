@@ -21,10 +21,7 @@ import (
 var tracer = otel.Tracer("pg2iceberg/checkpoint")
 
 // CheckpointVersion is the current schema version.
-// Increment when the checkpoint format changes in a backward-incompatible way.
-// v2: removed SeqCounter, MaterializerSnapshots, LastSnapshotID, LastSequenceNumber
-//     (these are now managed by the stream coordinator tables).
-const CheckpointVersion = 2
+const CheckpointVersion = 1
 
 // CommitSHA is the git commit hash of the pg2iceberg binary.
 // Set at startup from the build-time linker flag.
