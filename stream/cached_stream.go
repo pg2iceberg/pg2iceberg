@@ -7,6 +7,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -47,6 +49,13 @@ func (cs *CachedStream) Append(ctx context.Context, batches []WriteBatch) error 
 	if len(batches) == 0 {
 		return nil
 	}
+
+	ctx, span := streamTracer.Start(ctx, "stream.Append",
+		trace.WithAttributes(
+			attribute.Int("stream.batch_count", len(batches)),
+			attribute.Bool("stream.cached", true),
+		))
+	defer span.End()
 
 	type staged struct {
 		key      string

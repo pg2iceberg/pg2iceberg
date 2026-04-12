@@ -8,7 +8,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var coordTracer = otel.Tracer("pg2iceberg/coordinator")
 
 const defaultSchema = "_pg2iceberg"
 
@@ -102,6 +108,14 @@ func (c *PgCoordinator) ClaimOffsets(ctx context.Context, appends []LogAppend) (
 		return nil, nil
 	}
 
+	ctx, span := coordTracer.Start(ctx, "coordinator.ClaimOffsets",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.PeerService("postgres"),
+			attribute.Int("stream.batch_size", len(appends)),
+		))
+	defer span.End()
+
 	entries := make([]LogEntry, len(appends))
 
 	err := pgx.BeginTxFunc(ctx, c.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
@@ -179,6 +193,14 @@ func (c *PgCoordinator) ClaimOffsets(ctx context.Context, appends []LogAppend) (
 
 // ReadLog returns log entries with end_offset > afterOffset, ordered ascending.
 func (c *PgCoordinator) ReadLog(ctx context.Context, table string, afterOffset int64) ([]LogEntry, error) {
+	ctx, span := coordTracer.Start(ctx, "coordinator.ReadLog",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.PeerService("postgres"),
+			attribute.String("stream.table", table),
+			attribute.Int64("stream.after_offset", afterOffset),
+		))
+	defer span.End()
 	rows, err := c.pool.Query(ctx,
 		fmt.Sprintf(`SELECT table_name, start_offset, end_offset, s3_path, record_count, byte_size, created_at
 		 FROM %s
@@ -236,6 +258,13 @@ func (c *PgCoordinator) EnsureCursor(ctx context.Context, table string) error {
 
 // GetCursor returns the last materialized offset. Returns -1 if not found.
 func (c *PgCoordinator) GetCursor(ctx context.Context, table string) (int64, error) {
+	ctx, span := coordTracer.Start(ctx, "coordinator.GetCursor",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.PeerService("postgres"),
+			attribute.String("stream.table", table),
+		))
+	defer span.End()
 	var offset int64
 	err := c.pool.QueryRow(ctx,
 		fmt.Sprintf(`SELECT last_offset FROM %s WHERE table_name = $1`, c.q("mat_cursor")),
@@ -251,6 +280,14 @@ func (c *PgCoordinator) GetCursor(ctx context.Context, table string) (int64, err
 
 // SetCursor updates the materializer cursor.
 func (c *PgCoordinator) SetCursor(ctx context.Context, table string, offset int64) error {
+	ctx, span := coordTracer.Start(ctx, "coordinator.SetCursor",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.PeerService("postgres"),
+			attribute.String("stream.table", table),
+			attribute.Int64("stream.offset", offset),
+		))
+	defer span.End()
 	_, err := c.pool.Exec(ctx,
 		fmt.Sprintf(`UPDATE %s
 		 SET last_offset = $2, last_committed = now()
@@ -263,6 +300,14 @@ func (c *PgCoordinator) SetCursor(ctx context.Context, table string, offset int6
 
 // TryLock attempts to acquire a heartbeat lock. Expired locks are reclaimed.
 func (c *PgCoordinator) TryLock(ctx context.Context, table, workerID string, ttl time.Duration) (bool, error) {
+	ctx, span := coordTracer.Start(ctx, "coordinator.TryLock",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.PeerService("postgres"),
+			attribute.String("stream.table", table),
+			attribute.String("stream.worker_id", workerID),
+		))
+	defer span.End()
 	_, err := c.pool.Exec(ctx,
 		fmt.Sprintf(`DELETE FROM %s WHERE table_name = $1 AND expires_at < now()`, c.q("lock")),
 		table)

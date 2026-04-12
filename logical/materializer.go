@@ -650,16 +650,22 @@ func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
 // or on cache miss (recovery), it downloads the staged Parquet files and
 // decodes the JSON _data column.
 func (m *Materializer) readEventsFromLog(ctx context.Context, entries []stream.LogEntry, srcSchema *postgres.TableSchema) ([]MatEvent, error) {
+	_, span := matTracer.Start(ctx, "pg2iceberg.materialize.readEvents",
+		trace.WithAttributes(attribute.Int("stream.entry_count", len(entries))))
+	defer span.End()
+
 	// Check if CachedStream has pre-parsed events.
 	cs, isCached := m.stream.(*stream.CachedStream)
 
 	var events []MatEvent
+	var cacheHits, cacheMisses int
 	for _, entry := range entries {
 		// Fast path: read from event cache (combined mode).
 		if isCached {
 			if cached := cs.CachedEvents(entry.S3Path); cached != nil {
 				if matEvents, ok := cached.([]MatEvent); ok {
 					events = append(events, matEvents...)
+					cacheHits++
 					continue
 				}
 			}
@@ -671,7 +677,14 @@ func (m *Materializer) readEventsFromLog(ctx context.Context, entries []stream.L
 			return nil, err
 		}
 		events = append(events, parsed...)
+		cacheMisses++
 	}
+
+	span.SetAttributes(
+		attribute.Int("stream.cache_hits", cacheHits),
+		attribute.Int("stream.cache_misses", cacheMisses),
+		attribute.Int("stream.event_count", len(events)),
+	)
 
 	return events, nil
 }

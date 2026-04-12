@@ -6,8 +6,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
+
+var streamTracer = otel.Tracer("pg2iceberg/stream")
 
 // Stream is an append-only distributed log for staging WAL change events.
 // Writers call Append to stage files. Readers call Read + Download to consume.
@@ -72,6 +77,10 @@ func (s *BaseStream) Append(ctx context.Context, batches []WriteBatch) error {
 	if len(batches) == 0 {
 		return nil
 	}
+
+	ctx, span := streamTracer.Start(ctx, "stream.Append",
+		trace.WithAttributes(attribute.Int("stream.batch_count", len(batches))))
+	defer span.End()
 
 	// Step 1: Upload all files to S3 in parallel.
 	type staged struct {
