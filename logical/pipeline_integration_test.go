@@ -2731,7 +2731,7 @@ func TestMaterializer_NoDuplicateRowsOnShutdown(t *testing.T) {
 	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
 	// Ensure cursors exist (normally done in pipeline.setup).
-	if err := coord.EnsureCursor(ctx, "public.items"); err != nil {
+	if err := coord.EnsureCursor(ctx, "default", "public.items"); err != nil {
 		t.Fatalf("ensure cursor: %v", err)
 	}
 
@@ -2849,8 +2849,8 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
 	// Ensure cursors for both tables.
-	coord.EnsureCursor(ctx, "public.orders")
-	coord.EnsureCursor(ctx, "public.payments")
+	coord.EnsureCursor(ctx, "default", "public.orders")
+	coord.EnsureCursor(ctx, "default", "public.payments")
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2894,8 +2894,8 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	}
 
 	// Verify phase 1 cursors advanced for both tables.
-	curOrders, _ := coord.GetCursor(ctx, "public.orders")
-	curPayments, _ := coord.GetCursor(ctx, "public.payments")
+	curOrders, _ := coord.GetCursor(ctx, "default", "public.orders")
+	curPayments, _ := coord.GetCursor(ctx, "default", "public.payments")
 	t.Logf("phase 1 cursors: orders=%d, payments=%d", curOrders, curPayments)
 	if curOrders <= 0 || curPayments <= 0 {
 		t.Fatalf("expected both cursors > 0 after phase 1, got orders=%d payments=%d", curOrders, curPayments)
@@ -2922,8 +2922,8 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	}
 
 	// Verify phase 2 cursors advanced.
-	curOrders2, _ := coord.GetCursor(ctx, "public.orders")
-	curPayments2, _ := coord.GetCursor(ctx, "public.payments")
+	curOrders2, _ := coord.GetCursor(ctx, "default", "public.orders")
+	curPayments2, _ := coord.GetCursor(ctx, "default", "public.payments")
 	t.Logf("phase 2 cursors: orders=%d, payments=%d", curOrders2, curPayments2)
 	if curOrders2 <= curOrders || curPayments2 <= curPayments {
 		t.Fatalf("expected cursors to advance in phase 2: orders %d->%d, payments %d->%d",
@@ -2945,8 +2945,8 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	}
 
 	// Verify final cursors advanced.
-	curOrders3, _ := coord.GetCursor(ctx, "public.orders")
-	curPayments3, _ := coord.GetCursor(ctx, "public.payments")
+	curOrders3, _ := coord.GetCursor(ctx, "default", "public.orders")
+	curPayments3, _ := coord.GetCursor(ctx, "default", "public.payments")
 	t.Logf("phase 3 cursors: orders=%d, payments=%d", curOrders3, curPayments3)
 	if curOrders3 <= curOrders2 || curPayments3 <= curPayments2 {
 		t.Fatalf("expected cursors to advance in phase 3: orders %d->%d, payments %d->%d",
@@ -3045,8 +3045,8 @@ func TestMaterializer_CacheInvalidationOnConflict(t *testing.T) {
 	snk.SetStream(cs)
 	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
-	coord.EnsureCursor(ctx, "public.orders")
-	coord.EnsureCursor(ctx, "public.payments")
+	coord.EnsureCursor(ctx, "default", "public.orders")
+	coord.EnsureCursor(ctx, "default", "public.payments")
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)

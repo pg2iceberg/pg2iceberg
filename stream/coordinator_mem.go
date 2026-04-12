@@ -14,6 +14,7 @@ type MemCoordinator struct {
 	index   map[string][]LogEntry // table -> entries (sorted by end_offset)
 	cursors map[string]int64      // table -> last_offset
 	locks   map[string]lockEntry
+	workers map[string]time.Time // worker_id -> expires_at
 }
 
 type lockEntry struct {
@@ -27,6 +28,7 @@ func NewMemCoordinator() *MemCoordinator {
 		index:   make(map[string][]LogEntry),
 		cursors: make(map[string]int64),
 		locks:   make(map[string]lockEntry),
+		workers: make(map[string]time.Time),
 	}
 }
 
@@ -91,30 +93,64 @@ func (c *MemCoordinator) TruncateLog(ctx context.Context, table string, offset i
 	return paths, nil
 }
 
-func (c *MemCoordinator) EnsureCursor(ctx context.Context, table string) error {
+func (c *MemCoordinator) EnsureCursor(ctx context.Context, group, table string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.cursors[table]; !ok {
-		c.cursors[table] = -1
+	key := group + "/" + table
+	if _, ok := c.cursors[key]; !ok {
+		c.cursors[key] = -1
 	}
 	return nil
 }
 
-func (c *MemCoordinator) GetCursor(ctx context.Context, table string) (int64, error) {
+func (c *MemCoordinator) GetCursor(ctx context.Context, group, table string) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	offset, ok := c.cursors[table]
+	offset, ok := c.cursors[group+"/"+table]
 	if !ok {
 		return -1, nil
 	}
 	return offset, nil
 }
 
-func (c *MemCoordinator) SetCursor(ctx context.Context, table string, offset int64) error {
+func (c *MemCoordinator) SetCursor(ctx context.Context, group, table string, offset int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cursors[table] = offset
+	c.cursors[group+"/"+table] = offset
 	return nil
+}
+
+func (c *MemCoordinator) RegisterConsumer(ctx context.Context, group, workerID string, ttl time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.workers[group+"/"+workerID] = time.Now().Add(ttl)
+	return nil
+}
+
+func (c *MemCoordinator) UnregisterConsumer(ctx context.Context, group, workerID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.workers, group+"/"+workerID)
+	return nil
+}
+
+func (c *MemCoordinator) ActiveConsumers(ctx context.Context, group string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := group + "/"
+	now := time.Now()
+	var active []string
+	for key, exp := range c.workers {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			if now.Before(exp) {
+				active = append(active, key[len(prefix):])
+			} else {
+				delete(c.workers, key)
+			}
+		}
+	}
+	sort.Strings(active)
+	return active, nil
 }
 
 func (c *MemCoordinator) TryLock(ctx context.Context, table, workerID string, ttl time.Duration) (bool, error) {

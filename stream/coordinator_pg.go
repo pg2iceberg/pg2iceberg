@@ -85,15 +85,23 @@ func (c *PgCoordinator) Migrate(ctx context.Context) error {
 			PRIMARY KEY (table_name, end_offset)
 		)`, c.q("log_index")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			table_name     TEXT PRIMARY KEY,
+			group_name     TEXT NOT NULL DEFAULT 'default',
+			table_name     TEXT NOT NULL,
 			last_offset    BIGINT NOT NULL DEFAULT -1,
-			last_committed TIMESTAMPTZ NOT NULL DEFAULT now()
+			last_committed TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (group_name, table_name)
 		)`, c.q("mat_cursor")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			table_name TEXT PRIMARY KEY,
 			worker_id  TEXT NOT NULL,
 			expires_at TIMESTAMPTZ NOT NULL
 		)`, c.q("lock")),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			group_name TEXT NOT NULL,
+			worker_id  TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (group_name, worker_id)
+		)`, c.q("consumer")),
 	} {
 		if _, err := c.pool.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("migrate coordination tables: %w", err)
@@ -245,57 +253,112 @@ func (c *PgCoordinator) TruncateLog(ctx context.Context, table string, offset in
 	return paths, rows.Err()
 }
 
-// EnsureCursor creates a cursor row if it doesn't exist.
-func (c *PgCoordinator) EnsureCursor(ctx context.Context, table string) error {
+// EnsureCursor creates a cursor row for a group+table if it doesn't exist.
+func (c *PgCoordinator) EnsureCursor(ctx context.Context, group, table string) error {
 	_, err := c.pool.Exec(ctx,
-		fmt.Sprintf(`INSERT INTO %s (table_name, last_offset)
-		 VALUES ($1, -1) ON CONFLICT DO NOTHING`, c.q("mat_cursor")), table)
+		fmt.Sprintf(`INSERT INTO %s (group_name, table_name, last_offset)
+		 VALUES ($1, $2, -1) ON CONFLICT DO NOTHING`, c.q("mat_cursor")),
+		group, table)
 	if err != nil {
-		return fmt.Errorf("ensure cursor for %s: %w", table, err)
+		return fmt.Errorf("ensure cursor for %s/%s: %w", group, table, err)
 	}
 	return nil
 }
 
-// GetCursor returns the last materialized offset. Returns -1 if not found.
-func (c *PgCoordinator) GetCursor(ctx context.Context, table string) (int64, error) {
+// GetCursor returns the last committed offset for a group+table. Returns -1 if not found.
+func (c *PgCoordinator) GetCursor(ctx context.Context, group, table string) (int64, error) {
 	ctx, span := coordTracer.Start(ctx, "coordinator.GetCursor",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
 			semconv.PeerService("postgres"),
+			attribute.String("stream.group", group),
 			attribute.String("stream.table", table),
 		))
 	defer span.End()
 	var offset int64
 	err := c.pool.QueryRow(ctx,
-		fmt.Sprintf(`SELECT last_offset FROM %s WHERE table_name = $1`, c.q("mat_cursor")),
-		table).Scan(&offset)
+		fmt.Sprintf(`SELECT last_offset FROM %s WHERE group_name = $1 AND table_name = $2`,
+			c.q("mat_cursor")),
+		group, table).Scan(&offset)
 	if err == pgx.ErrNoRows {
 		return -1, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("get cursor for %s: %w", table, err)
+		return 0, fmt.Errorf("get cursor for %s/%s: %w", group, table, err)
 	}
 	return offset, nil
 }
 
-// SetCursor updates the materializer cursor.
-func (c *PgCoordinator) SetCursor(ctx context.Context, table string, offset int64) error {
+// SetCursor updates the cursor for a group+table.
+func (c *PgCoordinator) SetCursor(ctx context.Context, group, table string, offset int64) error {
 	ctx, span := coordTracer.Start(ctx, "coordinator.SetCursor",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
 			semconv.PeerService("postgres"),
+			attribute.String("stream.group", group),
 			attribute.String("stream.table", table),
 			attribute.Int64("stream.offset", offset),
 		))
 	defer span.End()
 	_, err := c.pool.Exec(ctx,
 		fmt.Sprintf(`UPDATE %s
-		 SET last_offset = $2, last_committed = now()
-		 WHERE table_name = $1`, c.q("mat_cursor")), table, offset)
+		 SET last_offset = $3, last_committed = now()
+		 WHERE group_name = $1 AND table_name = $2`,
+			c.q("mat_cursor")),
+		group, table, offset)
 	if err != nil {
-		return fmt.Errorf("set cursor for %s: %w", table, err)
+		return fmt.Errorf("set cursor for %s/%s: %w", group, table, err)
 	}
 	return nil
+}
+
+// RegisterWorker upserts a worker heartbeat within a consumer group.
+func (c *PgCoordinator) RegisterConsumer(ctx context.Context, group, workerID string, ttl time.Duration) error {
+	_, err := c.pool.Exec(ctx,
+		fmt.Sprintf(`INSERT INTO %s (group_name, worker_id, expires_at)
+		 VALUES ($1, $2, now() + $3::interval)
+		 ON CONFLICT (group_name, worker_id) DO UPDATE SET expires_at = now() + $3::interval`,
+			c.q("consumer")),
+		group, workerID, fmt.Sprintf("%d seconds", int(ttl.Seconds())))
+	if err != nil {
+		return fmt.Errorf("register worker %s in group %s: %w", workerID, group, err)
+	}
+	return nil
+}
+
+// UnregisterWorker removes a worker from its consumer group.
+func (c *PgCoordinator) UnregisterConsumer(ctx context.Context, group, workerID string) error {
+	_, err := c.pool.Exec(ctx,
+		fmt.Sprintf(`DELETE FROM %s WHERE group_name = $1 AND worker_id = $2`, c.q("consumer")),
+		group, workerID)
+	if err != nil {
+		return fmt.Errorf("unregister worker %s from group %s: %w", workerID, group, err)
+	}
+	return nil
+}
+
+// ActiveWorkers returns all workers in a group with valid heartbeats, sorted by ID.
+func (c *PgCoordinator) ActiveConsumers(ctx context.Context, group string) ([]string, error) {
+	// Expire stale workers first.
+	c.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE expires_at < now()`, c.q("consumer")))
+
+	rows, err := c.pool.Query(ctx,
+		fmt.Sprintf(`SELECT worker_id FROM %s WHERE group_name = $1 ORDER BY worker_id`,
+			c.q("consumer")), group)
+	if err != nil {
+		return nil, fmt.Errorf("list active workers in group %s: %w", group, err)
+	}
+	defer rows.Close()
+
+	var workers []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		workers = append(workers, id)
+	}
+	return workers, rows.Err()
 }
 
 // TryLock attempts to acquire a heartbeat lock. Expired locks are reclaimed.

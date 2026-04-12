@@ -39,17 +39,30 @@ type Coordinator interface {
 	// Returns s3_path values of deleted entries for S3 cleanup.
 	TruncateLog(ctx context.Context, table string, offset int64) ([]string, error)
 
-	// --- Materializer Cursors ---
+	// --- Cursors (scoped by consumer group) ---
 
-	// EnsureCursor creates a cursor row for a table if it doesn't exist.
-	EnsureCursor(ctx context.Context, table string) error
+	// EnsureCursor creates a cursor row for a group+table if it doesn't exist.
+	EnsureCursor(ctx context.Context, group, table string) error
 
-	// GetCursor returns the last materialized offset for a table.
+	// GetCursor returns the last committed offset for a group+table.
 	// Returns -1 if no cursor exists.
-	GetCursor(ctx context.Context, table string) (int64, error)
+	GetCursor(ctx context.Context, group, table string) (int64, error)
 
-	// SetCursor updates the materializer cursor to the given offset.
-	SetCursor(ctx context.Context, table string, offset int64) error
+	// SetCursor updates the cursor for a group+table.
+	SetCursor(ctx context.Context, group, table string, offset int64) error
+
+	// --- Consumer Registry + Table Assignment (Layer 2) ---
+
+	// RegisterConsumer upserts a consumer's heartbeat within a consumer group.
+	// The group scopes consumers so multiple pg2iceberg deployments sharing
+	// the same coordinator schema don't interfere with each other.
+	RegisterConsumer(ctx context.Context, group, consumerID string, ttl time.Duration) error
+
+	// UnregisterConsumer removes a consumer from its group.
+	UnregisterConsumer(ctx context.Context, group, consumerID string) error
+
+	// ActiveConsumers returns all consumers in a group with valid heartbeats, sorted by ID.
+	ActiveConsumers(ctx context.Context, group string) ([]string, error)
 
 	// --- Heartbeat Locks (Layer 2: Task Claiming) ---
 

@@ -167,9 +167,9 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 		matSchemaID = matTm.Metadata.CurrentSchemaID
 	}
 
-	// Ensure materializer cursor exists for this table.
+	// Ensure materializer cursor exists for this table (default group).
 	if s.stream != nil {
-		if err := s.stream.Coordinator().EnsureCursor(ctx, ts.Table); err != nil {
+		if err := s.stream.Coordinator().EnsureCursor(ctx, "default", ts.Table); err != nil {
 			return fmt.Errorf("ensure cursor for %s: %w", ts.Table, err)
 		}
 	}

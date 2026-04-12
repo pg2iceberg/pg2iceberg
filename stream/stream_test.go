@@ -322,12 +322,12 @@ func TestStream_CursorIntegration(t *testing.T) {
 	table := "public.orders"
 
 	// Ensure cursor exists.
-	if err := coord.EnsureCursor(ctx, table); err != nil {
+	if err := coord.EnsureCursor(ctx, "default", table); err != nil {
 		t.Fatalf("ensure cursor: %v", err)
 	}
 
 	// Initial cursor is -1.
-	cursor, err := coord.GetCursor(ctx, table)
+	cursor, err := coord.GetCursor(ctx, "default", table)
 	if err != nil {
 		t.Fatalf("get cursor: %v", err)
 	}
@@ -358,12 +358,12 @@ func TestStream_CursorIntegration(t *testing.T) {
 
 	// Advance cursor to end of first batch.
 	maxOffset := entries[0].EndOffset
-	if err := coord.SetCursor(ctx, table, maxOffset); err != nil {
+	if err := coord.SetCursor(ctx, "default", table, maxOffset); err != nil {
 		t.Fatalf("set cursor: %v", err)
 	}
 
 	// Read from new cursor — should see only second entry.
-	cursor, _ = coord.GetCursor(ctx, table)
+	cursor, _ = coord.GetCursor(ctx, "default", table)
 	entries, err = str.Read(ctx, table, cursor)
 	if err != nil {
 		t.Fatalf("read after advance: %v", err)

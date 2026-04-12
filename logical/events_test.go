@@ -51,7 +51,7 @@ func TestStagedEventRoundTrip(t *testing.T) {
 		targetSize:  128 * 1024 * 1024,
 		writer:      iceberg.NewRollingDataWriter(iceberg.StagedEventSchema(), 128*1024*1024),
 	}
-	coord.EnsureCursor(ctx, "public.test_types")
+	coord.EnsureCursor(ctx, "default", "public.test_types")
 
 	// Write events covering various types and operations.
 	events := []postgres.ChangeEvent{
@@ -212,7 +212,7 @@ func TestStagedEventCachePath(t *testing.T) {
 	coord := stream.NewMemCoordinator()
 	s3 := newMemStorage()
 	cs := stream.NewCachedStream(coord, s3, "test_ns")
-	coord.EnsureCursor(ctx, "public.items")
+	coord.EnsureCursor(ctx, "default", "public.items")
 
 	// Simulate what the Sink does: create WriteBatches with Events.
 	originalEvents := []MatEvent{

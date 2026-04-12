@@ -334,9 +334,11 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.str = stream.NewCachedStream(p.coord, p.snk.S3(), p.cfg.Sink.Namespace)
 	p.snk.SetStream(p.str)
 
-	// Ensure materializer cursors exist for all registered tables.
+	// Ensure materializer cursors exist for all registered tables (default group).
+	// Distributed materializer workers with a consumer group will also call
+	// EnsureCursor for their group on first cycle.
 	for pgTable := range p.schemas {
-		if err := p.coord.EnsureCursor(ctx, pgTable); err != nil {
+		if err := p.coord.EnsureCursor(ctx, "default", pgTable); err != nil {
 			return fmt.Errorf("ensure cursor for %s: %w", pgTable, err)
 		}
 	}
@@ -348,7 +350,9 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.str)
 	if p.cfg.Sink.MaterializerWorkerID != "" {
 		materializer.WorkerID = p.cfg.Sink.MaterializerWorkerID
-		log.Printf("[logical:%s] materializer distributed mode (worker_id=%s)", p.id, materializer.WorkerID)
+		materializer.ConsumerGroup = p.cfg.Source.Logical.PublicationName
+		log.Printf("[logical:%s] materializer distributed mode (worker_id=%s, group=%s)",
+			p.id, materializer.WorkerID, materializer.ConsumerGroup)
 	}
 	go materializer.Run(ctx)
 	p.materializer = materializer

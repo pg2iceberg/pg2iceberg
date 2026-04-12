@@ -385,9 +385,10 @@ func runMaterializerOnly(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	// Ensure cursors.
+	// Ensure cursors for the consumer group (scoped by publication name).
+	group := cfg.Source.Logical.PublicationName
 	for pgTable := range schemas {
-		if err := coord.EnsureCursor(ctx, pgTable); err != nil {
+		if err := coord.EnsureCursor(ctx, group, pgTable); err != nil {
 			return fmt.Errorf("ensure cursor for %s: %w", pgTable, err)
 		}
 	}
@@ -395,6 +396,7 @@ func runMaterializerOnly(ctx context.Context, cfg *config.Config) error {
 	// Create and run materializer.
 	mat := logical.NewMaterializer(cfg.Sink, snk.Catalog(), snk.S3(), snk.Tables(), str)
 	mat.WorkerID = workerID
+	mat.ConsumerGroup = cfg.Source.Logical.PublicationName
 
 	metricsAddr := cfg.MetricsAddr
 	if metricsAddr == "" {
