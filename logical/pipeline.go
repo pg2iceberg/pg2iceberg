@@ -346,6 +346,10 @@ func (p *Pipeline) setup(ctx context.Context) error {
 
 	// Start materializer.
 	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.str)
+	if p.cfg.Sink.MaterializerWorkerID != "" {
+		materializer.WorkerID = p.cfg.Sink.MaterializerWorkerID
+		log.Printf("[logical:%s] materializer distributed mode (worker_id=%s)", p.id, materializer.WorkerID)
+	}
 	go materializer.Run(ctx)
 	p.materializer = materializer
 	log.Printf("[logical:%s] materializer started (interval=%s)", p.id, p.cfg.Sink.MaterializerDuration())

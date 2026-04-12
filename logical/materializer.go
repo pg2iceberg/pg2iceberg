@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -106,10 +107,29 @@ func (m *Materializer) MaterializeAll(ctx context.Context) {
 }
 
 // Run starts the materialization loop. Blocks until ctx is cancelled.
+// If MaterializerInterval is "0", the loop is disabled (stream-only mode)
+// and Run blocks until ctx is done.
 func (m *Materializer) Run(ctx context.Context) {
 	interval := m.cfg.MaterializerDuration()
-	if interval <= 0 {
+	if interval == 0 {
+		// Materializer disabled — block until shutdown.
+		<-ctx.Done()
+		return
+	}
+	if interval < 0 {
 		interval = 10 * time.Second
+	}
+
+	// In distributed mode, add random jitter (0-50% of interval) to the
+	// first cycle to reduce lock contention and catalog commit conflicts
+	// when multiple workers start simultaneously.
+	if m.WorkerID != "" {
+		jitter := time.Duration(rand.Int64N(int64(interval) / 2))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(jitter):
+		}
 	}
 
 	ticker := time.NewTicker(interval)
@@ -124,7 +144,11 @@ func (m *Materializer) Run(ctx context.Context) {
 				return // don't start a cycle during shutdown
 			}
 			if err := m.materializeCycle(ctx); err != nil {
-				log.Printf("[materializer] cycle error: %v", err)
+				if strings.Contains(err.Error(), "409") {
+					log.Printf("[materializer] commit conflict (another worker committed first), will retry next cycle")
+				} else {
+					log.Printf("[materializer] cycle error: %v", err)
+				}
 			}
 		}
 	}

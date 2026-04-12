@@ -2971,6 +2971,236 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	}
 }
 
+// TestMaterializer_CacheInvalidationOnConflict verifies that when two distributed
+// materializer workers get a catalog 409 (concurrent commit conflict), the
+// MetadataStore's cache invalidation ensures recovery on the next cycle.
+//
+// Scenario:
+//   - Two workers start simultaneously on fresh tables (no snapshots)
+//   - Both try to commit the first snapshot → one wins, one gets 409
+//   - The loser's cache is invalidated → next cycle loads fresh metadata → succeeds
+//   - All rows are eventually materialized with no duplicates
+func TestMaterializer_CacheInvalidationOnConflict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+		CREATE TABLE payments (
+			id SERIAL PRIMARY KEY,
+			amount INTEGER NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            100,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "1h", // disable auto-materializer
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.orders"},
+			{Name: "public.payments"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_conflict",
+				SlotName:        "test_slot_conflict",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	// Use a conflict-checking catalog that validates CurrentSnapshotID.
+	cat := newConflictCheckingCatalog()
+	coord := stream.NewMemCoordinator()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	cs := stream.NewCachedStream(coord, mem, sinkCfg.Namespace)
+	snk.SetStream(cs)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+
+	coord.EnsureCursor(ctx, "public.orders")
+	coord.EnsureCursor(ctx, "public.payments")
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() { cancel(); <-p.Done() }()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// Insert data.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	for i := 0; i < 5; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (name) VALUES ($1)", fmt.Sprintf("order-%d", i))
+		conn.Exec(ctx, "INSERT INTO payments (amount) VALUES ($1)", (i+1)*100)
+	}
+
+	// Wait for flush.
+	time.Sleep(2 * time.Second)
+
+	// Create two materializers WITHOUT worker IDs — both will process all
+	// tables without locks, forcing a catalog conflict on the first commit.
+	matA := logical.NewMaterializer(sinkCfg, cat, mem, snk.Tables(), cs)
+	matB := logical.NewMaterializer(sinkCfg, cat, mem, snk.Tables(), cs)
+
+	// Run both simultaneously — they'll fight over fresh tables.
+	conflictsBefore := cat.conflictCount()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); matA.MaterializeAll(ctx) }()
+	go func() { defer wg.Done(); matB.MaterializeAll(ctx) }()
+	wg.Wait()
+
+	conflicts := cat.conflictCount() - conflictsBefore
+	t.Logf("phase 1: %d catalog conflicts detected", conflicts)
+
+	// Insert more data and run again — this time the cache should be fresh
+	// and no conflicts should occur (locks prevent double-processing).
+	for i := 5; i < 10; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (name) VALUES ($1)", fmt.Sprintf("order-%d", i))
+		conn.Exec(ctx, "INSERT INTO payments (amount) VALUES ($1)", (i+1)*100)
+	}
+	time.Sleep(2 * time.Second)
+
+	conflictsBefore2 := cat.conflictCount()
+	wg.Add(2)
+	go func() { defer wg.Done(); matA.MaterializeAll(ctx) }()
+	go func() { defer wg.Done(); matB.MaterializeAll(ctx) }()
+	wg.Wait()
+
+	conflicts2 := cat.conflictCount() - conflictsBefore2
+	t.Logf("phase 2: %d catalog conflicts (expected with no locks — cache invalidation handles recovery)", conflicts2)
+
+	// Verify all data materialized correctly.
+	ordersTm, _ := cat.LoadTable(context.Background(), "test_ns", "orders")
+	paymentsTm, _ := cat.LoadTable(context.Background(), "test_ns", "payments")
+
+	ordersRows := countDataRows(t, context.Background(), mem, ordersTm)
+	paymentsRows := countDataRows(t, context.Background(), mem, paymentsTm)
+
+	t.Logf("final: orders=%d rows, payments=%d rows (expected 10 each)", ordersRows, paymentsRows)
+
+	if ordersRows != 10 {
+		t.Errorf("orders: expected 10 rows, got %d", ordersRows)
+	}
+	if paymentsRows != 10 {
+		t.Errorf("payments: expected 10 rows, got %d", paymentsRows)
+	}
+}
+
+// conflictCheckingCatalog wraps memCatalog with real optimistic concurrency
+// checking on CommitSnapshot. Returns an error when CurrentSnapshotID doesn't
+// match, simulating the Iceberg REST catalog's 409 behavior.
+type conflictCheckingCatalog struct {
+	*memCatalog
+	conflicts atomic.Int64
+}
+
+func newConflictCheckingCatalog() *conflictCheckingCatalog {
+	return &conflictCheckingCatalog{memCatalog: newMemCatalog()}
+}
+
+func (c *conflictCheckingCatalog) conflictCount() int64 {
+	return c.conflicts.Load()
+}
+
+func (c *conflictCheckingCatalog) CommitSnapshot(ctx context.Context, ns, table string, currentSnapshotID int64, snapshot iceberg.SnapshotCommit) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := ns + "." + table
+	tm := c.tables[key]
+	if tm == nil {
+		return fmt.Errorf("table not found: %s", key)
+	}
+
+	// Optimistic concurrency check: reject if snapshot ID doesn't match.
+	if tm.Metadata.CurrentSnapshotID != currentSnapshotID {
+		c.conflicts.Add(1)
+		return fmt.Errorf("catalog error 409: Requirement failed: branch main was created concurrently (expected snapshot %d, actual %d)",
+			currentSnapshotID, tm.Metadata.CurrentSnapshotID)
+	}
+
+	tm.Metadata.CurrentSnapshotID = snapshot.SnapshotID
+	tm.Metadata.LastSequenceNumber = snapshot.SequenceNumber
+	snap := struct {
+		SnapshotID     int64             `json:"snapshot-id"`
+		TimestampMs    int64             `json:"timestamp-ms"`
+		ManifestList   string            `json:"manifest-list"`
+		Summary        map[string]string `json:"summary"`
+		SchemaID       int               `json:"schema-id"`
+		SequenceNumber int64             `json:"sequence-number"`
+	}{
+		SnapshotID:     snapshot.SnapshotID,
+		TimestampMs:    snapshot.TimestampMs,
+		ManifestList:   snapshot.ManifestListPath,
+		Summary:        snapshot.Summary,
+		SchemaID:       snapshot.SchemaID,
+		SequenceNumber: snapshot.SequenceNumber,
+	}
+	tm.Metadata.Snapshots = append(tm.Metadata.Snapshots, snap)
+	return nil
+}
+
+func (c *conflictCheckingCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
+	for _, tc := range commits {
+		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+			return err
+		}
+		if tc.NewManifests != nil {
+			c.SetManifests(ns, tc.Table, tc.NewManifests)
+		}
+		fi := c.FileIndex(ns, tc.Table)
+		if fi != nil {
+			for _, pk := range tc.DeletedPKs {
+				if filePath, ok := fi.PkToFile[pk]; ok {
+					delete(fi.PkToFile, pk)
+					if pks, ok := fi.FilePKs[filePath]; ok {
+						delete(pks, pk)
+					}
+				}
+			}
+			for _, fe := range tc.NewDataFiles {
+				fi.AddFile(fe.DataFile, fe.PKKeys)
+			}
+		}
+	}
+	return nil
+}
+
 // TestPipeline_SlotSurvivesShutdown verifies that the replication slot is NOT
 // dropped when the pipeline shuts down. The slot must persist so the pipeline
 // can resume from its last confirmed LSN without data loss.

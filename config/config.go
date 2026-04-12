@@ -164,6 +164,7 @@ type SinkConfig struct {
 	EventsPartition string `yaml:"events_partition" json:"events_partition,omitempty"`
 
 	// Materializer settings
+	MaterializerWorkerID       string `yaml:"materializer_worker_id" json:"materializer_worker_id,omitempty"` // enables distributed mode; tables claimed via heartbeat locks
 	MaterializerInterval       string `yaml:"materializer_interval" json:"materializer_interval,omitempty"`
 	MaterializerTargetFileSize int64  `yaml:"materializer_target_file_size" json:"materializer_target_file_size,omitempty"`
 	MaterializerConcurrency    int    `yaml:"materializer_concurrency" json:"materializer_concurrency,omitempty"`
@@ -454,6 +455,12 @@ func (cfg *Config) ApplyEnv() error {
 	}
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
 		cfg.MetricsAddr = v
+	}
+	if v := os.Getenv("MATERIALIZER_WORKER_ID"); v != "" {
+		cfg.Sink.MaterializerWorkerID = v
+	}
+	if v := os.Getenv("COORDINATOR_SCHEMA"); v != "" {
+		cfg.State.CoordinatorSchema = v
 	}
 
 	if v := os.Getenv("MAINTENANCE_RETENTION"); v != "" {
