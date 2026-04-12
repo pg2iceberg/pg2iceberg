@@ -257,7 +257,7 @@ func TestPgCoordinator_Cursor(t *testing.T) {
 	coord := newTestCoordinator(t, ctx)
 
 	// No cursor yet.
-	offset, err := coord.GetCursor(ctx, "public.orders")
+	offset, err := coord.GetCursor(ctx, "default", "public.orders")
 	if err != nil {
 		t.Fatalf("get cursor: %v", err)
 	}
@@ -266,10 +266,10 @@ func TestPgCoordinator_Cursor(t *testing.T) {
 	}
 
 	// Ensure cursor.
-	if err := coord.EnsureCursor(ctx, "public.orders"); err != nil {
+	if err := coord.EnsureCursor(ctx, "default", "public.orders"); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	offset, err = coord.GetCursor(ctx, "public.orders")
+	offset, err = coord.GetCursor(ctx, "default", "public.orders")
 	if err != nil {
 		t.Fatalf("get after ensure: %v", err)
 	}
@@ -278,15 +278,15 @@ func TestPgCoordinator_Cursor(t *testing.T) {
 	}
 
 	// Ensure is idempotent.
-	if err := coord.EnsureCursor(ctx, "public.orders"); err != nil {
+	if err := coord.EnsureCursor(ctx, "default", "public.orders"); err != nil {
 		t.Fatalf("ensure idempotent: %v", err)
 	}
 
 	// Set cursor.
-	if err := coord.SetCursor(ctx, "public.orders", 42); err != nil {
+	if err := coord.SetCursor(ctx, "default", "public.orders", 42); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	offset, err = coord.GetCursor(ctx, "public.orders")
+	offset, err = coord.GetCursor(ctx, "default", "public.orders")
 	if err != nil {
 		t.Fatalf("get after set: %v", err)
 	}
@@ -295,10 +295,10 @@ func TestPgCoordinator_Cursor(t *testing.T) {
 	}
 
 	// Different tables are independent.
-	if err := coord.EnsureCursor(ctx, "public.users"); err != nil {
+	if err := coord.EnsureCursor(ctx, "default", "public.users"); err != nil {
 		t.Fatalf("ensure users: %v", err)
 	}
-	offset, err = coord.GetCursor(ctx, "public.users")
+	offset, err = coord.GetCursor(ctx, "default", "public.users")
 	if err != nil {
 		t.Fatalf("get users: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestPgCoordinator_FullCycle(t *testing.T) {
 	table := "public.orders"
 
 	// Setup: ensure cursor.
-	if err := coord.EnsureCursor(ctx, table); err != nil {
+	if err := coord.EnsureCursor(ctx, "default", table); err != nil {
 		t.Fatalf("ensure cursor: %v", err)
 	}
 
@@ -468,7 +468,7 @@ func TestPgCoordinator_FullCycle(t *testing.T) {
 	}
 
 	// Simulate materializer cycle 1: read from cursor, process, advance.
-	cursor, _ := coord.GetCursor(ctx, table)
+	cursor, _ := coord.GetCursor(ctx, "default", table)
 	entries, err := coord.ReadLog(ctx, table, cursor)
 	if err != nil {
 		t.Fatalf("read: %v", err)
@@ -479,12 +479,12 @@ func TestPgCoordinator_FullCycle(t *testing.T) {
 
 	// Process first 2 entries, advance cursor.
 	maxOffset := entries[1].EndOffset // 20
-	if err := coord.SetCursor(ctx, table, maxOffset); err != nil {
+	if err := coord.SetCursor(ctx, "default", table, maxOffset); err != nil {
 		t.Fatalf("set cursor: %v", err)
 	}
 
 	// Simulate materializer cycle 2: only sees entry 3.
-	cursor, _ = coord.GetCursor(ctx, table)
+	cursor, _ = coord.GetCursor(ctx, "default", table)
 	entries, err = coord.ReadLog(ctx, table, cursor)
 	if err != nil {
 		t.Fatalf("read cycle 2: %v", err)
@@ -497,7 +497,7 @@ func TestPgCoordinator_FullCycle(t *testing.T) {
 	}
 
 	// Advance cursor and truncate processed entries.
-	if err := coord.SetCursor(ctx, table, entries[0].EndOffset); err != nil {
+	if err := coord.SetCursor(ctx, "default", table, entries[0].EndOffset); err != nil {
 		t.Fatalf("set cursor final: %v", err)
 	}
 	paths, err := coord.TruncateLog(ctx, table, 20)
