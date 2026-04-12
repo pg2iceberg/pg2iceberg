@@ -2,6 +2,7 @@ package logical
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -643,52 +644,81 @@ func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
 		float64((prep.tToast-prep.tFold).Milliseconds()))
 }
 
-// readEventsFromLog downloads staged Parquet files referenced by log entries
-// and parses them into MatEvent structs.
+// readEventsFromLog reads events for a set of log entries. In combined mode
+// (CachedStream), pre-parsed MatEvents are returned directly from memory —
+// no S3 download, no Parquet parse, no JSON decode. In multi-process mode
+// or on cache miss (recovery), it downloads the staged Parquet files and
+// decodes the JSON _data column.
 func (m *Materializer) readEventsFromLog(ctx context.Context, entries []stream.LogEntry, srcSchema *postgres.TableSchema) ([]MatEvent, error) {
-	eventsSchema := iceberg.EventsTableSchema(srcSchema)
+	// Check if CachedStream has pre-parsed events.
+	cs, isCached := m.stream.(*stream.CachedStream)
+
 	var events []MatEvent
-
 	for _, entry := range entries {
-		data, err := m.stream.Download(ctx, entry.S3Path)
-		if err != nil {
-			return nil, fmt.Errorf("download staged file %s: %w", entry.S3Path, err)
-		}
-
-		rows, err := iceberg.ReadParquetRows(data, eventsSchema)
-		if err != nil {
-			return nil, fmt.Errorf("read staged file %s: %w", entry.S3Path, err)
-		}
-
-		for _, row := range rows {
-			lsn, err := iceberg.ToInt64(row["_lsn"])
-			if err != nil {
-				return nil, fmt.Errorf("parse _lsn in %s: %w", entry.S3Path, err)
-			}
-			seq, err := iceberg.ToInt64(row["_seq"])
-			if err != nil {
-				return nil, fmt.Errorf("parse _seq in %s: %w", entry.S3Path, err)
-			}
-			ev := MatEvent{
-				op:  fmt.Sprintf("%v", row["_op"]),
-				lsn: lsn,
-				seq: seq,
-			}
-
-			if uc, ok := row["_unchanged_cols"]; ok && uc != nil {
-				ucStr := fmt.Sprintf("%v", uc)
-				if ucStr != "" {
-					ev.unchangedCols = strings.Split(ucStr, ",")
+		// Fast path: read from event cache (combined mode).
+		if isCached {
+			if cached := cs.CachedEvents(entry.S3Path); cached != nil {
+				if matEvents, ok := cached.([]MatEvent); ok {
+					events = append(events, matEvents...)
+					continue
 				}
 			}
-
-			ev.row = make(map[string]any, len(srcSchema.Columns))
-			for _, col := range srcSchema.Columns {
-				ev.row[col.Name] = row[col.Name]
-			}
-
-			events = append(events, ev)
 		}
+
+		// Slow path: download Parquet, decode JSON _data column.
+		parsed, err := m.readEventsFromParquet(ctx, entry.S3Path)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, parsed...)
+	}
+
+	return events, nil
+}
+
+// readEventsFromParquet downloads a staged Parquet file and decodes its
+// fixed-schema rows (with JSON _data) into MatEvent structs.
+func (m *Materializer) readEventsFromParquet(ctx context.Context, s3Path string) ([]MatEvent, error) {
+	data, err := m.stream.Download(ctx, s3Path)
+	if err != nil {
+		return nil, fmt.Errorf("download staged file %s: %w", s3Path, err)
+	}
+
+	stagedSchema := iceberg.StagedEventSchema()
+	rows, err := iceberg.ReadParquetRows(data, stagedSchema)
+	if err != nil {
+		return nil, fmt.Errorf("read staged file %s: %w", s3Path, err)
+	}
+
+	var events []MatEvent
+	for _, row := range rows {
+		lsn, err := iceberg.ToInt64(row["_lsn"])
+		if err != nil {
+			return nil, fmt.Errorf("parse _lsn in %s: %w", s3Path, err)
+		}
+		ev := MatEvent{
+			op:  fmt.Sprintf("%v", row["_op"]),
+			lsn: lsn,
+		}
+
+		if uc, ok := row["_unchanged_cols"]; ok && uc != nil {
+			ucStr := fmt.Sprintf("%v", uc)
+			if ucStr != "" {
+				ev.unchangedCols = strings.Split(ucStr, ",")
+			}
+		}
+
+		// Decode JSON _data into user column map.
+		dataStr, ok := row["_data"].(string)
+		if !ok {
+			return nil, fmt.Errorf("_data is not a string in %s", s3Path)
+		}
+		ev.row = make(map[string]any)
+		if err := json.Unmarshal([]byte(dataStr), &ev.row); err != nil {
+			return nil, fmt.Errorf("unmarshal _data in %s: %w", s3Path, err)
+		}
+
+		events = append(events, ev)
 	}
 
 	return events, nil

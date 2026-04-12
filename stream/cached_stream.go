@@ -10,30 +10,31 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// CachedStream wraps a Stream with an in-memory cache of recently staged files.
+// CachedStream wraps a Stream with an in-memory cache of pre-parsed events.
 // In combined mode (single process running both WAL writer and materializer),
-// the materializer reads staged Parquet data from the cache instead of
-// downloading it from S3, avoiding a redundant round-trip for data that was
-// just uploaded.
+// the materializer reads events directly from memory — skipping S3 download,
+// Parquet parsing, and JSON decoding entirely.
 //
 // On cold start (restart/recovery), the cache is empty and Download falls back
-// to S3 — this is the correct behavior for crash recovery.
+// to S3 + Parquet + JSON decode — this is the correct recovery behavior.
 type CachedStream struct {
 	coord     Coordinator
 	s3        iceberg.ObjectStorage
 	namespace string
 
-	mu    sync.Mutex
-	cache map[string][]byte // s3Key -> parquet data
+	mu         sync.Mutex
+	eventCache map[string]any    // s3Key -> pre-parsed events ([]MatEvent from logical pkg)
+	dataCache  map[string][]byte // s3Key -> raw Parquet bytes (fallback for Download)
 }
 
-// NewCachedStream creates a Stream with an in-memory download cache.
+// NewCachedStream creates a Stream with an in-memory event cache.
 func NewCachedStream(coord Coordinator, s3 iceberg.ObjectStorage, namespace string) *CachedStream {
 	return &CachedStream{
-		coord:     coord,
-		s3:        s3,
-		namespace: namespace,
-		cache:     make(map[string][]byte),
+		coord:      coord,
+		s3:         s3,
+		namespace:  namespace,
+		eventCache: make(map[string]any),
+		dataCache:  make(map[string][]byte),
 	}
 }
 
@@ -41,8 +42,7 @@ func NewCachedStream(coord Coordinator, s3 iceberg.ObjectStorage, namespace stri
 func (cs *CachedStream) Coordinator() Coordinator { return cs.coord }
 
 // Append stages Parquet files to S3, atomically registers them in the log
-// index, and caches the data in memory so the co-located materializer can
-// read it without an S3 round-trip.
+// index, and caches the pre-parsed events in memory.
 func (cs *CachedStream) Append(ctx context.Context, batches []WriteBatch) error {
 	if len(batches) == 0 {
 		return nil
@@ -88,12 +88,17 @@ func (cs *CachedStream) Append(ctx context.Context, batches []WriteBatch) error 
 		return fmt.Errorf("claim offsets: %w", err)
 	}
 
-	// Cache the data for the co-located materializer.
+	// Cache pre-parsed events and raw data for the co-located materializer.
 	cs.mu.Lock()
 	for i, b := range batches {
+		key := files[i].key
+		if b.Events != nil {
+			cs.eventCache[key] = b.Events
+		}
+		// Also cache raw bytes as fallback for Download.
 		cp := make([]byte, len(b.Data))
 		copy(cp, b.Data)
-		cs.cache[files[i].key] = cp
+		cs.dataCache[key] = cp
 	}
 	cs.mu.Unlock()
 
@@ -105,31 +110,37 @@ func (cs *CachedStream) Read(ctx context.Context, table string, afterOffset int6
 	return cs.coord.ReadLog(ctx, table, afterOffset)
 }
 
+// CachedEvents returns pre-parsed events for a staged file, or nil on cache miss.
+// The caller should type-assert the result to []MatEvent.
+func (cs *CachedStream) CachedEvents(s3Path string) any {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.eventCache[s3Path]
+}
+
 // Download returns staged Parquet data from the in-memory cache if available,
 // falling back to S3 on cache miss (cold start / recovery).
 func (cs *CachedStream) Download(ctx context.Context, s3Path string) ([]byte, error) {
 	cs.mu.Lock()
-	data, ok := cs.cache[s3Path]
+	data, ok := cs.dataCache[s3Path]
 	cs.mu.Unlock()
 	if ok {
 		return data, nil
 	}
-	// Cache miss — fall back to S3 (recovery path).
 	return cs.s3.Download(ctx, s3Path)
 }
 
-// Evict removes entries from the cache. Call after the materializer
-// successfully commits to keep the cache bounded.
+// Evict removes entries from both caches.
 func (cs *CachedStream) Evict(paths []string) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	for _, p := range paths {
-		delete(cs.cache, p)
+		delete(cs.eventCache, p)
+		delete(cs.dataCache, p)
 	}
 }
 
 // Truncate removes processed log entries and deletes their S3 files.
-// Also evicts the entries from the cache.
 func (cs *CachedStream) Truncate(ctx context.Context, table string, atOrBeforeOffset int64) error {
 	paths, err := cs.coord.TruncateLog(ctx, table, atOrBeforeOffset)
 	if err != nil {

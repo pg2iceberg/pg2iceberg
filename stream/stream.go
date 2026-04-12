@@ -53,6 +53,12 @@ type WriteBatch struct {
 	Table       string // PG table name (e.g. "public.orders")
 	Data        []byte // serialized Parquet bytes
 	RecordCount int    // number of change events
+
+	// Events carries pre-parsed events for CachedStream. In combined mode,
+	// the materializer reads these directly instead of re-parsing the Parquet
+	// + JSON. The concrete type is []logical.MatEvent but stored as any to
+	// avoid a circular import. Nil for BaseStream (multi-process mode).
+	Events any
 }
 
 // Append stages Parquet files to S3 and atomically registers them in the

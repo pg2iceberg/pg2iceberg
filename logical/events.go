@@ -2,6 +2,7 @@ package logical
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -15,6 +16,10 @@ import (
 )
 
 var sinkTracer = otel.Tracer("pg2iceberg/sink")
+
+// stagedSchema is the fixed Parquet schema for staged WAL files.
+// Created once, shared across all tables — user columns are JSON in _data.
+var stagedSchema = iceberg.StagedEventSchema()
 
 // txBuffer holds events for a single in-flight PG transaction.
 type txBuffer struct {
@@ -51,18 +56,22 @@ type Sink struct {
 type tableSink struct {
 	// Source schema (user columns only).
 	srcSchema *postgres.TableSchema
-	// Events schema (metadata + user columns, all user cols nullable).
-	// Used for Parquet serialization of staged files.
-	eventsSchema *postgres.TableSchema
 
 	icebergName string                 // materialized table name in Iceberg (e.g. "orders")
 	partSpec    *iceberg.PartitionSpec // materialized table partition spec
 	matSchemaID int                    // materialized table schema ID
 	targetSize  int64
 
-	// Single rolling writer for staged Parquet files (events).
+	// Single rolling writer for staged Parquet files.
+	// Uses the fixed stagedSchema (user data is JSON in _data).
+	// Never rebuilt on schema evolution.
 	writer    *iceberg.RollingWriter
 	totalRows int
+
+	// Per-flush accumulator of MatEvents, keyed by the batch index
+	// within the current flush. Used to pass pre-parsed events to
+	// the CachedStream so the materializer skips JSON decode.
+	pendingEvents []MatEvent
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
@@ -158,9 +167,6 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 		matSchemaID = matTm.Metadata.CurrentSchemaID
 	}
 
-	// Build events schema for staged Parquet files.
-	eventsSchema := iceberg.EventsTableSchema(ts)
-
 	// Ensure materializer cursor exists for this table.
 	if s.stream != nil {
 		if err := s.stream.Coordinator().EnsureCursor(ctx, ts.Table); err != nil {
@@ -170,13 +176,12 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 
 	targetSize := s.cfg.TargetFileSizeOrDefault()
 	tSink := &tableSink{
-		srcSchema:    ts,
-		eventsSchema: eventsSchema,
-		icebergName:  icebergTable,
-		partSpec:     partSpec,
-		matSchemaID:  matSchemaID,
-		targetSize:   targetSize,
-		writer:       iceberg.NewRollingDataWriter(eventsSchema, targetSize),
+		srcSchema:   ts,
+		icebergName: icebergTable,
+		partSpec:    partSpec,
+		matSchemaID: matSchemaID,
+		targetSize:  targetSize,
+		writer:      iceberg.NewRollingDataWriter(stagedSchema, targetSize),
 	}
 
 	s.tables[ts.Table] = tSink
@@ -190,9 +195,9 @@ func (s *Sink) UnregisterTable(pgTable string) {
 	delete(s.tables, pgTable)
 }
 
-// EvolveSchema applies a schema change to a table: updates the in-memory schema,
-// evolves the materialized Iceberg table, and rebuilds writers.
-// The caller must flush all buffered data before calling this.
+// EvolveSchema applies a schema change to a table: updates the in-memory schema
+// and evolves the materialized Iceberg table. The staged Parquet writer uses a
+// fixed schema (user data is JSON in _data), so no writer rebuild is needed.
 func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgres.SchemaChange) error {
 	ts, ok := s.tables[pgTable]
 	if !ok {
@@ -254,9 +259,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgre
 		log.Printf("[sink] schema change for %s is a no-op at Iceberg level, skipping catalog evolution", pgTable)
 	}
 
-	// Rebuild events schema and writer with the new schema.
-	ts.eventsSchema = iceberg.EventsTableSchema(ts.srcSchema)
-	ts.writer = iceberg.NewRollingDataWriter(ts.eventsSchema, ts.targetSize)
+	// No writer rebuild needed — staged files use a fixed schema with JSON _data.
 
 	log.Printf("[sink] evolved schema for %s to schema-id %d (materialized)",
 		pgTable, ts.matSchemaID)
@@ -299,40 +302,52 @@ func (s *Sink) Write(event postgres.ChangeEvent) error {
 	return s.writeDirect(event)
 }
 
-// writeDirect writes a change event to the staging writer as an append-only row.
+// writeDirect converts a change event into a staged Parquet row (fixed schema
+// with JSON _data) and accumulates a MatEvent for the CachedStream.
 func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 	ts, ok := s.tables[event.Table]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", event.Table)
 	}
 
-	// Reuse the source event's map directly — the source allocates a new map
-	// per event and doesn't retain references.
-	var row map[string]any
+	var me MatEvent
 	switch event.Operation {
 	case postgres.OpInsert:
-		row = event.After
-		row["_op"] = "I"
+		me.op = "I"
+		me.row = event.After
 	case postgres.OpUpdate:
-		row = event.After
-		row["_op"] = "U"
-		if len(event.UnchangedCols) > 0 {
-			row["_unchanged_cols"] = iceberg.UnchangedColsString(event.UnchangedCols)
-		}
+		me.op = "U"
+		me.row = event.After
+		me.unchangedCols = event.UnchangedCols
 	case postgres.OpDelete:
-		row = event.Before
-		row["_op"] = "D"
+		me.op = "D"
+		me.row = event.Before
 	default:
-		return nil // ignore other operations
+		return nil
+	}
+	me.lsn = int64(event.LSN)
+
+	// JSON-encode user columns for the _data field.
+	dataJSON, err := json.Marshal(me.row)
+	if err != nil {
+		return fmt.Errorf("marshal _data for %s: %w", event.Table, err)
 	}
 
-	row["_lsn"] = int64(event.LSN)
-	row["_ts"] = event.SourceTimestamp
-	row["_seq"] = int64(0) // placeholder — offset assigned by Stream
+	// Build the fixed-schema Parquet row.
+	row := map[string]any{
+		"_op":  me.op,
+		"_lsn": me.lsn,
+		"_ts":  event.SourceTimestamp,
+		"_data": string(dataJSON),
+	}
+	if len(me.unchangedCols) > 0 {
+		row["_unchanged_cols"] = iceberg.UnchangedColsString(me.unchangedCols)
+	}
 
 	if err := ts.writer.Add(row); err != nil {
 		return err
 	}
+	ts.pendingEvents = append(ts.pendingEvents, me)
 	ts.totalRows++
 	return nil
 }
@@ -374,21 +389,15 @@ func (s *Sink) CheckBackpressure(ctx context.Context) error {
 
 // Flush replays committed transactions into writers, then stages all data
 // to S3 and registers in the Stream atomically.
-//
-// On success, committedTxns is cleared and writers are finalized. If Flush
-// is called again (e.g. from a retry loop), it returns nil immediately.
-// The Stream.Append call is NOT retried — staged data is durable once
-// uploaded to S3 + registered in PG. The caller (pipeline.flush) can safely
-// retry the checkpoint save without re-staging.
 func (s *Sink) Flush(ctx context.Context) error {
 	if len(s.committedTxns) == 0 {
 		return nil
 	}
 
-	// Reset writers to ensure a clean slate (no leftover rows from a
-	// previous failed flush attempt).
+	// Reset writers and pending events for a clean slate.
 	for _, ts := range s.tables {
 		ts.writer.Reset()
+		ts.pendingEvents = nil
 	}
 
 	// Drain committed transactions into per-table writers.
@@ -400,7 +409,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 		}
 	}
 
-	// Collect FileChunks from all tables into WriteBatches for the Stream.
+	// Collect FileChunks + pre-parsed events into WriteBatches.
 	var batches []stream.WriteBatch
 	type flushedTable struct {
 		pgTable string
@@ -416,11 +425,24 @@ func (s *Sink) Flush(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("flush writer for %s: %w", pgTable, err)
 		}
+
+		// Distribute pending events across chunks proportionally.
+		// Each chunk covers a contiguous slice of the pending events.
+		eventIdx := 0
 		for _, chunk := range chunks {
+			count := int(chunk.RowCount)
+			var chunkEvents []MatEvent
+			if eventIdx+count <= len(ts.pendingEvents) {
+				chunkEvents = make([]MatEvent, count)
+				copy(chunkEvents, ts.pendingEvents[eventIdx:eventIdx+count])
+			}
+			eventIdx += count
+
 			batches = append(batches, stream.WriteBatch{
 				Table:       pgTable,
 				Data:        chunk.Data,
-				RecordCount: int(chunk.RowCount),
+				RecordCount: count,
+				Events:      chunkEvents,
 			})
 		}
 		flushed = append(flushed, flushedTable{pgTable, ts})
@@ -428,19 +450,15 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 	if len(batches) > 0 {
 		if err := s.stream.Append(ctx, batches); err != nil {
-			// Append failed — committedTxns are preserved for retry.
-			// The Reset at the top of the next Flush call clears the
-			// writer so events are re-drained without duplication.
 			return fmt.Errorf("stream append: %w", err)
 		}
 	}
 
-	// Staging succeeded — clear committedTxns and finalize writers.
-	// From this point, retries (e.g. from checkpoint save failure) will
-	// see committedTxns == nil and return early.
+	// Staging succeeded — clear state.
 	s.committedTxns = nil
 	for _, ft := range flushed {
 		ft.ts.writer.Commit()
+		ft.ts.pendingEvents = nil
 		ft.ts.totalRows = 0
 		log.Printf("[sink] staged %s events to stream", ft.pgTable)
 	}
