@@ -51,6 +51,10 @@ type Materializer struct {
 	// interfering with each other. Defaults to "default".
 	ConsumerGroup string
 
+	// lastAssigned tracks the previous cycle's table assignment for
+	// detecting rebalances (log when assignment changes).
+	lastAssigned map[string]bool
+
 	// cycleMu serializes materializeCycle calls. Prevents the periodic Run()
 	// goroutine and the shutdown MaterializeAll() from processing the same
 	// events concurrently (which would cause duplicate rows).
@@ -115,6 +119,18 @@ func (m *Materializer) MaterializeAll(ctx context.Context) {
 
 // unregisterWorker removes this worker from the registry on shutdown so other
 // workers immediately see the updated worker count and rebalance.
+func mapsEqual(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *Materializer) group() string {
 	if m.ConsumerGroup != "" {
 		return m.ConsumerGroup
@@ -237,6 +253,26 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 				assigned[tbl] = true
 			}
 		}
+
+		// Detect rebalance: log when assignment changes.
+		if m.lastAssigned != nil && !mapsEqual(m.lastAssigned, assigned) {
+			var added, removed []string
+			for tbl := range assigned {
+				if !m.lastAssigned[tbl] {
+					added = append(added, tbl)
+				}
+			}
+			for tbl := range m.lastAssigned {
+				if !assigned[tbl] {
+					removed = append(removed, tbl)
+				}
+			}
+			sort.Strings(added)
+			sort.Strings(removed)
+			log.Printf("[materializer:%s] rebalanced: %d consumers, +%v -%v (now %d tables)",
+				m.WorkerID, len(workers), added, removed, len(assigned))
+		}
+		m.lastAssigned = assigned
 	}
 
 	// Phase 2: Read new log entries per table and parse events.

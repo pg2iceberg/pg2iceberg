@@ -2776,14 +2776,14 @@ func TestMaterializer_NoDuplicateRowsOnShutdown(t *testing.T) {
 	}
 }
 
-// TestMaterializer_HorizontalScaling verifies that materializer workers
-// can scale horizontally via heartbeat locks: 1 worker → 2 workers → 1 worker.
+// TestMaterializer_HorizontalScaling verifies consumer-group-based table
+// assignment and rebalancing: 1 consumer → 2 consumers → 1 consumer.
 //
-// Phase 1: Single materializer A processes 2 tables (orders, payments)
-// Phase 2: Scale up — materializers A+B run concurrently, tables distributed
-// Phase 3: Scale down — only materializer A runs, processes both tables again
+// Phase 1: Single consumer A processes both tables (orders, payments)
+// Phase 2: Scale up — consumers A+B, each gets 1 table via round-robin
+// Phase 3: Scale down — B unregisters, A processes both tables again
 //
-// Verifies: all rows materialized exactly once, no duplicates, no data loss.
+// Verifies: tables are distributed, cursors advance, no duplicates, no data loss.
 func TestMaterializer_HorizontalScaling(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -2820,7 +2820,7 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 		FlushBytes:           1 << 30,
 		Namespace:            "test_ns",
 		Warehouse:            "s3://test-bucket/",
-		MaterializerInterval: "1h", // disable auto-materializer — we control it manually
+		MaterializerInterval: "1h", // disable auto-materializer
 	}
 
 	cfg := &config.Config{
@@ -2842,15 +2842,15 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	mem := newMemStorage()
 	cat := newTrackingCatalog()
 	coord := stream.NewMemCoordinator()
+	group := "test_group"
 
 	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 	cs := stream.NewCachedStream(coord, mem, sinkCfg.Namespace)
 	snk.SetStream(cs)
 	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
-	// Ensure cursors for both tables.
-	coord.EnsureCursor(ctx, "default", "public.orders")
-	coord.EnsureCursor(ctx, "default", "public.payments")
+	coord.EnsureCursor(ctx, group, "public.orders")
+	coord.EnsureCursor(ctx, group, "public.payments")
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2872,40 +2872,51 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 		}
 	}
 
-	// Helper: create a distributed materializer with the given workerID.
 	newDistMat := func(workerID string) *logical.Materializer {
 		m := logical.NewMaterializer(sinkCfg, cat, mem, snk.Tables(), cs)
 		m.WorkerID = workerID
+		m.ConsumerGroup = group
 		return m
 	}
 
-	// --- Phase 1: Single materializer A processes both tables ---
+	// --- Phase 1: Single consumer A processes both tables ---
 	insertBatch(0, 5)
-	time.Sleep(2 * time.Second) // wait for flush
+	time.Sleep(2 * time.Second)
 
-	matA := newDistMat("worker-a")
+	// Register A so round-robin sees 1 consumer.
+	coord.RegisterConsumer(ctx, group, "consumer-a", 30*time.Second)
+
+	matA := newDistMat("consumer-a")
 	matA.MaterializeAll(ctx)
 
-	commitsAfterPhase1 := len(cat.matCommits())
-	t.Logf("phase 1 (1 worker): %d commits", commitsAfterPhase1)
+	// Re-register since MaterializeAll unregisters on exit.
+	coord.RegisterConsumer(ctx, group, "consumer-a", 30*time.Second)
 
+	commitsAfterPhase1 := len(cat.matCommits())
+	t.Logf("phase 1 (1 consumer): %d commits", commitsAfterPhase1)
 	if commitsAfterPhase1 == 0 {
-		t.Fatal("expected commits from single worker in phase 1")
+		t.Fatal("expected commits from single consumer in phase 1")
 	}
 
-	// Verify phase 1 cursors advanced for both tables.
-	curOrders, _ := coord.GetCursor(ctx, "default", "public.orders")
-	curPayments, _ := coord.GetCursor(ctx, "default", "public.payments")
+	// Both cursors should have advanced (A owns both tables).
+	curOrders, _ := coord.GetCursor(ctx, group, "public.orders")
+	curPayments, _ := coord.GetCursor(ctx, group, "public.payments")
 	t.Logf("phase 1 cursors: orders=%d, payments=%d", curOrders, curPayments)
 	if curOrders <= 0 || curPayments <= 0 {
-		t.Fatalf("expected both cursors > 0 after phase 1, got orders=%d payments=%d", curOrders, curPayments)
+		t.Fatalf("expected both cursors > 0, got orders=%d payments=%d", curOrders, curPayments)
 	}
 
-	// --- Phase 2: Scale up — A and B run concurrently ---
+	// --- Phase 2: Scale up — A and B each get 1 table ---
 	insertBatch(5, 5)
 	time.Sleep(2 * time.Second)
 
-	matB := newDistMat("worker-b")
+	// Register both consumers so round-robin distributes 2 tables across 2.
+	coord.RegisterConsumer(ctx, group, "consumer-a", 30*time.Second)
+	coord.RegisterConsumer(ctx, group, "consumer-b", 30*time.Second)
+
+	matA = newDistMat("consumer-a")
+	matB := newDistMat("consumer-b")
+
 	commitsBeforePhase2 := len(cat.matCommits())
 
 	var wg sync.WaitGroup
@@ -2915,46 +2926,49 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	wg.Wait()
 
 	phase2Commits := len(cat.matCommits()) - commitsBeforePhase2
-	t.Logf("phase 2 (2 workers): %d new commits", phase2Commits)
+	t.Logf("phase 2 (2 consumers): %d new commits", phase2Commits)
 
-	if phase2Commits == 0 {
-		t.Fatal("expected commits from distributed workers in phase 2")
+	// With 2 tables and 2 consumers, round-robin assigns 1 table each.
+	// Both should commit exactly 1 table → 2 total commits.
+	if phase2Commits != 2 {
+		t.Errorf("expected 2 commits (one per consumer), got %d", phase2Commits)
 	}
 
-	// Verify phase 2 cursors advanced.
-	curOrders2, _ := coord.GetCursor(ctx, "default", "public.orders")
-	curPayments2, _ := coord.GetCursor(ctx, "default", "public.payments")
+	curOrders2, _ := coord.GetCursor(ctx, group, "public.orders")
+	curPayments2, _ := coord.GetCursor(ctx, group, "public.payments")
 	t.Logf("phase 2 cursors: orders=%d, payments=%d", curOrders2, curPayments2)
 	if curOrders2 <= curOrders || curPayments2 <= curPayments {
-		t.Fatalf("expected cursors to advance in phase 2: orders %d->%d, payments %d->%d",
+		t.Fatalf("expected cursors to advance: orders %d->%d, payments %d->%d",
 			curOrders, curOrders2, curPayments, curPayments2)
 	}
 
-	// --- Phase 3: Scale down — only A runs, processes both tables ---
+	// --- Phase 3: Scale down — B leaves, A processes both tables ---
 	insertBatch(10, 5)
 	time.Sleep(2 * time.Second)
 
+	// Unregister B, re-register A only.
+	coord.UnregisterConsumer(ctx, group, "consumer-b")
+	coord.RegisterConsumer(ctx, group, "consumer-a", 30*time.Second)
+
+	matA = newDistMat("consumer-a")
 	commitsBeforePhase3 := len(cat.matCommits())
 	matA.MaterializeAll(ctx)
 
 	phase3Commits := len(cat.matCommits()) - commitsBeforePhase3
-	t.Logf("phase 3 (1 worker again): %d new commits", phase3Commits)
-
+	t.Logf("phase 3 (1 consumer again): %d new commits", phase3Commits)
 	if phase3Commits == 0 {
-		t.Fatal("expected commits from single worker in phase 3 after scale-down")
+		t.Fatal("expected commits after scale-down")
 	}
 
-	// Verify final cursors advanced.
-	curOrders3, _ := coord.GetCursor(ctx, "default", "public.orders")
-	curPayments3, _ := coord.GetCursor(ctx, "default", "public.payments")
+	curOrders3, _ := coord.GetCursor(ctx, group, "public.orders")
+	curPayments3, _ := coord.GetCursor(ctx, group, "public.payments")
 	t.Logf("phase 3 cursors: orders=%d, payments=%d", curOrders3, curPayments3)
 	if curOrders3 <= curOrders2 || curPayments3 <= curPayments2 {
-		t.Fatalf("expected cursors to advance in phase 3: orders %d->%d, payments %d->%d",
+		t.Fatalf("expected cursors to advance: orders %d->%d, payments %d->%d",
 			curOrders2, curOrders3, curPayments2, curPayments3)
 	}
 
 	// --- Verify data correctness ---
-	// Each table: 5 rows × 3 phases = 15 rows total, no duplicates.
 	ordersTm, _ := cat.LoadTable(context.Background(), "test_ns", "orders")
 	paymentsTm, _ := cat.LoadTable(context.Background(), "test_ns", "payments")
 
@@ -2964,10 +2978,10 @@ func TestMaterializer_HorizontalScaling(t *testing.T) {
 	t.Logf("final: orders=%d rows, payments=%d rows (expected 15 each)", ordersRows, paymentsRows)
 
 	if ordersRows != 15 {
-		t.Errorf("orders: expected 15 rows, got %d — possible duplicate or data loss", ordersRows)
+		t.Errorf("orders: expected 15 rows, got %d", ordersRows)
 	}
 	if paymentsRows != 15 {
-		t.Errorf("payments: expected 15 rows, got %d — possible duplicate or data loss", paymentsRows)
+		t.Errorf("payments: expected 15 rows, got %d", paymentsRows)
 	}
 }
 
