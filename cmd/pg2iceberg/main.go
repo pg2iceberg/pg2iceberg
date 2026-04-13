@@ -409,6 +409,10 @@ func runMaterializerOnly(ctx context.Context, cfg *config.Config) error {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"status":"ok"}`))
 		})
+		mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+		})
 		srv := &http.Server{Addr: metricsAddr, Handler: mux}
 		go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
@@ -738,6 +742,14 @@ func startMetricsServer(ctx context.Context, addr string, r pipeline.Pipeline) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(r.Metrics())
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r2 *http.Request) {
+		status, _ := r.Status()
+		w.Header().Set("Content-Type", "application/json")
+		if status != pipeline.StatusRunning {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		json.NewEncoder(w).Encode(r.Metrics())
 	})
 
