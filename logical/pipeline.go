@@ -433,8 +433,28 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.src.SetStartLSN(cp.LSN)
 		log.Printf("[logical:%s] restored LSN: %d", p.id, cp.LSN)
 	}
-	p.src.SetSnapshotComplete(cp.SnapshotComplete)
-	p.src.SetSnapshotedTables(cp.SnapshotedTables)
+	// If snapshot was marked complete but new tables were added to the config,
+	// re-open the snapshot phase for those tables only.
+	snapshotDone := cp.SnapshotComplete
+	snapshotedTables := cp.SnapshotedTables
+	if snapshotDone && len(p.cfg.Tables) > 0 {
+		for _, tc := range p.cfg.Tables {
+			if !cp.SnapshotedTables[tc.Name] {
+				// New table — need to snapshot it
+				snapshotDone = false
+				if snapshotedTables == nil {
+					snapshotedTables = make(map[string]bool)
+				}
+				// Copy existing entries so old tables are skipped in the snapshot
+				for k, v := range cp.SnapshotedTables {
+					snapshotedTables[k] = v
+				}
+				break
+			}
+		}
+	}
+	p.src.SetSnapshotComplete(snapshotDone)
+	p.src.SetSnapshotedTables(snapshotedTables)
 
 	// Configure direct-to-Iceberg snapshot writes.
 	p.src.SetSnapshotDeps(&snapshot.Deps{

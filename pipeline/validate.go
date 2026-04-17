@@ -71,11 +71,13 @@ func ValidateStartup(v StartupValidation) error {
 			v.SlotName, v.SlotName))
 	}
 
-	// 4. Checkpoint exists but tables missing.
+	// 4. Checkpoint exists but previously-tracked tables missing.
+	// Only flag tables that were in the checkpoint (snapshotted before).
+	// New tables added to the config are expected to not exist yet.
 	if !fresh {
 		var missing []string
 		for _, t := range v.Tables {
-			if !t.Existed {
+			if !t.Existed && cp.SnapshotedTables[t.PGTable] {
 				missing = append(missing, t.IcebergName)
 			}
 		}
