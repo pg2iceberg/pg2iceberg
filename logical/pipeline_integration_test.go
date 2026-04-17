@@ -4084,17 +4084,14 @@ func TestPipeline_AddTableToRunningPipeline(t *testing.T) {
 	waitForStatus(t, p2, pipeline.StatusRunning, 60*time.Second)
 	t.Log("phase 2: pipeline running — products should be snapshotted")
 
-	// Wait for materializer to process everything.
-	time.Sleep(3 * time.Second)
+	// Wait for products table to have snapshot data (snapshot writes directly to the table).
+	waitFor(t, 30*time.Second, func() bool {
+		tm, _ := cat.LoadTable(ctx, "test_ns", "products")
+		return tm != nil && tm.Metadata.CurrentSnapshotID != 0
+	})
 
 	// Verify products table now exists with all 30 rows (snapshot captures current state).
 	productsTm, _ = cat.LoadTable(ctx, "test_ns", "products")
-	if productsTm == nil {
-		t.Fatal("products table should exist after restart with new table")
-	}
-	if productsTm.Metadata.CurrentSnapshotID == 0 {
-		t.Fatal("products table should have snapshot data")
-	}
 	productsRows := countDataRows(t, ctx, mem, productsTm)
 	t.Logf("phase 2: products has %d rows", productsRows)
 	if productsRows != 30 {
