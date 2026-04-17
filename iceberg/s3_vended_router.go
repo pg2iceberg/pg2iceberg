@@ -19,7 +19,7 @@ type VendedS3Router struct {
 
 type routerEntry struct {
 	basePath string
-	client   *VendedS3Client
+	client   ObjectStorage
 }
 
 // NewVendedS3Router creates an empty router. Use Add to register tables.
@@ -27,8 +27,8 @@ func NewVendedS3Router() *VendedS3Router {
 	return &VendedS3Router{}
 }
 
-// Add registers a per-table VendedS3Client under its base path.
-func (r *VendedS3Router) Add(basePath string, client *VendedS3Client) {
+// Add registers a per-table ObjectStorage client under its base path.
+func (r *VendedS3Router) Add(basePath string, client ObjectStorage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.entries = append(r.entries, routerEntry{basePath: basePath, client: client})
@@ -38,8 +38,8 @@ func (r *VendedS3Router) Add(basePath string, client *VendedS3Client) {
 	})
 }
 
-// clientFor returns the VendedS3Client whose basePath is a prefix of key.
-func (r *VendedS3Router) clientFor(key string) (*VendedS3Client, error) {
+// clientFor returns the ObjectStorage whose basePath is a prefix of key.
+func (r *VendedS3Router) clientFor(key string) (ObjectStorage, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, e := range r.entries {
