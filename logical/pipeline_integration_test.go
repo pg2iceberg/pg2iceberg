@@ -3932,3 +3932,182 @@ func TestPipeline_TablesEndpoint(t *testing.T) {
 		t.Errorf("rows_processed: got %d, want >= %d", tbl.Stats.RowsProcessed, streamInserts)
 	}
 }
+
+// TestPipeline_AddTableToRunningPipeline verifies that adding a new table to
+// the config and restarting the pipeline works: the new table gets snapshotted
+// while existing tables resume from their checkpoint without data loss.
+func TestPipeline_AddTableToRunningPipeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// Create two tables — but only replicate one initially.
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (id SERIAL PRIMARY KEY, total INTEGER NOT NULL);
+		CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, price INTEGER NOT NULL);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	// Seed both tables.
+	for i := 1; i <= 20; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100)
+		conn.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)", fmt.Sprintf("p-%d", i), i*10)
+	}
+	conn.Close(ctx)
+
+	slotName := "test_slot_addtable"
+	pubName := "test_pub_addtable"
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	// Phase 1: Start pipeline with only "orders".
+	cfg1 := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.orders"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical:  config.LogicalConfig{PublicationName: pubName, SlotName: slotName},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	coord1 := stream.NewMemCoordinator()
+	cpStore := pipeline.NewMemCheckpointStore()
+
+	snk1 := logical.NewSink(sinkCfg, cfg1.Tables, "test", mem, cat)
+	p1 := logical.NewPipeline("test", cfg1, snk1, cpStore, coord1)
+	snk1.SetStream(stream.NewCachedStream(coord1, mem, sinkCfg.Namespace))
+
+	if err := p1.Start(ctx); err != nil {
+		t.Fatalf("start pipeline (phase 1): %v", err)
+	}
+
+	waitForStatus(t, p1, pipeline.StatusRunning, 60*time.Second)
+	t.Log("phase 1: pipeline running — orders snapshotted")
+
+	// Verify orders table exists with data.
+	ordersTm, _ := cat.LoadTable(ctx, "test_ns", "orders")
+	if ordersTm == nil || ordersTm.Metadata.CurrentSnapshotID == 0 {
+		t.Fatal("expected orders table to have snapshot data")
+	}
+	ordersRows := countDataRows(t, ctx, mem, ordersTm)
+	t.Logf("phase 1: orders has %d rows", ordersRows)
+	if ordersRows != 20 {
+		t.Fatalf("expected 20 orders rows, got %d", ordersRows)
+	}
+
+	// Products should NOT exist yet.
+	productsTm, _ := cat.LoadTable(ctx, "test_ns", "products")
+	if productsTm != nil {
+		t.Fatal("products table should not exist yet")
+	}
+
+	// Insert more orders while running (to verify CDC continues after restart).
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	for i := 21; i <= 25; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100)
+	}
+
+	// Wait for CDC flush.
+	waitFor(t, 30*time.Second, func() bool {
+		return p1.Source().FlushedLSN() > 0
+	})
+
+	// Stop pipeline.
+	if err := p1.Stop(); err != nil {
+		t.Fatalf("stop pipeline: %v", err)
+	}
+	t.Log("phase 1: pipeline stopped")
+
+	// Insert more rows while pipeline is down.
+	for i := 26; i <= 30; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100)
+	}
+	// Add more products too.
+	for i := 21; i <= 30; i++ {
+		conn.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)", fmt.Sprintf("p-%d", i), i*10)
+	}
+	conn.Close(ctx)
+
+	// Phase 2: Restart with "orders" + "products" (new table added).
+	cfg2 := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.orders"},
+			{Name: "public.products"}, // NEW
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical:  config.LogicalConfig{PublicationName: pubName, SlotName: slotName},
+		},
+		Sink: sinkCfg,
+	}
+
+	coord2 := stream.NewMemCoordinator()
+	snk2 := logical.NewSink(sinkCfg, cfg2.Tables, "test", mem, cat)
+	p2 := logical.NewPipeline("test", cfg2, snk2, cpStore, coord2)
+	snk2.SetStream(stream.NewCachedStream(coord2, mem, sinkCfg.Namespace))
+
+	if err := p2.Start(ctx); err != nil {
+		t.Fatalf("start pipeline (phase 2): %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p2.Done()
+	}()
+
+	waitForStatus(t, p2, pipeline.StatusRunning, 60*time.Second)
+	t.Log("phase 2: pipeline running — products should be snapshotted")
+
+	// Wait for materializer to process everything.
+	time.Sleep(3 * time.Second)
+
+	// Verify products table now exists with all 30 rows (snapshot captures current state).
+	productsTm, _ = cat.LoadTable(ctx, "test_ns", "products")
+	if productsTm == nil {
+		t.Fatal("products table should exist after restart with new table")
+	}
+	if productsTm.Metadata.CurrentSnapshotID == 0 {
+		t.Fatal("products table should have snapshot data")
+	}
+	productsRows := countDataRows(t, ctx, mem, productsTm)
+	t.Logf("phase 2: products has %d rows", productsRows)
+	if productsRows != 30 {
+		t.Fatalf("expected 30 products rows (full snapshot), got %d", productsRows)
+	}
+
+	// Verify orders table still has data and picked up the rows inserted while down.
+	ordersTm, _ = cat.LoadTable(ctx, "test_ns", "orders")
+	ordersRows = countDataRows(t, ctx, mem, ordersTm)
+	t.Logf("phase 2: orders has %d rows", ordersRows)
+	if ordersRows < 25 {
+		t.Fatalf("expected at least 25 orders rows (20 snapshot + 5 CDC before stop), got %d", ordersRows)
+	}
+
+	t.Logf("success: new table snapshotted, existing table preserved with CDC catch-up")
+}

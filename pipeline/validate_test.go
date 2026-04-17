@@ -64,15 +64,53 @@ func TestValidateStartup(t *testing.T) {
 			},
 		},
 		{
-			name: "checkpoint but table missing",
+			name: "checkpoint but previously-tracked table missing",
 			v: StartupValidation{
-				Checkpoint: &Checkpoint{Mode: "logical", LSN: 1000, SnapshotComplete: true},
+				Checkpoint: &Checkpoint{
+					Mode: "logical", LSN: 1000, SnapshotComplete: true,
+					SnapshotedTables: map[string]bool{"public.orders": true},
+				},
 				Tables:     []TableExistence{table("orders", false, 0, 0)},
 				Slot:       &SlotState{Exists: true, RestartLSN: 900},
 				ConfigMode: "logical",
 				SlotName:   "test_slot",
 			},
 			wantErr: "Iceberg table(s) missing: orders",
+		},
+		{
+			name: "new table added to config does not trigger missing error",
+			v: StartupValidation{
+				Checkpoint: &Checkpoint{
+					Mode: "logical", LSN: 1000, SnapshotComplete: true,
+					SnapshotedTables: map[string]bool{"public.orders": true},
+				},
+				Tables: []TableExistence{
+					table("orders", true, 5, 3),
+					table("payments", false, 0, 0), // new table, not in checkpoint
+				},
+				Slot:       &SlotState{Exists: true, RestartLSN: 900},
+				ConfigMode: "logical",
+				SlotName:   "test_slot",
+			},
+			// no error — payments is new, not previously tracked
+		},
+		{
+			name: "multiple new tables added alongside existing",
+			v: StartupValidation{
+				Checkpoint: &Checkpoint{
+					Mode: "logical", LSN: 1000, SnapshotComplete: true,
+					SnapshotedTables: map[string]bool{"public.orders": true},
+				},
+				Tables: []TableExistence{
+					table("orders", true, 5, 3),
+					table("payments", false, 0, 0),
+					table("ratings", false, 0, 0),
+				},
+				Slot:       &SlotState{Exists: true, RestartLSN: 900},
+				ConfigMode: "logical",
+				SlotName:   "test_slot",
+			},
+			// no error — payments and ratings are new additions
 		},
 		{
 			name: "checkpoint LSN but no slot",
@@ -168,7 +206,10 @@ func TestValidateStartup(t *testing.T) {
 		{
 			name: "multiple violations reported together",
 			v: StartupValidation{
-				Checkpoint: &Checkpoint{Mode: "logical", LSN: 1000, SnapshotComplete: true},
+				Checkpoint: &Checkpoint{
+					Mode: "logical", LSN: 1000, SnapshotComplete: true,
+					SnapshotedTables: map[string]bool{"public.orders": true, "public.orders_events": true},
+				},
 				Tables: []TableExistence{
 					table("orders", false, 0, 0),
 					table("orders_events", false, 0, 0),
