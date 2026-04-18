@@ -153,11 +153,17 @@ func cleanOrphanFiles(ctx context.Context, s3 ObjectStorage, ns, table string, t
 		mu.Unlock()
 	}
 
+	// The active metadata.json must never be deleted.
+	if tm.MetadataLocation != "" {
+		if metaKey, err := KeyFromURI(tm.MetadataLocation); err == nil {
+			addRef(metaKey)
+		}
+	}
+
 	for _, snap := range tm.Metadata.Snapshots {
 		if snap.ManifestList == "" {
 			continue
 		}
-		snap := snap
 		g.Go(func() error {
 			return collectSnapshotRefs(gctx, s3, snap.ManifestList, addRef)
 		})
