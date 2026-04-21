@@ -3549,7 +3549,7 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 		OrphanGracePeriod: 0, // disable grace period for test — all orphans eligible
 	}
 
-	if err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items", mc); err != nil {
+	if _, err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items", mc); err != nil {
 		t.Fatalf("maintain materialized table: %v", err)
 	}
 

@@ -426,15 +426,36 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	log.Printf("[compact] %s: %d files -> %d files (%d rewritten, %d carried, %d deletes applied, %d rows removed)",
 		cfg.IcebergName, beforeFiles, afterFiles, len(filesToRewrite), len(carriedEntries), len(deleteFiles), deletedRows)
 
+	var outputRows int64
+	for _, e := range newDataEntries {
+		outputRows += e.DataFile.RecordCount
+	}
+	var inputDataBytes, inputDeleteBytes int64
+	var inputDataRows int64
+	for _, df := range filesToRewrite {
+		inputDataBytes += df.FileSizeBytes
+		inputDataRows += df.RecordCount
+	}
+	for _, df := range deleteFiles {
+		inputDeleteBytes += df.FileSizeBytes
+	}
+	delta := SummaryDelta{
+		AddedDataFiles:         int64(len(newDataEntries)),
+		AddedRecords:           outputRows,
+		AddedFilesSize:         bytesAfter,
+		RemovedDataFiles:       int64(len(filesToRewrite)),
+		RemovedRecords:         inputDataRows,
+		RemovedFilesSize:       inputDataBytes + inputDeleteBytes,
+		RemovedDeleteFiles:     int64(len(deleteFiles)),
+		RemovedEqualityDeletes: int64(len(deletePKSeq)),
+	}
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
 		SequenceNumber:   seqNum,
 		TimestampMs:      now.UnixMilli(),
 		ManifestListPath: mlURI,
 		SchemaID:         cfg.SchemaID,
-		Summary: map[string]string{
-			"operation": "replace",
-		},
+		Summary:          BuildSummary("replace", PrevSnapshotSummary(matTm, currentSnapID), delta),
 	}
 
 	return &PreparedCommit{

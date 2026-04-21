@@ -199,13 +199,23 @@ func (mw *MetaWriter) BuildTableCommit(ctx context.Context) (*TableCommit, error
 	}
 
 	schemaID := tm.Metadata.CurrentSchemaID
+	var addedRows, addedBytes int64
+	for _, e := range entries {
+		addedRows += e.DataFile.RecordCount
+		addedBytes += e.DataFile.FileSizeBytes
+	}
+	delta := SummaryDelta{
+		AddedDataFiles: int64(len(entries)),
+		AddedRecords:   addedRows,
+		AddedFilesSize: addedBytes,
+	}
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
 		SequenceNumber:   seqNum,
 		TimestampMs:      now.UnixMilli(),
 		ManifestListPath: bundle.ManifestListURI,
 		SchemaID:         schemaID,
-		Summary:          map[string]string{"operation": "append"},
+		Summary:          BuildSummary("append", PrevSnapshotSummary(tm, prevSnapID), delta),
 	}
 
 	// Clear buffers for next batch.
@@ -240,6 +250,7 @@ func EnsureMetaTables(ctx context.Context, catalog MetadataCache, warehouse, nam
 		{MetaCommitsTable, MetaCommitsSchema()},
 		{MetaCheckpointsTable, MetaCheckpointsSchema()},
 		{MetaCompactionsTable, MetaCompactionsSchema()},
+		{MetaMaintenanceTable, MetaMaintenanceSchema()},
 	} {
 		tm, err := catalog.LoadTable(ctx, namespace, entry.name)
 		if err != nil {

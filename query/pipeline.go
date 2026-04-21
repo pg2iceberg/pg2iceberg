@@ -527,6 +527,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	// Piggyback control-plane meta rows (one per table) + pending checkpoint rows.
 	if p.meta != nil {
 		durationMs := time.Since(start).Milliseconds()
+		watermarks := p.poller.Watermarks()
 		for _, tp := range preps {
 			var bytes int64
 			for _, fe := range tp.prepared.NewDataFiles {
@@ -538,6 +539,8 @@ func (p *Pipeline) flush(ctx context.Context) error {
 				Mode:           iceberg.CommitModeQuery,
 				SnapshotID:     tp.prepared.Commit.SnapshotID,
 				SequenceNumber: tp.prepared.Commit.SequenceNumber,
+				SchemaID:       tp.prepared.Commit.SchemaID,
+				MaxSourceTs:    watermarks[tp.pgTable],
 				Bytes:          bytes,
 				DurationMs:     durationMs,
 				DataFiles:      tp.prepared.DataCount,
@@ -797,8 +800,33 @@ func (p *Pipeline) maintainAllTables(ctx context.Context) {
 
 	for _, tc := range p.cfg.Tables {
 		icebergName := postgres.TableToIceberg(tc.Name)
-		if err := iceberg.MaintainTable(ctx, catalog, p.s3, p.cfg.Sink.Namespace, icebergName, mc); err != nil {
+		result, err := iceberg.MaintainTable(ctx, catalog, p.s3, p.cfg.Sink.Namespace, icebergName, mc)
+		if err != nil {
 			log.Printf("[maintain:%s] error on %s: %v", p.id, icebergName, err)
+		}
+		if p.meta != nil {
+			if result.SnapshotsExpired > 0 {
+				p.meta.RecordMaintenance(iceberg.MaintenanceStats{
+					TableName:     tc.Name,
+					Operation:     iceberg.MaintenanceOpExpireSnapshots,
+					ItemsAffected: result.SnapshotsExpired,
+					DurationMs:    result.ExpireDuration.Milliseconds(),
+				})
+			}
+			if result.OrphansDeleted > 0 {
+				p.meta.RecordMaintenance(iceberg.MaintenanceStats{
+					TableName:     tc.Name,
+					Operation:     iceberg.MaintenanceOpCleanOrphans,
+					ItemsAffected: result.OrphansDeleted,
+					BytesFreed:    result.OrphanBytesFreed,
+					DurationMs:    result.CleanupDuration.Milliseconds(),
+				})
+			}
+		}
+	}
+	if p.meta != nil {
+		if err := p.meta.Flush(ctx); err != nil {
+			log.Printf("[maintain:%s] meta flush error: %v", p.id, err)
 		}
 	}
 }

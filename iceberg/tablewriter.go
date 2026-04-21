@@ -474,15 +474,29 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	mlURI := bundle.ManifestListURI
 	allManifests := bundle.AllManifests
 
+	var addedDataRows, addedDataBytes int64
+	for _, e := range dataEntries {
+		addedDataRows += e.DataFile.RecordCount
+		addedDataBytes += e.DataFile.FileSizeBytes
+	}
+	var addedDeleteBytes int64
+	for _, e := range deleteEntries {
+		addedDeleteBytes += e.DataFile.FileSizeBytes
+	}
+	delta := SummaryDelta{
+		AddedDataFiles:         int64(len(dataEntries)),
+		AddedRecords:           addedDataRows,
+		AddedFilesSize:         addedDataBytes + addedDeleteBytes,
+		AddedDeleteFiles:       int64(len(deleteEntries)),
+		AddedEqualityDeletes:   totalDeleteRows,
+	}
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
 		SequenceNumber:   seqNum,
 		TimestampMs:      now.UnixMilli(),
 		ManifestListPath: mlURI,
 		SchemaID:         cfg.SchemaID,
-		Summary: map[string]string{
-			"operation": "overwrite",
-		},
+		Summary:          BuildSummary("overwrite", PrevSnapshotSummary(matTm, prevMatSnapID), delta),
 	}
 
 	return &PreparedCommit{
