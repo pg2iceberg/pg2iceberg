@@ -55,6 +55,15 @@ type Checkpoint struct {
 	// LSN is the confirmed flush LSN (logical replication mode).
 	LSN uint64 `json:"lsn,omitempty"`
 
+	// SystemIdentifier is the PostgreSQL cluster's system identifier, sourced
+	// from pg_control_system(). It's stamped on every save and compared on
+	// startup so a checkpoint written against cluster X can't silently be
+	// resumed against cluster Y (e.g. after a blue/green cutover or an
+	// accidental DSN swap). Zero means "not yet populated" (legacy checkpoints
+	// from before this field existed); such checkpoints adopt the current
+	// cluster's identifier on first load.
+	SystemIdentifier uint64 `json:"system_identifier,omitempty"`
+
 	// SnapshotComplete indicates whether the initial table snapshot has been
 	// fully copied into Iceberg. When false and LSN == 0, a fresh snapshot
 	// is needed before streaming WAL.
@@ -91,6 +100,12 @@ func (cp *Checkpoint) computeChecksum() string {
 	parts = append(parts, fmt.Sprintf("mode=%s", cp.Mode))
 	parts = append(parts, fmt.Sprintf("watermark=%s", cp.Watermark))
 	parts = append(parts, fmt.Sprintf("lsn=%d", cp.LSN))
+	// system_identifier is only included in the checksum when populated so
+	// that pre-existing checkpoints (written before this field existed) keep
+	// validating after upgrade. Once stamped (>0) it's covered.
+	if cp.SystemIdentifier != 0 {
+		parts = append(parts, fmt.Sprintf("system_identifier=%d", cp.SystemIdentifier))
+	}
 	parts = append(parts, fmt.Sprintf("snapshot_complete=%t", cp.SnapshotComplete))
 	parts = append(parts, fmt.Sprintf("updated_at=%s", cp.UpdatedAt.UTC().Format(time.RFC3339Nano)))
 
@@ -317,3 +332,28 @@ func (s *MemCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Ch
 }
 
 func (s *MemCheckpointStore) Close() {}
+
+// stampingStore wraps a CheckpointStore and stamps SystemIdentifier on every
+// Save so a checkpoint always carries the cluster fingerprint it was written
+// under. Used by the logical pipeline after it queries pg_control_system().
+type stampingStore struct {
+	inner    CheckpointStore
+	systemID uint64
+}
+
+// WithSystemIdentifier returns a CheckpointStore that overwrites
+// cp.SystemIdentifier with the given value on every Save. Load is a pass-through.
+func WithSystemIdentifier(inner CheckpointStore, systemID uint64) CheckpointStore {
+	return &stampingStore{inner: inner, systemID: systemID}
+}
+
+func (s *stampingStore) Load(ctx context.Context, pipelineID string) (*Checkpoint, error) {
+	return s.inner.Load(ctx, pipelineID)
+}
+
+func (s *stampingStore) Save(ctx context.Context, pipelineID string, cp *Checkpoint) error {
+	cp.SystemIdentifier = s.systemID
+	return s.inner.Save(ctx, pipelineID, cp)
+}
+
+func (s *stampingStore) Close() { s.inner.Close() }

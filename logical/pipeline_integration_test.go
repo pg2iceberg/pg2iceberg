@@ -988,6 +988,299 @@ func TestPipeline_IdleAdvance_OnSparseTrackedWrites(t *testing.T) {
 	t.Logf("storage file count: %d", fileCount)
 }
 
+// TestPipeline_Checkpoint_RejectsClusterMismatch verifies that once a checkpoint
+// has been stamped with a cluster's pg_control system_identifier, pointing the
+// pipeline at a different cluster (with the same checkpoint store) fails fast
+// rather than silently resuming from a meaningless LSN. This is the safety
+// net for blue/green cutovers done via DSN swap — the mismatch must be
+// caught before the pipeline tries to replay blue's LSN against green's slot.
+func TestPipeline_Checkpoint_RejectsClusterMismatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// Two independent containers → two independent initdb → distinct system_identifiers.
+	pgA, cleanupA := startPostgres(t, ctx)
+	defer cleanupA()
+	pgB, cleanupB := startPostgres(t, ctx)
+	defer cleanupB()
+
+	// Sanity: confirm the two clusters really have different identifiers.
+	var idA, idB uint64
+	connA, err := pgx.Connect(ctx, pgA.DSN())
+	if err != nil {
+		t.Fatalf("connect A: %v", err)
+	}
+	if err := connA.QueryRow(ctx, `SELECT system_identifier FROM pg_control_system()`).Scan(&idA); err != nil {
+		t.Fatalf("query system_identifier A: %v", err)
+	}
+	if _, err := connA.Exec(ctx, `CREATE TABLE t (id SERIAL PRIMARY KEY, v INT)`); err != nil {
+		t.Fatalf("create t on A: %v", err)
+	}
+	connA.Close(ctx)
+
+	connB, err := pgx.Connect(ctx, pgB.DSN())
+	if err != nil {
+		t.Fatalf("connect B: %v", err)
+	}
+	if err := connB.QueryRow(ctx, `SELECT system_identifier FROM pg_control_system()`).Scan(&idB); err != nil {
+		t.Fatalf("query system_identifier B: %v", err)
+	}
+	if _, err := connB.Exec(ctx, `CREATE TABLE t (id SERIAL PRIMARY KEY, v INT)`); err != nil {
+		t.Fatalf("create t on B: %v", err)
+	}
+	connB.Close(ctx)
+
+	if idA == idB {
+		t.Fatalf("expected distinct system_identifiers, got %d on both clusters", idA)
+	}
+	t.Logf("system_identifier A=%d B=%d", idA, idB)
+
+	makeCfg := func(pg config.PostgresConfig) *config.Config {
+		return &config.Config{
+			Tables: []config.TableConfig{{Name: "public.t"}},
+			Source: config.SourceConfig{
+				Mode:     "logical",
+				Postgres: pg,
+				Logical: config.LogicalConfig{
+					PublicationName: "test_pub",
+					SlotName:        "test_slot",
+				},
+			},
+			Sink: config.SinkConfig{
+				FlushInterval: "300ms",
+				FlushRows:     100,
+				FlushBytes:    1 << 30,
+				Namespace:     "test_ns",
+				Warehouse:     "s3://test-bucket/",
+			},
+		}
+	}
+
+	// Shared checkpoint store: this is what carries the stamp from cluster
+	// A to the next startup attempt against cluster B.
+	store := pipeline.NewMemCheckpointStore()
+
+	// --- Phase 1: bring up pipeline against cluster A, reach Running, stop. ---
+	cfgA := makeCfg(pgA)
+	memA := newMemStorage()
+	catA := newMemCatalog()
+	snkA := logical.NewSink(cfgA.Sink, cfgA.Tables, "test", memA, catA)
+	pA := logical.NewPipeline("test", cfgA, snkA, store, stream.NewMemCoordinator())
+
+	if err := pA.Start(ctx); err != nil {
+		t.Fatalf("start on A: %v", err)
+	}
+	waitForStatus(t, pA, pipeline.StatusRunning, 30*time.Second)
+	if err := pA.Stop(); err != nil {
+		t.Fatalf("stop A: %v", err)
+	}
+	<-pA.Done()
+
+	// Checkpoint must now carry A's system_identifier.
+	cpAfterA, err := store.Load(ctx, "test")
+	if err != nil {
+		t.Fatalf("load checkpoint after A: %v", err)
+	}
+	if cpAfterA.SystemIdentifier != idA {
+		t.Fatalf("checkpoint not stamped: want SystemIdentifier=%d, got %d",
+			idA, cpAfterA.SystemIdentifier)
+	}
+	t.Logf("checkpoint after A: system_identifier=%d, snapshot_complete=%v",
+		cpAfterA.SystemIdentifier, cpAfterA.SnapshotComplete)
+
+	// --- Phase 2: attempt Start on cluster B using A's checkpoint. Must fail. ---
+	cfgB := makeCfg(pgB)
+	memB := newMemStorage()
+	catB := newMemCatalog()
+	snkB := logical.NewSink(cfgB.Sink, cfgB.Tables, "test", memB, catB)
+	pB := logical.NewPipeline("test", cfgB, snkB, store, stream.NewMemCoordinator())
+
+	err = pB.Start(ctx)
+	if err == nil {
+		t.Fatal("expected Start on mismatched cluster to fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "system_identifier mismatch") {
+		t.Errorf("expected 'system_identifier mismatch' in error, got: %v", err)
+	}
+	t.Logf("Start on B correctly failed: %v", err)
+
+	// Store must not have been mutated by the failed Start (stamp unchanged).
+	cpAfterFailedB, err := store.Load(ctx, "test")
+	if err != nil {
+		t.Fatalf("load checkpoint after failed B: %v", err)
+	}
+	if cpAfterFailedB.SystemIdentifier != idA {
+		t.Errorf("failed Start should not have rewritten stamp: want %d, got %d",
+			idA, cpAfterFailedB.SystemIdentifier)
+	}
+}
+
+// TestPipeline_Checkpoint_AdoptsLegacyStamp verifies that a checkpoint written
+// before the SystemIdentifier field existed (i.e. SystemIdentifier == 0) is
+// accepted on startup and restamped on the next save. This is the upgrade
+// path — existing deployments must not be forced to re-snapshot after upgrade.
+//
+// We fabricate the "legacy" state by running the pipeline once (producing a
+// valid stamped checkpoint) and then clearing the stamp in place, simulating
+// an in-place upgrade over a checkpoint that pre-dates this field.
+func TestPipeline_Checkpoint_AdoptsLegacyStamp(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	var sysID uint64
+	if err := conn.QueryRow(ctx, `SELECT system_identifier FROM pg_control_system()`).Scan(&sysID); err != nil {
+		t.Fatalf("query system_identifier: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE TABLE t (id SERIAL PRIMARY KEY, v INT)`); err != nil {
+		t.Fatalf("create t: %v", err)
+	}
+	conn.Close(ctx)
+
+	makeCfg := func() *config.Config {
+		return &config.Config{
+			Tables: []config.TableConfig{{Name: "public.t"}},
+			Source: config.SourceConfig{
+				Mode:     "logical",
+				Postgres: pgCfg,
+				Logical: config.LogicalConfig{
+					PublicationName: "test_pub",
+					SlotName:        "test_slot",
+				},
+			},
+			Sink: config.SinkConfig{
+				FlushInterval: "300ms",
+				FlushRows:     100,
+				FlushBytes:    1 << 30,
+				Namespace:     "test_ns",
+				Warehouse:     "s3://test-bucket/",
+			},
+		}
+	}
+
+	store := pipeline.NewMemCheckpointStore()
+
+	// --- Phase 1: produce a real, valid checkpoint via a full run. ---
+	{
+		cfg := makeCfg()
+		mem := newMemStorage()
+		cat := newMemCatalog()
+		snk := logical.NewSink(cfg.Sink, cfg.Tables, "test", mem, cat)
+		p := logical.NewPipeline("test", cfg, snk, store, stream.NewMemCoordinator())
+
+		if err := p.Start(ctx); err != nil {
+			t.Fatalf("phase 1 start: %v", err)
+		}
+		waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+		// Drive a CDC insert + flush so the checkpoint holds a real LSN.
+		c2, err := pgx.Connect(ctx, pgCfg.DSN())
+		if err != nil {
+			t.Fatalf("reconnect: %v", err)
+		}
+		for i := 0; i < 120; i++ { // crosses the 100-row flush threshold
+			if _, err := c2.Exec(ctx, `INSERT INTO t (v) VALUES ($1)`, i); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+		}
+		c2.Close(ctx)
+
+		waitFor(t, 30*time.Second, func() bool {
+			cp, err := store.Load(ctx, "test")
+			return err == nil && cp.LSN > 0 && cp.SnapshotComplete
+		})
+
+		if err := p.Stop(); err != nil {
+			t.Fatalf("phase 1 stop: %v", err)
+		}
+		<-p.Done()
+	}
+
+	// Confirm phase 1 produced a stamped, LSN-bearing checkpoint.
+	cpBefore, err := store.Load(ctx, "test")
+	if err != nil {
+		t.Fatalf("load after phase 1: %v", err)
+	}
+	if cpBefore.SystemIdentifier != sysID || cpBefore.LSN == 0 || !cpBefore.SnapshotComplete {
+		t.Fatalf("phase 1 checkpoint unexpected: %+v", cpBefore)
+	}
+	t.Logf("phase 1 produced: system_identifier=%d lsn=%d", cpBefore.SystemIdentifier, cpBefore.LSN)
+
+	// Simulate a legacy checkpoint: clear the stamp + the checksum (the
+	// checksum doesn't cover SystemIdentifier when it's zero, but it WAS
+	// computed with a non-zero value, so we must null the checksum too to
+	// mimic a truly pre-field checkpoint).
+	cpBefore.SystemIdentifier = 0
+	cpBefore.Checksum = ""
+	if err := store.Save(ctx, "test", cpBefore); err != nil {
+		t.Fatalf("overwrite with legacy shape: %v", err)
+	}
+	// MemCheckpointStore is wrapped in nothing at this point (raw store),
+	// so the save above sticks with SystemIdentifier=0 as intended.
+	reloaded, _ := store.Load(ctx, "test")
+	if reloaded.SystemIdentifier != 0 {
+		t.Fatalf("setup precondition: expected SystemIdentifier=0, got %d", reloaded.SystemIdentifier)
+	}
+
+	// --- Phase 2: restart on the same cluster. Should succeed and re-stamp. ---
+	cfg := makeCfg()
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	snk := logical.NewSink(cfg.Sink, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, store, stream.NewMemCoordinator())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("phase 2 start: legacy checkpoint should be accepted, got: %v", err)
+	}
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// A CDC write forces a subsequent Save, which must carry the new stamp.
+	c3, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect 2: %v", err)
+	}
+	for i := 0; i < 120; i++ {
+		if _, err := c3.Exec(ctx, `INSERT INTO t (v) VALUES ($1)`, i+1000); err != nil {
+			t.Fatalf("insert 2: %v", err)
+		}
+	}
+	c3.Close(ctx)
+
+	waitFor(t, 30*time.Second, func() bool {
+		cp, err := store.Load(ctx, "test")
+		return err == nil && cp.SystemIdentifier == sysID
+	})
+
+	cpAfter, err := store.Load(ctx, "test")
+	if err != nil {
+		t.Fatalf("load final: %v", err)
+	}
+	if cpAfter.SystemIdentifier != sysID {
+		t.Errorf("legacy checkpoint should have been restamped: want %d, got %d",
+			sysID, cpAfter.SystemIdentifier)
+	}
+	t.Logf("legacy checkpoint restamped: system_identifier=%d", cpAfter.SystemIdentifier)
+
+	if err := p.Stop(); err != nil {
+		t.Fatalf("phase 2 stop: %v", err)
+	}
+	<-p.Done()
+}
+
 // TestPipeline_FlushRetry_NoDuplicateData verifies that when a flush fails at
 // the catalog commit stage and is retried, the retry does not produce duplicate
 // data in Iceberg.

@@ -46,6 +46,11 @@ type Pipeline struct {
 	lastWrittenLSN uint64
 	perTableRows   map[string]*atomic.Int64
 
+	// systemIdentifier is the source cluster's pg_control system_identifier,
+	// cached at setup. Stamped on every checkpoint save so a future restart
+	// can detect if the DSN was repointed at a different cluster.
+	systemIdentifier uint64
+
 	materializer *Materializer
 	coord        stream.Coordinator
 	str          stream.Stream
@@ -307,6 +312,37 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		pgConn.Close(ctx)
 		return fmt.Errorf("wal_level is %q, must be \"logical\"; enable logical replication in your database settings", walLevel)
 	}
+
+	// Fingerprint the source cluster. This value is unique per initdb and
+	// survives replication/clone — so it differs between blue and green even
+	// when green was bootstrapped from blue's snapshot. Compared against the
+	// checkpoint's stored identifier to catch accidental DSN swaps and to
+	// guard against resuming a stale LSN on a different cluster.
+	var connectedSystemID uint64
+	if err := pgConn.QueryRow(ctx, "SELECT system_identifier FROM pg_control_system()").Scan(&connectedSystemID); err != nil {
+		pgConn.Close(ctx)
+		return fmt.Errorf("query system_identifier: %w", err)
+	}
+	switch {
+	case cp.SystemIdentifier == 0:
+		// Legacy checkpoint (pre-SystemIdentifier field) or first-ever save.
+		// Adopt the connected cluster's identifier.
+		log.Printf("[logical:%s] stamping checkpoint with cluster system_identifier=%d", p.id, connectedSystemID)
+	case cp.SystemIdentifier == connectedSystemID:
+		// Same cluster — normal resume.
+	default:
+		pgConn.Close(ctx)
+		return fmt.Errorf(
+			"checkpoint system_identifier mismatch: checkpoint was written against cluster %d, "+
+				"but the configured source is cluster %d. refusing to resume — a stale LSN from "+
+				"a different cluster cannot be replayed safely. if this is an intentional "+
+				"blue/green cutover, use the switchover flow; otherwise verify the source DSN",
+			cp.SystemIdentifier, connectedSystemID)
+	}
+	p.systemIdentifier = connectedSystemID
+	// Every subsequent Save on this store stamps the connected cluster's
+	// identifier, so both legacy checkpoints and new checkpoints carry it.
+	p.store = pipeline.WithSystemIdentifier(p.store, connectedSystemID)
 
 	// Discover schemas.
 	p.schemas = make(map[string]*postgres.TableSchema)
