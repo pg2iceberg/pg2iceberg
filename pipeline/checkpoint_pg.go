@@ -120,6 +120,7 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 			revision                BIGINT NOT NULL DEFAULT 0,
 			mode                    TEXT NOT NULL DEFAULT '',
 			lsn                     BIGINT NOT NULL DEFAULT 0,
+			system_identifier       BIGINT NOT NULL DEFAULT 0,
 			watermark               TEXT NOT NULL DEFAULT '',
 			snapshot_complete       BOOLEAN NOT NULL DEFAULT FALSE,
 			snapshoted_tables       JSONB,
@@ -130,6 +131,13 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("create checkpoint table: %w", err)
+	}
+	// Add column for deployments on a pre-existing checkpoints table. Safe
+	// to run every startup; no-op once present.
+	if _, err := s.pool.Exec(ctx,
+		`ALTER TABLE _pg2iceberg.checkpoints ADD COLUMN IF NOT EXISTS system_identifier BIGINT NOT NULL DEFAULT 0`,
+	); err != nil {
+		return fmt.Errorf("add system_identifier column: %w", err)
 	}
 	return nil
 }
@@ -150,13 +158,13 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 		attribute.String("db.system", "postgresql"),
 	))
 	err := s.pool.QueryRow(ctx, `
-		SELECT version, checksum, written_by, revision, mode, lsn, watermark,
+		SELECT version, checksum, written_by, revision, mode, lsn, system_identifier, watermark,
 		       snapshot_complete, snapshoted_tables, snapshot_chunks,
 		       query_watermarks, updated_at
 		FROM _pg2iceberg.checkpoints
 		WHERE pipeline_id = $1
 	`, pipelineID).Scan(
-		&cp.Version, &cp.Checksum, &cp.WrittenBy, &cp.Revision, &cp.Mode, &cp.LSN, &cp.Watermark,
+		&cp.Version, &cp.Checksum, &cp.WrittenBy, &cp.Revision, &cp.Mode, &cp.LSN, &cp.SystemIdentifier, &cp.Watermark,
 		&cp.SnapshotComplete, &snapshotedTables, &snapshotChunks,
 		&queryWatermarks, &cp.UpdatedAt,
 	)
@@ -215,18 +223,18 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 		))
 		_, err := s.pool.Exec(ctx, `
 			INSERT INTO _pg2iceberg.checkpoints (
-				pipeline_id, version, checksum, written_by, revision, mode, lsn, watermark,
+				pipeline_id, version, checksum, written_by, revision, mode, lsn, system_identifier, watermark,
 				snapshot_complete, snapshoted_tables, snapshot_chunks,
 				query_watermarks, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT (pipeline_id) DO UPDATE SET
 				version = $2, checksum = $3, written_by = $4, revision = $5,
-				mode = $6, lsn = $7, watermark = $8,
-				snapshot_complete = $9, snapshoted_tables = $10, snapshot_chunks = $11,
-				query_watermarks = $12, updated_at = $13
+				mode = $6, lsn = $7, system_identifier = $8, watermark = $9,
+				snapshot_complete = $10, snapshoted_tables = $11, snapshot_chunks = $12,
+				query_watermarks = $13, updated_at = $14
 			WHERE _pg2iceberg.checkpoints.revision = 0 OR _pg2iceberg.checkpoints.revision IS NULL
 		`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
-			cp.Mode, cp.LSN, cp.Watermark,
+			cp.Mode, cp.LSN, int64(cp.SystemIdentifier), cp.Watermark,
 			cp.SnapshotComplete, snapshotedTables, snapshotChunks, queryWatermarks,
 			cp.UpdatedAt)
 		dbSpan.End()
@@ -244,12 +252,12 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 	result, err := s.pool.Exec(ctx, `
 		UPDATE _pg2iceberg.checkpoints SET
 			version = $2, checksum = $3, written_by = $4, revision = $5,
-			mode = $6, lsn = $7, watermark = $8,
-			snapshot_complete = $9, snapshoted_tables = $10, snapshot_chunks = $11,
-			query_watermarks = $12, updated_at = $13
-		WHERE pipeline_id = $1 AND revision = $14
+			mode = $6, lsn = $7, system_identifier = $8, watermark = $9,
+			snapshot_complete = $10, snapshoted_tables = $11, snapshot_chunks = $12,
+			query_watermarks = $13, updated_at = $14
+		WHERE pipeline_id = $1 AND revision = $15
 	`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
-		cp.Mode, cp.LSN, cp.Watermark,
+		cp.Mode, cp.LSN, int64(cp.SystemIdentifier), cp.Watermark,
 		cp.SnapshotComplete, snapshotedTables, snapshotChunks, queryWatermarks,
 		cp.UpdatedAt, expectedRevision)
 	dbSpan.End()
