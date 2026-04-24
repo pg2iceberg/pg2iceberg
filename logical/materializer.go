@@ -622,11 +622,9 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 		return nil, nil
 	}
 
+	// pk is guaranteed non-empty here: TableSchema.Validate rejects tables
+	// without a primary key at pipeline setup (postgres/schema.go).
 	pk := ts.srcSchema.PK
-	if len(pk) == 0 {
-		log.Printf("[materializer] skipping %s: no primary key", pgTable)
-		return nil, nil
-	}
 
 	tw := m.tableWriters[pgTable]
 
