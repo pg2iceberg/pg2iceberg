@@ -3,9 +3,15 @@
 # End-to-end integration test runner for pg2iceberg.
 #
 # Test cases live in tests/cases/ with these files:
-#   <name>__input.sql      – SQL run on PostgreSQL in sequential steps
-#   <name>__query.sql      – query run on ClickHouse to verify results
-#   <name>__reference.tsv  – expected ClickHouse output
+#   <name>__input.sql            – SQL run on PostgreSQL in sequential steps
+#   <name>__query.sql            – query run on ClickHouse to verify results
+#   <name>__query.duckdb.sql     – (alternative) query run via DuckDB CLI
+#                                  instead of ClickHouse. Use this for types
+#                                  ClickHouse doesn't support (e.g. Iceberg v3
+#                                  geometry/geography). The query may reference
+#                                  a prebound view `t` that exposes the
+#                                  replicated table.
+#   <name>__reference.tsv  – expected output (same format regardless of engine)
 #
 # Input SQL is split into steps using markers:
 #   -- SETUP --     DDL phase: runs before pg2iceberg starts
@@ -85,6 +91,42 @@ ch_query() {
     curl -sf "$CLICKHOUSE_URL" --data-binary "$sql" 2>/dev/null
 }
 
+# Run SQL on DuckDB with the Iceberg + httpfs extensions configured to read
+# the replicated table from the local MinIO warehouse via the REST catalog.
+# The user SQL sees the replicated table exposed as a view named `t`.
+duckdb_query() {
+    local sql="$1"
+    local table="$2"
+
+    # Fetch the current metadata-location for the table from the REST catalog.
+    # DuckDB's iceberg_scan takes the metadata JSON path directly.
+    local metadata_loc
+    metadata_loc=$(curl -sf "${CATALOG_URI}/v1/namespaces/${NAMESPACE}/tables/${table}" \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)["metadata-location"])' 2>/dev/null)
+
+    if [ -z "$metadata_loc" ]; then
+        echo "ERROR: could not fetch metadata-location for ${table} from ${CATALOG_URI}" >&2
+        return 1
+    fi
+
+    # DuckDB reads s3:// via httpfs; point it at MinIO.
+    local s3_host="${S3_ENDPOINT#http://}"
+    s3_host="${s3_host#https://}"
+
+    duckdb -noheader -list -separator $'\t' <<EOF 2>/dev/null
+INSTALL iceberg; LOAD iceberg;
+INSTALL httpfs; LOAD httpfs;
+INSTALL spatial; LOAD spatial;
+SET s3_endpoint='${s3_host}';
+SET s3_access_key_id='${S3_ACCESS_KEY}';
+SET s3_secret_access_key='${S3_SECRET_KEY}';
+SET s3_use_ssl=false;
+SET s3_url_style='path';
+CREATE VIEW t AS SELECT * FROM iceberg_scan('${metadata_loc}');
+${sql}
+EOF
+}
+
 # Extract table name from setup SQL (first CREATE TABLE statement).
 extract_table_name() {
     local sql="$1"
@@ -147,14 +189,17 @@ ${line}"
     emit
 }
 
-# Discover unique test names from query files.
+# Discover unique test names from query files. Accepts either
+# <name>__query.sql (ClickHouse) or <name>__query.duckdb.sql (DuckDB); the
+# dispatcher picks the engine per test.
 discover_tests() {
     local filter="${1:-}"
     local names=()
-    for f in "$CASES_DIR"/*__query.sql; do
+    for f in "$CASES_DIR"/*__query.sql "$CASES_DIR"/*__query.duckdb.sql; do
         [ -f "$f" ] || continue
         local name
         name="$(basename "$f")"
+        name="${name%%__query.duckdb.sql}"
         name="${name%%__query.sql}"
         if [ -n "$filter" ] && [ "$name" != "$filter" ]; then
             continue
@@ -241,9 +286,22 @@ run_test() {
     local test_name="$1"
     local input_file="$CASES_DIR/${test_name}__input.sql"
     local query_file="$CASES_DIR/${test_name}__query.sql"
+    local duckdb_query_file="$CASES_DIR/${test_name}__query.duckdb.sql"
     local reference_file="$CASES_DIR/${test_name}__reference.tsv"
 
-    info "TEST: $test_name"
+    # Pick the query engine. DuckDB query file takes precedence when present.
+    local engine="clickhouse"
+    if [ -f "$duckdb_query_file" ]; then
+        engine="duckdb"
+        query_file="$duckdb_query_file"
+    fi
+
+    info "TEST: $test_name (engine=$engine)"
+
+    if [ "$engine" = "duckdb" ] && ! command -v duckdb >/dev/null 2>&1; then
+        echo "  SKIP: duckdb CLI not installed (required for this test)"
+        return
+    fi
 
     # Validate files exist.
     for f in "$input_file" "$query_file" "$reference_file"; do
@@ -382,14 +440,22 @@ run_test() {
     local expected
     expected="$(cat "$reference_file")"
 
-    # Retry query a few times — ClickHouse schema cache invalidation is async,
-    # so the first query after shutdown may still see stale (empty) state.
+    # Retry query a few times — engine schema/catalog caches are async, so the
+    # first query after shutdown may still see stale state.
     local actual=""
     local retry=0
     while [ $retry -lt 5 ]; do
-        ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
-        sleep 1
-        actual=$(ch_query "$query_sql" 2>&1) || true
+        case "$engine" in
+            clickhouse)
+                ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
+                sleep 1
+                actual=$(ch_query "$query_sql" 2>&1) || true
+                ;;
+            duckdb)
+                sleep 1
+                actual=$(duckdb_query "$query_sql" "$table" 2>&1) || true
+                ;;
+        esac
         if [ "$actual" = "$expected" ]; then
             break
         fi
@@ -426,10 +492,24 @@ main() {
     # Preflight checks.
     pg_query "SELECT 1" >/dev/null 2>&1 \
         || die "PostgreSQL not reachable at ${PG_HOST}:${PG_PORT}"
-    curl -sf "$CLICKHOUSE_URL" --data-binary "SELECT 1" >/dev/null 2>&1 \
-        || die "ClickHouse not reachable at $CLICKHOUSE_URL"
     curl -sf "${CATALOG_URI}/v1/config" >/dev/null 2>&1 \
         || die "Iceberg REST catalog not reachable at $CATALOG_URI"
+    # ClickHouse is only required if any test uses it — skip if every discovered
+    # test has a __query.duckdb.sql companion.
+    local needs_clickhouse=false
+    for q in "$CASES_DIR"/*__query.sql; do
+        [ -f "$q" ] || continue
+        local base
+        base="$(basename "$q" __query.sql)"
+        if [ ! -f "$CASES_DIR/${base}__query.duckdb.sql" ]; then
+            needs_clickhouse=true
+            break
+        fi
+    done
+    if [ "$needs_clickhouse" = true ]; then
+        curl -sf "$CLICKHOUSE_URL" --data-binary "SELECT 1" >/dev/null 2>&1 \
+            || die "ClickHouse not reachable at $CLICKHOUSE_URL"
+    fi
 
     # Build pg2iceberg.
     info "Building pg2iceberg..."

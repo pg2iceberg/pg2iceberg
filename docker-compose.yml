@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:16
+    # PostGIS image so e2e tests can replicate geometry/geography columns.
+    # Pinned to the upstream PostgreSQL 16 base used previously.
+    image: postgis/postgis:16-3.4
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

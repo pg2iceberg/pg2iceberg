@@ -27,6 +27,7 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `timestamptz` | `timestamptz` | Microsecond precision |
 | `uuid` | `uuid` | |
 | `json`, `jsonb` | `string` | Stored as text |
+| `geometry`, `geography` | `binary` | PostGIS EWKB bytes; SRID recorded in the column `doc` field (see [PostGIS types](#postgis-types)) |
 | Other (`inet`, `interval`, `xml`, …) | `string` | Stored as text representation |
 
 ## Decimal precision limit
@@ -37,3 +38,15 @@ Unconstrained `numeric` columns (no precision specified) are mapped to `decimal(
 
 !!! tip
     If you have unconstrained `numeric` columns, add an explicit precision constraint in PostgreSQL (`ALTER TABLE ... ALTER COLUMN ... TYPE numeric(p,s)`) before starting replication to avoid the `decimal(38,18)` fallback.
+
+## PostGIS types
+
+`geometry` and `geography` columns are replicated as PostGIS EWKB bytes into an Iceberg `binary` column. The column's `doc` field carries `postgis:geometry;srid=<N>` (or `postgis:geography;srid=<N>`), which lets downstream readers recognise the column as spatial and a future upgrade to Iceberg v3 native `geometry`/`geography` types be a metadata-only migration.
+
+- **SRID** is looked up from the PostGIS `geometry_columns` / `geography_columns` catalog views at schema discovery. If the extension is not installed, the columns fall back to the standard `binary` mapping with no SRID annotation.
+- **`geography`** is validated to have SRID `4326` (PostGIS's only supported geodetic CRS, matching Iceberg v3 geography). Other SRIDs are rejected at startup.
+- **Query engines** can read the column with:
+    - DuckDB (spatial ext.): `ST_GeomFromWKB(geom)` — accepts PostGIS EWKB.
+    - Apache Sedona / Spark: `ST_GeomFromWKB(geom)`.
+    - Trino, Athena, Snowflake: no native Iceberg v3 spatial support yet; the column reads as `VARBINARY` and can be parsed with engine-specific WKB/EWKB functions.
+- **Schema evolution**: adding a `geometry`/`geography` column mid-stream is recognised on pipeline restart. PostGIS OID resolution during live WAL replication is not yet wired — the column will be treated as `text` until the pipeline is restarted and schema is re-discovered.

@@ -2,9 +2,11 @@ package iceberg
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -168,6 +170,18 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) {
 				b.(*array.Decimal128Builder).Append(decimal128.Num{})
 			}
+		case postgres.Geometry, postgres.Geography:
+			ca.appendVal = func(b array.Builder, v any) error {
+				raw, err := ToPostGISBytes(v)
+				if err != nil {
+					return err
+				}
+				b.(*array.BinaryBuilder).Append(raw)
+				return nil
+			}
+			ca.appendZero = func(b array.Builder) {
+				b.(*array.BinaryBuilder).Append(nil)
+			}
 		default:
 			// text, varchar, numeric, json, uuid, etc. → string
 			ca.appendVal = func(b array.Builder, v any) error {
@@ -205,6 +219,8 @@ func pgToArrowType(col postgres.Column) arrow.DataType {
 	case postgres.Numeric:
 		prec, scale := decimalPrecScale(col)
 		return &arrow.Decimal128Type{Precision: prec, Scale: scale}
+	case postgres.Geometry, postgres.Geography:
+		return arrow.BinaryTypes.Binary
 	default:
 		return arrow.BinaryTypes.String
 	}
@@ -833,6 +849,44 @@ func ToDecimal128(v any, prec, scale int32) (decimal128.Num, error) {
 		return decimal128.Num{}, fmt.Errorf("convert %q to decimal128(%d,%d): %w", s, prec, scale, err)
 	}
 	return n, nil
+}
+
+// ToPostGISBytes converts the PostGIS wire value into raw EWKB bytes.
+// pgoutput ships PostGIS geometry/geography values as the text output of the
+// type's output function, which is uppercase hex-encoded EWKB (e.g.
+// "0101000020E6100000..."). We decode that back to bytes and store it as-is;
+// the result is a self-describing EWKB payload that preserves the SRID and
+// dimensionality, and can be read by Sedona, DuckDB spatial (via
+// ST_GeomFromHEXEWKB on the re-hex'd form, or ST_GeomFromWKB which accepts
+// EWKB), and any future Iceberg v3 native geometry/geography column.
+func ToPostGISBytes(v any) ([]byte, error) {
+	switch x := v.(type) {
+	case []byte:
+		// Already raw bytes (parquet round-trip).
+		out := make([]byte, len(x))
+		copy(out, x)
+		return out, nil
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return nil, nil
+		}
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("decode postgis hex %q: %w", shortHex(s), err)
+		}
+		return b, nil
+	default:
+		return nil, fmt.Errorf("unsupported type %T for postgis geometry", v)
+	}
+}
+
+// shortHex returns a truncated form of a hex string for error messages.
+func shortHex(s string) string {
+	if len(s) > 32 {
+		return s[:32] + "..."
+	}
+	return s
 }
 
 func ToString(v any) string {

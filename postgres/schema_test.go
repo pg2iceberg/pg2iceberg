@@ -99,3 +99,87 @@ func TestIcebergSchemaJSONWithID_OmitsIdentifierWhenNoPK(t *testing.T) {
 		t.Errorf("identifier-field-ids should not be emitted when PK is empty")
 	}
 }
+
+func TestParseType_PostGIS(t *testing.T) {
+	cases := map[string]Type{
+		"geometry":  Geometry,
+		"GEOMETRY":  Geometry,
+		"geography": Geography,
+	}
+	for in, want := range cases {
+		if got := ParseType(in); got != want {
+			t.Errorf("ParseType(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestIcebergType_PostGIS(t *testing.T) {
+	for _, pg := range []Type{Geometry, Geography} {
+		col := Column{Name: "g", PGType: pg}
+		got, truncated := col.IcebergType()
+		if got != "binary" {
+			t.Errorf("IcebergType(%v) = %q, want binary", pg, got)
+		}
+		if truncated {
+			t.Errorf("IcebergType(%v) should not report truncation", pg)
+		}
+	}
+}
+
+func TestIcebergSchemaJSON_EmitsGeoDoc(t *testing.T) {
+	ts := &TableSchema{
+		Table: "public.places",
+		Columns: []Column{
+			{Name: "id", PGType: Int8, FieldID: 1, IsNullable: false},
+			{Name: "geom", PGType: Geometry, FieldID: 2, IsNullable: true, SRID: 4326},
+			{Name: "area", PGType: Geography, FieldID: 3, IsNullable: true, SRID: 4326},
+			{Name: "unknown", PGType: Geometry, FieldID: 4, IsNullable: true},
+		},
+		PK: []string{"id"},
+	}
+	s := IcebergSchemaJSONWithID(ts, 0)
+	fields := s["fields"].([]map[string]any)
+
+	if doc := fields[1]["doc"]; doc != "postgis:geometry;srid=4326" {
+		t.Errorf("geom doc = %v, want postgis:geometry;srid=4326", doc)
+	}
+	if doc := fields[2]["doc"]; doc != "postgis:geography;srid=4326" {
+		t.Errorf("area doc = %v, want postgis:geography;srid=4326", doc)
+	}
+	if doc := fields[3]["doc"]; doc != "postgis:geometry" {
+		t.Errorf("unknown doc = %v, want postgis:geometry (no srid)", doc)
+	}
+	if _, ok := fields[0]["doc"]; ok {
+		t.Errorf("non-geo column should not have doc field")
+	}
+}
+
+func TestValidate_RejectsGeographyWithNon4326SRID(t *testing.T) {
+	ts := sampleSchemaWithPK([]string{"id"})
+	ts.Columns = append(ts.Columns, Column{
+		Name:    "area",
+		PGType:  Geography,
+		FieldID: 4,
+		SRID:    3857,
+	})
+	err := ts.Validate()
+	if err == nil {
+		t.Fatalf("expected Validate to reject geography SRID != 4326")
+	}
+	if !strings.Contains(err.Error(), "SRID") {
+		t.Fatalf("error should mention SRID, got: %v", err)
+	}
+}
+
+func TestValidate_AcceptsGeographyWith4326(t *testing.T) {
+	ts := sampleSchemaWithPK([]string{"id"})
+	ts.Columns = append(ts.Columns, Column{
+		Name:    "area",
+		PGType:  Geography,
+		FieldID: 4,
+		SRID:    4326,
+	})
+	if err := ts.Validate(); err != nil {
+		t.Fatalf("expected Validate to pass, got: %v", err)
+	}
+}

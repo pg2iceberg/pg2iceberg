@@ -34,6 +34,8 @@ const (
 	JSON        Type = "json"
 	JSONB       Type = "jsonb"
 	OID         Type = "oid"
+	Geometry    Type = "geometry"
+	Geography   Type = "geography"
 )
 
 // ParseType normalizes a PostgreSQL type name (as returned by udt_name or
@@ -82,6 +84,10 @@ func ParseType(name string) Type {
 		return JSONB
 	case "oid":
 		return OID
+	case "geometry":
+		return Geometry
+	case "geography":
+		return Geography
 	default:
 		return Text
 	}
@@ -95,6 +101,9 @@ type Column struct {
 	FieldID    int // Iceberg field ID (1-based, assigned in order)
 	Precision  int // numeric precision; 0 = unspecified
 	Scale      int // numeric scale; 0 = unspecified
+	// SRID is the PostGIS spatial reference system identifier for geometry/
+	// geography columns (e.g. 4326 for WGS84). 0 means unconstrained/unknown.
+	SRID int
 }
 
 // IcebergType maps the column's PostgreSQL type to an Iceberg type string.
@@ -133,6 +142,14 @@ func (c Column) IcebergType() (string, bool) {
 		return "uuid", false
 	case JSON, JSONB:
 		return "string", false
+	case Geometry, Geography:
+		// Iceberg v3 defines native geometry/geography logical types, but
+		// pg2iceberg currently writes format-version=2 metadata. We store the
+		// PostGIS EWKB bytes in a `binary` column and record the logical type
+		// + SRID in the column `doc` field (see IcebergSchemaJSONWithID), so
+		// downstream readers can identify the column and a future upgrade to
+		// v3 native types is a metadata-only migration.
+		return "binary", false
 	default:
 		return "string", false
 	}
@@ -176,6 +193,15 @@ func (ts *TableSchema) Validate() error {
 				"column %s.%s has type numeric(%d,%d) which exceeds Iceberg's max decimal precision of %d; "+
 					"reduce the column precision in PostgreSQL or exclude this table",
 				ts.Table, col.Name, col.Precision, col.Scale, MaxDecimalPrecision)
+		}
+		if col.PGType == Geography && col.SRID != 0 && col.SRID != 4326 {
+			// PostGIS's built-in spatial_ref_sys only defines geodetic edges
+			// for EPSG:4326 (WGS84); Iceberg v3 geography is likewise fixed to
+			// a spherical CRS. Reject anything else up front rather than write
+			// data that can't be round-tripped into a v3 geography.
+			return fmt.Errorf(
+				"column %s.%s is geography with SRID %d; only 4326 (WGS84) is supported",
+				ts.Table, col.Name, col.SRID)
 		}
 	}
 	return nil
@@ -280,6 +306,13 @@ func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSc
 		ts.PK = append(ts.PK, pkCol)
 	}
 
+	// Enrich PostGIS geometry/geography columns with SRID from the
+	// geometry_columns / geography_columns views. Missing views (no PostGIS
+	// installed) is not an error — columns simply keep SRID=0.
+	if err := enrichPostGISSRID(ctx, conn, schema, tableName, ts); err != nil {
+		return nil, err
+	}
+
 	// Discover replica identity and partitioning status.
 	var relReplIdent, relKind byte
 	err = conn.QueryRow(ctx,
@@ -291,6 +324,71 @@ func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSc
 	}
 
 	return ts, nil
+}
+
+// enrichPostGISSRID populates col.SRID for any Geometry/Geography column
+// using the PostGIS catalog views. It tolerates a missing PostGIS extension
+// by returning early when the views aren't present.
+func enrichPostGISSRID(ctx context.Context, conn *pgx.Conn, schema, table string, ts *TableSchema) error {
+	hasGeo := false
+	for _, c := range ts.Columns {
+		if c.PGType == Geometry || c.PGType == Geography {
+			hasGeo = true
+			break
+		}
+	}
+	if !hasGeo {
+		return nil
+	}
+
+	var installed bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis')`,
+	).Scan(&installed); err != nil {
+		return fmt.Errorf("check postgis extension: %w", err)
+	}
+	if !installed {
+		return nil
+	}
+
+	srids := make(map[string]int)
+	// geometry_columns and geography_columns have the same relevant schema:
+	// (f_table_schema, f_table_name, f_geometry_column|f_geography_column, srid).
+	for _, q := range []struct {
+		view, colField string
+	}{
+		{"geometry_columns", "f_geometry_column"},
+		{"geography_columns", "f_geography_column"},
+	} {
+		rows, err := conn.Query(ctx, fmt.Sprintf(
+			`SELECT %s, srid FROM %s WHERE f_table_schema = $1 AND f_table_name = $2`,
+			q.colField, q.view,
+		), schema, table)
+		if err != nil {
+			return fmt.Errorf("query %s: %w", q.view, err)
+		}
+		for rows.Next() {
+			var name string
+			var srid int
+			if err := rows.Scan(&name, &srid); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan %s: %w", q.view, err)
+			}
+			srids[name] = srid
+		}
+		rows.Close()
+	}
+
+	for i := range ts.Columns {
+		col := &ts.Columns[i]
+		if col.PGType != Geometry && col.PGType != Geography {
+			continue
+		}
+		if srid, ok := srids[col.Name]; ok {
+			col.SRID = srid
+		}
+	}
+	return nil
 }
 
 func splitTableName(table string) (string, string) {
@@ -311,12 +409,16 @@ func IcebergSchemaJSONWithID(ts *TableSchema, schemaID int) map[string]any {
 	fields := make([]map[string]any, len(ts.Columns))
 	for i, col := range ts.Columns {
 		iceType, _ := col.IcebergType()
-		fields[i] = map[string]any{
+		field := map[string]any{
 			"id":       col.FieldID,
 			"name":     col.Name,
 			"required": !col.IsNullable,
 			"type":     iceType,
 		}
+		if doc := geoDoc(col); doc != "" {
+			field["doc"] = doc
+		}
+		fields[i] = field
 	}
 	schema := map[string]any{
 		"type":      "struct",
@@ -330,6 +432,27 @@ func IcebergSchemaJSONWithID(ts *TableSchema, schemaID int) map[string]any {
 		schema["identifier-field-ids"] = pkIDs
 	}
 	return schema
+}
+
+// geoDoc returns the column `doc` string used to identify PostGIS-backed
+// geometry/geography columns in the Iceberg schema. Readers that understand
+// the convention can promote the `binary` column to a spatial type; an
+// eventual v3 migration swaps the `doc` for a native geometry/geography type
+// with the same SRID.
+func geoDoc(col Column) string {
+	switch col.PGType {
+	case Geometry:
+		if col.SRID > 0 {
+			return fmt.Sprintf("postgis:geometry;srid=%d", col.SRID)
+		}
+		return "postgis:geometry"
+	case Geography:
+		if col.SRID > 0 {
+			return fmt.Sprintf("postgis:geography;srid=%d", col.SRID)
+		}
+		return "postgis:geography"
+	}
+	return ""
 }
 
 // TableToIceberg converts a fully qualified PG table name like "public.orders"
