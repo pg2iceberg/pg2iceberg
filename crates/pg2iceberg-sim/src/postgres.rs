@@ -247,6 +247,27 @@ impl SimPostgres {
         Ok(t.rows.values().cloned().collect())
     }
 
+    /// Test-only: returns every committed change event for tables in the
+    /// given publication, ordered by LSN. Used by DST invariant checks to
+    /// compare the WAL "ground truth" against staged Parquet contents.
+    pub fn dump_change_events(&self, publication: &str) -> Result<Vec<ChangeEvent>> {
+        let s = self.state.lock().unwrap();
+        let pub_tables = &s
+            .publications
+            .get(publication)
+            .ok_or_else(|| SimError::UnknownPublication(publication.to_string()))?
+            .tables;
+        let mut out = Vec::new();
+        for entry in &s.wal {
+            if let WalKind::Change(ce) = &entry.kind {
+                if pub_tables.contains(&ce.table) {
+                    out.push(ce.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Open a replication stream for the slot. Cursor starts at the slot's
     /// `restart_lsn` (so reconnects replay from that point).
     pub fn start_replication(&self, slot: &str) -> Result<SimReplicationStream> {

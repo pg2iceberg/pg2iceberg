@@ -785,8 +785,14 @@ dependencies = [
 name = "pg2iceberg-tests"
 version = "0.0.0"
 dependencies = [
+ "pg2iceberg-coord",
  "pg2iceberg-core",
+ "pg2iceberg-iceberg",
+ "pg2iceberg-logical",
+ "pg2iceberg-pg",
  "pg2iceberg-sim",
+ "pg2iceberg-stream",
+ "pollster",
  "proptest",
 ]
 

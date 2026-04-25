@@ -14,4 +14,10 @@ pg2iceberg-core.workspace = true
 pg2iceberg-sim.workspace = true
 
 [dev-dependencies]
+pg2iceberg-coord.workspace = true
+pg2iceberg-iceberg.workspace = true
+pg2iceberg-logical.workspace = true
+pg2iceberg-pg.workspace = true
+pg2iceberg-stream.workspace = true
+pollster = "0.4"
 proptest.workspace = true
