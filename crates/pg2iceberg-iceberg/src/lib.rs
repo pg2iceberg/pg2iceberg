@@ -3,10 +3,16 @@
 //! Wraps `iceberg-rust` in production. The sim impl in `pg2iceberg-sim` keeps
 //! metadata in memory.
 
+pub mod file_index;
 pub mod fold;
+pub mod materialize;
+pub mod reader;
 pub mod writer;
 
+pub use file_index::FileIndex;
 pub use fold::{fold_events, pk_key, MaterializedRow};
+pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
+pub use reader::read_data_file;
 pub use writer::{DataChunk, PreparedFiles, TableWriter, WriterError};
 
 use async_trait::async_trait;
