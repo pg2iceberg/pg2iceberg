@@ -319,7 +319,19 @@ This is where silent data loss hides. Do it with no IO.
 
 The fixed staged Parquet schema is the entire reason logical mode can keep slot-advance off the catalog path. Get it right early.
 
-- Implement `staged_event_schema()` to byte-match what `iceberg/events_schema.go` emits (so the Rust port reads Go-written files and vice versa — required for differential testing and rolling migration).
+- Implement `staged_schema()` to match `iceberg/events_schema.go:30-42`. The exact contract:
+
+  | Field ID | Name | Type | Null | Notes |
+  |---|---|---|---|---|
+  | 1 | `_op` | string | not null | `"I"`, `"U"`, `"D"` |
+  | 2 | `_lsn` | int64 | not null | WAL position |
+  | 3 | `_ts` | timestamptz (μs) | not null | PG commit time |
+  | 4 | `_unchanged_cols` | string | nullable | comma-separated column names |
+  | 5 | `_data` | string | not null | JSON-encoded user row |
+  | 6 | `_xid` | int64 | nullable | PG transaction ID; null for snapshot rows |
+
+- Field IDs are stored in Parquet column metadata under `PARQUET:field_id` so Iceberg readers (Go and Rust) resolve columns by ID, not name.
+- The JSON inside `_data` is a separate compatibility surface from the Parquet schema. For now we use a serde-tagged Rust-internal form so round-trips are lossless. **Before differential testing (Phase 9)** switch to Go's "natural JSON" convention (numbers as JSON numbers, dates/timestamps/uuid as ISO strings, bytea as base64) so Rust- and Go-written staged files are mutually readable. Track as an explicit Phase 2.5 task.
 - `RollingWriter`: thresholds on rows / bytes / time, named for offset range like Go does.
 - `StagedReader`: parses staged Parquet → `Vec<MatEvent>` (pre-decoded, no JSON re-parse on materializer hot path).
 - Property test: round-trip through staged Parquet preserves all `ChangeEvent` fields, including `unchanged_cols`.

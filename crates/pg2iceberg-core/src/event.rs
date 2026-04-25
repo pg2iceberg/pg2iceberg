@@ -29,6 +29,9 @@ pub struct ChangeEvent {
     pub op: Op,
     pub lsn: Lsn,
     pub commit_ts: Timestamp,
+    /// Source-PG transaction ID. `None` for events emitted outside a tx
+    /// (initial-snapshot rows).
+    pub xid: Option<u32>,
     pub before: Option<Row>,
     pub after: Option<Row>,
     /// Columns whose value the publisher said are unchanged (TOAST `'u'` placeholder).
