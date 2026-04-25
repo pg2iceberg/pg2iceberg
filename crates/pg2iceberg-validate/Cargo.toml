@@ -10,8 +10,16 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 pg2iceberg-core.workspace = true
 pg2iceberg-pg.workspace = true
 pg2iceberg-coord.workspace = true
 pg2iceberg-iceberg.workspace = true
+pg2iceberg-snapshot.workspace = true
+pg2iceberg-stream.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+pg2iceberg-logical.workspace = true
+pg2iceberg-sim.workspace = true
+pollster = "0.4"
