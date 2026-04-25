@@ -738,10 +738,16 @@ name = "pg2iceberg-query"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
+ "pg2iceberg-logical",
  "pg2iceberg-pg",
+ "pg2iceberg-sim",
+ "pg2iceberg-stream",
+ "pollster",
+ "thiserror",
 ]
 
 [[package]]
@@ -754,6 +760,8 @@ dependencies = [
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
  "pg2iceberg-pg",
+ "pg2iceberg-query",
+ "pg2iceberg-snapshot",
  "pg2iceberg-stream",
  "pollster",
  "serde_json",
@@ -768,7 +776,12 @@ dependencies = [
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
+ "pg2iceberg-logical",
  "pg2iceberg-pg",
+ "pg2iceberg-sim",
+ "pg2iceberg-stream",
+ "pollster",
+ "thiserror",
 ]
 
 [[package]]
@@ -799,6 +812,7 @@ dependencies = [
  "pg2iceberg-logical",
  "pg2iceberg-pg",
  "pg2iceberg-sim",
+ "pg2iceberg-snapshot",
  "pg2iceberg-stream",
  "pollster",
  "proptest",

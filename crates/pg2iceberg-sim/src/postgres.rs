@@ -19,11 +19,14 @@
 //! shows we need any of them, add behind a feature, not by rewriting the
 //! happy path.
 
+use async_trait::async_trait;
 use pg2iceberg_core::{
     ChangeEvent, ColumnName, ColumnSchema, Lsn, Op, PgValue, Row, TableIdent, TableSchema,
     Timestamp,
 };
 use pg2iceberg_pg::DecodedMessage;
+use pg2iceberg_query::{watermark_compare, QueryError, WatermarkSource};
+use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -600,5 +603,85 @@ impl SimReplicationStream {
 
     pub fn cursor_lsn(&self) -> Lsn {
         self.cursor_lsn
+    }
+}
+
+#[async_trait]
+impl SnapshotSource for SimPostgres {
+    async fn snapshot_lsn(&self) -> std::result::Result<Lsn, SnapshotError> {
+        Ok(self.current_lsn())
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> std::result::Result<Vec<Row>, SnapshotError> {
+        let s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get(ident)
+            .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))?;
+
+        // SimPostgres stores rows keyed by canonical PK in a BTreeMap, so
+        // iteration is already sorted ASC by PK. Filter strictly above the
+        // bound, then truncate.
+        let chunk: Vec<Row> = table
+            .rows
+            .iter()
+            .filter(|(k, _)| match after_pk_key {
+                Some(after) => k.as_str() > after,
+                None => true,
+            })
+            .take(chunk_size)
+            .map(|(_, v)| v.clone())
+            .collect();
+
+        Ok(chunk)
+    }
+}
+
+#[async_trait]
+impl WatermarkSource for SimPostgres {
+    async fn read_after(
+        &self,
+        ident: &TableIdent,
+        watermark_col: &str,
+        after: Option<&PgValue>,
+        limit: Option<usize>,
+    ) -> std::result::Result<Vec<Row>, QueryError> {
+        let mut rows =
+            SimPostgres::read_table(self, ident).map_err(|e| QueryError::Source(e.to_string()))?;
+        let key = ColumnName(watermark_col.to_string());
+
+        // Filter rows whose watermark > `after`. Rows missing the column are
+        // skipped (matches PG behavior of `wm > NULL` excluding the row).
+        if let Some(threshold) = after {
+            rows.retain(|r| {
+                r.get(&key)
+                    .and_then(|v| watermark_compare(v, threshold).ok())
+                    .is_some_and(|ord| ord == std::cmp::Ordering::Greater)
+            });
+        } else {
+            rows.retain(|r| r.get(&key).is_some());
+        }
+
+        // Sort ASC by watermark. Rows with mismatched types fail the
+        // comparison; we treat them as Equal (preserves stability without
+        // panicking).
+        rows.sort_by(|a, b| {
+            let av = a.get(&key);
+            let bv = b.get(&key);
+            match (av, bv) {
+                (Some(x), Some(y)) => watermark_compare(x, y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        if let Some(n) = limit {
+            rows.truncate(n);
+        }
+        Ok(rows)
     }
 }

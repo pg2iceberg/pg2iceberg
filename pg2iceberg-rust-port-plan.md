@@ -367,17 +367,30 @@ The sim is where most DST mileage comes from. Build it before the prod logical p
 ### Phase 6 — **DST harness** (week 5–6, can start in week 4)
 
 - Workload generator (`proptest`): sequences of `Insert`/`Update`/`Delete`/`AddColumn`/`DropColumn`/`BeginTxn`/`CommitTxn`/`RollbackTxn`.
-- Fault injector, same seed:
-  - Drop conn between BEGIN and COMMIT, after COMMIT before standby, mid-standby.
-  - Reorder: object-store PUT vs coord write.
-  - Drop and recreate slot.
-  - Stall standby ticker; resume.
-  - Partition app↔catalog while PG↔app healthy (relevant once materializer is in).
-  - Stall materializer; resume.
-  - Clock skew between sim PG commit ts and app clock.
-- Invariants (full list in §9), checked at quiescence.
-- Flight recorder: on failure, dump seed + event trace + fault schedule.
+- Graceful crash + restart of the pipeline: drop in-memory state, rebuild from coord/slot durable state.
+- Invariants 1–4 (durability subset; see §9), checked at quiescence.
+- Flight recorder: on failure, dump seed + event trace.
 - Pin failing seeds as regression tests.
+
+After Phase 8 lands the materializer, fold it into the workload (interleaved `MaterializerCycle`) and add invariant 5 ("PG ground truth == Iceberg materialized state at quiescence").
+
+### Phase 6.5 — **Fault injection layer** (deferred follow-on)
+
+The Phase 6 harness only exercises *graceful* crashes (drop + rebuild after a clean drive/flush/ack). The actual fault paths — IO failure mid-flight — are uncovered. This phase fills that gap by wrapping the sim impls with a fault scheduler.
+
+- `FaultyBlobStore` and `FaultyCoordinator` wrappers in `pg2iceberg-sim`. Each wraps the in-memory impl and consults an `Arc<Mutex<FaultSchedule>>` per call. When armed, the call returns a typed error matching the real-world failure mode (`StreamError::Io`, `CoordError::Pg`).
+- `FaultSchedule` API: `fail_after_n_calls`, `fail_n_times`, `clear`. Tests can both pin specific scenarios and let the proptest generator randomize.
+- New workload steps in DST: `FailNextBlobPut`, `FailNextCoordWrite`, `FailNextCatalogCommit`. Each arms a single failure; the next operation that touches that surface bounces with an error.
+- New invariants under fault:
+  - **6. Orphan blobs are harmless.** A blob put that succeeded but whose coord write failed is not referenced by `log_index`. Invariant 1 ("every coord row's blob exists") still holds. Invariant 4 (WAL ≡ staged) must be relaxed to "every WAL event ends up in the union of coord-referenced blobs once retries succeed."
+  - **7. No stuck slot.** A coord write failure must leave `pipeline.flushed_lsn` unchanged (the receipt-gated invariant). The next successful flush must resume from the same point and produce the same LSN advance.
+  - **8. No duplicate snapshot.** A catalog commit failure must leave `coord.cursor` unchanged. The next materializer cycle replays the same staged batch and produces an Iceberg snapshot whose post-MoR state is identical to what the failed commit would have produced.
+- Mid-flush crash: pipeline crashes after blob `put` but before coord `claim_offsets`. Modelled by arming `FailNextCoordWrite` mid-flush + then crashing the pipeline harness. Recovery on restart should re-encode the same events into NEW blobs and claim those.
+- Stall: a wrapper that delays a call (resolves after N "ticks" of `Clock::sleep`). Models slow standby ticker / slow materializer / slow catalog. Lets us verify nothing else is blocked.
+
+Plan-§9 invariants 6–8 above are appended to §9 once this phase ships.
+
+This is the highest-leverage P1 work after the materializer is operational — it turns the receipt-gated durability invariant from "structurally enforced" into "structurally enforced AND empirically proven under random IO failure."
 
 ### Phase 7 — **Iceberg `TableWriter`** (week 6–7)
 

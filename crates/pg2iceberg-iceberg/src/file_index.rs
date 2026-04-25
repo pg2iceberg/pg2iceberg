@@ -94,6 +94,84 @@ impl FileIndex {
     }
 }
 
+/// Rebuild a `FileIndex` for `ident` from the catalog's snapshot history.
+///
+/// Used on materializer / query-pipeline restart so re-insert promotion
+/// keeps working — without this, a freshly-booted process has an empty
+/// FileIndex and a re-insert of a previously-materialized PK won't emit
+/// the equality delete that's needed to void the prior data file row,
+/// producing duplicate rows in MoR readers.
+///
+/// MoR semantics: an equality-delete file at snapshot `N` voids data file
+/// rows whose PK matches at snapshots `< N`. So a PK is "live" iff it's
+/// in some data file at snap `S` AND no equality-delete at snap `> S`
+/// targets it. This walks the snapshots in order and tracks the latest
+/// data file each live PK lives in.
+pub async fn rebuild_from_catalog(
+    catalog: &dyn pg2iceberg_iceberg_dyn::DynCatalog,
+    blob_store: &dyn pg2iceberg_stream::BlobStore,
+    ident: &pg2iceberg_core::TableIdent,
+    schema: &pg2iceberg_core::TableSchema,
+    pk_cols: &[pg2iceberg_core::ColumnName],
+) -> std::result::Result<FileIndex, crate::verify::VerifyError> {
+    use crate::reader::read_data_file;
+    use crate::verify::VerifyError;
+
+    let snapshots = catalog
+        .snapshots(ident)
+        .await
+        .map_err(VerifyError::from_dyn)?;
+
+    let pk_schema: Vec<pg2iceberg_core::ColumnSchema> = schema
+        .columns
+        .iter()
+        .filter(|c| c.is_primary_key)
+        .cloned()
+        .collect();
+
+    // Per-snapshot deleted-PK sets, ordered by snap id.
+    let mut deletes_per_snap: Vec<(i64, BTreeSet<String>)> = Vec::with_capacity(snapshots.len());
+    for snap in &snapshots {
+        let mut snap_deleted = BTreeSet::new();
+        for df in &snap.delete_files {
+            let bytes = blob_store.get(&df.path).await.map_err(VerifyError::Blob)?;
+            let rows = read_data_file(&bytes, &pk_schema).map_err(VerifyError::Decode)?;
+            for row in rows {
+                snap_deleted.insert(crate::fold::pk_key(&row, pk_cols));
+            }
+        }
+        deletes_per_snap.push((snap.id, snap_deleted));
+    }
+
+    let mut fi = FileIndex::new();
+    for snap in &snapshots {
+        for df in &snap.data_files {
+            let bytes = blob_store.get(&df.path).await.map_err(VerifyError::Blob)?;
+            let rows = read_data_file(&bytes, &schema.columns).map_err(VerifyError::Decode)?;
+            let mut live_in_file = Vec::new();
+            for row in rows {
+                let key = crate::fold::pk_key(&row, pk_cols);
+                let deleted_later = deletes_per_snap
+                    .iter()
+                    .any(|(sid, set)| *sid > snap.id && set.contains(&key));
+                if !deleted_later {
+                    live_in_file.push(key);
+                }
+            }
+            if !live_in_file.is_empty() {
+                fi.add_file(df.path.clone(), live_in_file);
+            }
+        }
+    }
+    Ok(fi)
+}
+
+/// Avoid a circular module reference by re-exporting `DynCatalog` through a
+/// private module. `verify::DynCatalog` is the canonical name.
+mod pg2iceberg_iceberg_dyn {
+    pub use crate::verify::DynCatalog;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

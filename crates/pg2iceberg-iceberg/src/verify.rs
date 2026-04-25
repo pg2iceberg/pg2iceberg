@@ -29,6 +29,15 @@ pub enum VerifyError {
     Decode(#[from] WriterError),
 }
 
+impl VerifyError {
+    /// Helper used by `file_index::rebuild_from_catalog` to thread errors
+    /// through the dyn-catalog boundary without exposing `Result` aliases
+    /// in two different modules.
+    pub(crate) fn from_dyn(e: VerifyError) -> Self {
+        e
+    }
+}
+
 pub type Result<T> = std::result::Result<T, VerifyError>;
 
 /// Compute the visible row set for a materialized table.

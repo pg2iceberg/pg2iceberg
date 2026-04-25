@@ -10,7 +10,7 @@ pub mod reader;
 pub mod verify;
 pub mod writer;
 
-pub use file_index::FileIndex;
+pub use file_index::{rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
 pub use reader::read_data_file;

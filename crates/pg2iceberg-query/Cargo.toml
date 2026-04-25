@@ -11,7 +11,15 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes = "1"
 pg2iceberg-core.workspace = true
 pg2iceberg-pg.workspace = true
 pg2iceberg-coord.workspace = true
 pg2iceberg-iceberg.workspace = true
+pg2iceberg-stream.workspace = true
+pg2iceberg-logical.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pg2iceberg-sim.workspace = true
+pollster = "0.4"

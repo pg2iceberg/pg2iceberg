@@ -27,8 +27,9 @@ use bytes::Bytes;
 use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::{ColumnName, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::{
-    fold_events, pk_key, promote_re_inserts, read_data_file, resolve_unchanged_cols, Catalog,
-    DataFile, FileIndex, IcebergError, MaterializedRow, PreparedCommit, TableWriter, WriterError,
+    fold_events, pk_key, promote_re_inserts, read_data_file, rebuild_from_catalog,
+    resolve_unchanged_cols, Catalog, DataFile, FileIndex, IcebergError, MaterializedRow,
+    PreparedCommit, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -125,9 +126,10 @@ impl<C: Catalog> Materializer<C> {
     }
 
     /// Register a materialized table. Creates the catalog table if missing,
-    /// ensures the coord cursor exists, and starts with an empty FileIndex.
-    /// Phase 8 doesn't yet rebuild the FileIndex from existing snapshots — a
-    /// fresh process must materialize from cursor=0.
+    /// ensures the coord cursor exists, and rebuilds the FileIndex from
+    /// catalog snapshot history so a restarted process correctly handles
+    /// re-inserts of PKs committed by the prior process. For a fresh
+    /// catalog this is a no-op.
     pub async fn register_table(&mut self, schema: TableSchema) -> Result<()> {
         let ident = schema.ident.clone();
         self.catalog.ensure_namespace(&ident.namespace).await?;
@@ -142,12 +144,22 @@ impl<C: Catalog> Materializer<C> {
             .collect();
         let writer = TableWriter::new(schema.clone());
 
+        let file_index = rebuild_from_catalog(
+            self.catalog.as_ref(),
+            self.blob_store.as_ref(),
+            &ident,
+            &schema,
+            &pk_cols,
+        )
+        .await
+        .map_err(|e| MaterializerError::Catalog(IcebergError::Other(e.to_string())))?;
+
         self.tables.insert(
             ident,
             TableEntry {
                 schema,
                 pk_cols,
-                file_index: FileIndex::new(),
+                file_index,
                 writer,
             },
         );
