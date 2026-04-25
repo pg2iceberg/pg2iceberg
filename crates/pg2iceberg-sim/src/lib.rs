@@ -4,6 +4,7 @@
 //! `PgCoordinator` semantics so DST and unit tests can exercise invariants
 //! without testcontainers). Phase 4 adds `SimPostgres` (WAL + slot semantics).
 
+pub mod blob;
 pub mod clock;
 pub mod coord;
 pub mod postgres;

@@ -10,8 +10,11 @@ use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent, Timesta
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod blob;
 pub mod codec;
 pub mod rolling;
+
+pub use blob::BlobStore;
 
 #[derive(Clone, Debug, Error)]
 pub enum StreamError {

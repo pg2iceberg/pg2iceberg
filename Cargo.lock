@@ -704,11 +704,15 @@ name = "pg2iceberg-logical"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
  "pg2iceberg-pg",
+ "pg2iceberg-sim",
  "pg2iceberg-stream",
+ "pollster",
+ "thiserror",
 ]
 
 [[package]]
@@ -737,6 +741,7 @@ name = "pg2iceberg-sim"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
@@ -769,6 +774,7 @@ dependencies = [
  "bytes",
  "parquet",
  "pg2iceberg-core",
+ "pollster",
  "proptest",
  "serde",
  "serde_json",
