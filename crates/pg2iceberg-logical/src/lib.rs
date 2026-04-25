@@ -14,12 +14,14 @@
 
 pub mod materializer;
 pub mod pipeline;
+pub mod runner;
 pub mod sink;
 
 pub use materializer::{
     CounterMaterializerNamer, Materializer, MaterializerError, MaterializerNamer,
 };
 pub use pipeline::{Pipeline, PipelineError};
+pub use runner::{Handler, Schedule, Ticker};
 pub use sink::{Sink, SinkError};
 
 /// **Compile-time durability proof.**

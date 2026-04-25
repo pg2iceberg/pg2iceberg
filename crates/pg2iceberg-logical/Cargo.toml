@@ -21,4 +21,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 pg2iceberg-sim.workspace = true
+pg2iceberg-validate.workspace = true
 pollster = "0.4"

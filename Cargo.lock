@@ -719,6 +719,7 @@ dependencies = [
  "pg2iceberg-pg",
  "pg2iceberg-sim",
  "pg2iceberg-stream",
+ "pg2iceberg-validate",
  "pollster",
  "thiserror",
 ]
