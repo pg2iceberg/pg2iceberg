@@ -16,5 +16,5 @@
 pub mod connect;
 pub mod coord;
 
-pub use connect::connect;
+pub use connect::{connect, connect_with, PgConn, TlsMode};
 pub use coord::PostgresCoordinator;

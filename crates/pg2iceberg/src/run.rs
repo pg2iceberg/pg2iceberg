@@ -17,7 +17,7 @@ use crate::realio::{RealClock, RealIdGen};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pg2iceberg_coord::{
-    prod::{connect as coord_connect, PostgresCoordinator},
+    prod::{connect_with as coord_connect_with, PostgresCoordinator, TlsMode as CoordTls},
     schema::CoordSchema,
     Coordinator,
 };
@@ -27,7 +27,10 @@ use pg2iceberg_logical::{
     materializer::CounterMaterializerNamer, pipeline::BlobNamer, Handler, Materializer, Pipeline,
     Schedule, Ticker,
 };
-use pg2iceberg_pg::{prod::PgClientImpl, PgClient};
+use pg2iceberg_pg::{
+    prod::{PgClientImpl, TlsMode as PgTls},
+    PgClient,
+};
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +69,128 @@ impl<I: IdGen + 'static> BlobNamer for UuidBlobNamer<I> {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
+    // Build the Iceberg catalog and dispatch to the generic `run_inner`.
+    // The Materializer is generic over the concrete iceberg::Catalog
+    // type, so each variant compiles a separate specialization. If we
+    // grow more variants and that bloats the binary, refactor to a
+    // dyn-Catalog wrapper at this seam.
+    let blob = build_blob(&cfg).context("build blob store")?;
+    match cfg.iceberg.clone() {
+        IcebergConfig::Memory { warehouse } => {
+            let inner = build_memory_catalog(&warehouse).await?;
+            run_inner(cfg, IcebergRustCatalog::new(Arc::new(inner)), blob).await
+        }
+        IcebergConfig::Rest {
+            uri,
+            warehouse,
+            token,
+            props,
+        } => {
+            let inner = build_rest_catalog(&uri, &warehouse, token.as_deref(), &props).await?;
+            run_inner(cfg, IcebergRustCatalog::new(Arc::new(inner)), blob).await
+        }
+    }
+}
+
+pub(crate) async fn build_memory_catalog(
+    warehouse: &str,
+) -> Result<iceberg::memory::MemoryCatalog> {
+    use iceberg::CatalogBuilder;
+    iceberg::memory::MemoryCatalogBuilder::default()
+        .load(
+            "pg2iceberg",
+            HashMap::from([(
+                iceberg::memory::MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.to_string(),
+            )]),
+        )
+        .await
+        .context("MemoryCatalog load")
+}
+
+pub(crate) async fn build_rest_catalog(
+    uri: &str,
+    warehouse: &str,
+    token: Option<&str>,
+    extra_props: &std::collections::BTreeMap<String, String>,
+) -> Result<iceberg_catalog_rest::RestCatalog> {
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_rest::{
+        RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+    };
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(REST_CATALOG_PROP_URI.to_string(), uri.to_string());
+    props.insert(
+        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
+    if let Some(t) = token {
+        // The REST spec's `Authorization: Bearer` flow is conveyed
+        // through this prop.
+        props.insert("token".to_string(), t.to_string());
+    }
+    for (k, v) in extra_props {
+        props.insert(k.clone(), v.clone());
+    }
+    RestCatalogBuilder::default()
+        .load("pg2iceberg", props)
+        .await
+        .context("RestCatalog load")
+}
+
+fn build_blob(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
+    match &cfg.blob {
+        BlobConfig::Memory => Ok(Arc::new(ObjectStoreBlobStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )))),
+        BlobConfig::S3 {
+            bucket,
+            region,
+            prefix,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } => {
+            let mut builder = object_store::aws::AmazonS3Builder::new()
+                .with_bucket_name(bucket)
+                .with_region(region);
+            if let Some(ep) = endpoint {
+                builder = builder.with_endpoint(ep);
+                // Path-style addressing matters for non-AWS S3
+                // (MinIO, R2 default to virtual-hosted, but
+                // operators often use path-style). Default off; if
+                // needed, surface as a config flag.
+            }
+            if let (Some(ak), Some(sk)) = (access_key_id, secret_access_key) {
+                builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
+                if let Some(st) = session_token {
+                    builder = builder.with_token(st);
+                }
+            }
+            let inner = builder.build().context("AmazonS3Builder build")?;
+            // If `prefix` is set, wrap in a PrefixStore so all
+            // staged paths land under that prefix.
+            let store: Arc<dyn object_store::ObjectStore> = match prefix.as_deref() {
+                Some(p) if !p.is_empty() => Arc::new(object_store::prefix::PrefixStore::new(
+                    inner,
+                    p.trim_matches('/').to_string(),
+                )),
+                _ => Arc::new(inner),
+            };
+            Ok(Arc::new(ObjectStoreBlobStore::new(store)))
+        }
+    }
+}
+
+async fn run_inner<C>(
+    cfg: Config,
+    catalog: IcebergRustCatalog<C>,
+    blob: Arc<dyn BlobStore>,
+) -> Result<()>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
     let clock = Arc::new(RealClock);
     let id_gen = match cfg.runtime.worker_id.as_deref() {
         Some(w) => Arc::new(RealIdGen::with_worker_id(w)),
@@ -75,39 +200,21 @@ pub async fn run(cfg: Config) -> Result<()> {
     tracing::info!(worker = %worker_id.0, "starting pg2iceberg");
 
     // ── coord ──────────────────────────────────────────────────────────
-    let coord_conn = coord_connect(&cfg.coord.conn)
+    let coord_tls = CoordTls::parse(&cfg.coord.tls)
+        .map_err(|e| anyhow::anyhow!("parse coord tls mode: {e}"))?;
+    let coord_conn = coord_connect_with(&cfg.coord.conn, coord_tls)
         .await
         .context("coord connect")?;
     let coord_schema = CoordSchema::sanitize(&cfg.coord.schema);
     let coord = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
     coord.migrate().await.context("coord migrate")?;
 
-    // ── catalog ────────────────────────────────────────────────────────
-    let warehouse = match &cfg.iceberg {
-        IcebergConfig::Memory { warehouse } => warehouse.clone(),
-    };
-    let inner_catalog: iceberg::memory::MemoryCatalog =
-        <iceberg::memory::MemoryCatalogBuilder as iceberg::CatalogBuilder>::load(
-            iceberg::memory::MemoryCatalogBuilder::default(),
-            "pg2iceberg",
-            HashMap::from([(
-                iceberg::memory::MEMORY_CATALOG_WAREHOUSE.to_string(),
-                warehouse.clone(),
-            )]),
-        )
-        .await
-        .context("MemoryCatalog load")?;
-    let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(inner_catalog)));
-
-    // ── blob store ─────────────────────────────────────────────────────
-    let blob: Arc<dyn BlobStore> = match &cfg.blob {
-        BlobConfig::Memory => Arc::new(ObjectStoreBlobStore::new(Arc::new(
-            object_store::memory::InMemory::new(),
-        ))),
-    };
+    let catalog = Arc::new(catalog);
 
     // ── pg source ──────────────────────────────────────────────────────
-    let pg = PgClientImpl::connect(&cfg.pg.conn)
+    let pg_tls =
+        PgTls::parse(&cfg.pg.tls).map_err(|e| anyhow::anyhow!("parse pg tls mode: {e}"))?;
+    let pg = PgClientImpl::connect_with(&cfg.pg.conn, pg_tls)
         .await
         .context("PG connect")?;
     let table_idents: Vec<_> = cfg
@@ -152,15 +259,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     );
 
     let mat_namer = Arc::new(CounterMaterializerNamer::new("materialized"));
-    let mut materializer: Materializer<IcebergRustCatalog<iceberg::memory::MemoryCatalog>> =
-        Materializer::new(
-            coord.clone() as Arc<dyn Coordinator>,
-            blob.clone(),
-            catalog.clone(),
-            mat_namer,
-            &cfg.coord.group,
-            cfg.runtime.cycle_limit,
-        );
+    let mut materializer: Materializer<IcebergRustCatalog<C>> = Materializer::new(
+        coord.clone() as Arc<dyn Coordinator>,
+        blob.clone(),
+        catalog.clone(),
+        mat_namer,
+        &cfg.coord.group,
+        cfg.runtime.cycle_limit,
+    );
 
     for t in &cfg.tables {
         let schema = t.to_table_schema()?;

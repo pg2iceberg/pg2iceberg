@@ -19,8 +19,10 @@
 
 pub mod client;
 pub mod stream;
+pub mod tls;
 pub mod typemap;
 pub mod value_decode;
 
 pub use client::PgClientImpl;
 pub use stream::ReplicationStreamImpl;
+pub use tls::TlsMode;

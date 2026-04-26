@@ -38,6 +38,12 @@ byteorder = { version = "1", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 rust_decimal = { version = "1", optional = true, default-features = false, features = ["std"] }
 uuid = { version = "1", optional = true, default-features = false, features = ["std"] }
+# TLS lives inside `prod` so test builds stay light. tokio-postgres-rustls
+# 0.13 uses `ring` as the rustls crypto provider; we mirror that on
+# `rustls` to keep the dep graph aligned.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = { version = "0.26", optional = true }
 
 [features]
 default = []
@@ -53,6 +59,9 @@ prod = [
     "dep:chrono",
     "dep:rust_decimal",
     "dep:uuid",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
 ]
 
 [dev-dependencies]

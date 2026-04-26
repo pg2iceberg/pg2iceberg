@@ -591,25 +591,56 @@ to the binary's prod glue.
 4 unit tests cover type-name parsing, schema construction with PK
 detection + auto field-id assignment, and TOML round-trip.
 
-**Remaining items for the binary:**
+**Status — P0 production blockers now wired:**
 
-1. **TLS** — both `PgClientImpl::connect` and the coord's
-   `connect()` use `NoTls`. Wire `tokio-postgres-rustls` for managed
-   PG.
-2. **Iceberg catalog backends** — config currently only supports
-   `type = "memory"`. Add REST/Glue/SQL/HMS variants when we wire
-   real Iceberg deployments.
-3. **Object store backends** — config only supports `type = "memory"`.
-   Add S3/GCS/Azure variants with their auth-config sections.
+- **TLS** — `pg2iceberg-pg/prod` and `pg2iceberg-coord/prod` both
+  expose a `TlsMode { Disable, Webpki }` enum and a `connect_with`
+  variant. Webpki uses `tokio-postgres-rustls` 0.13 with rustls's
+  ring crypto provider against Mozilla's `webpki-roots` bundle.
+  Config: `tls = "webpki"` in `[pg]` and `[coord]`.
+- **Iceberg REST catalog** — `iceberg-catalog-rest = "0.9"` (from
+  the same `polynya-dev/iceberg-rust` fork via `[patch.crates-io]`)
+  is wired. Config: `type = "rest"` in `[iceberg]` with `uri`,
+  `warehouse`, optional `token`, plus a free-form `[iceberg.props]`
+  passthrough for vendor-specific REST options. Covers Polaris,
+  Tabular, Snowflake-managed-catalog, and the open-source Iceberg
+  REST reference.
+- **S3 object store** — `object_store` `aws` feature on. Config:
+  `type = "s3"` in `[blob]` with `bucket`, `region`, optional
+  `prefix`, `endpoint` (for MinIO/R2), and optional static creds
+  (`access_key_id`/`secret_access_key`/`session_token`); falls
+  back to the standard AWS chain (env vars / instance profile /
+  AWS SSO) when creds aren't in config. The `prefix` wraps the
+  store in `object_store::prefix::PrefixStore` so all staged
+  files land under that prefix.
+- `run.rs` dispatches on `IcebergConfig` at the top of `run` and
+  hands a typed `IcebergRustCatalog<C>` to the generic `run_inner`,
+  so each catalog variant compiles a separate specialization. If
+  variants grow and bloat the binary, refactor to a dyn-Catalog
+  wrapper at the seam.
+
+**Remaining items for the binary (now P0.5 / P1):**
+
+1. **Glue / SQL / S3Tables / HMS catalog backends** — variants of
+   `IcebergConfig`. Same dispatch pattern as Memory/REST.
+2. **GCS + Azure object store backends** — feature-gate
+   `object_store/gcp` and `object_store/azure`, add config variants.
+3. **Vended-credentials S3 router** — Plan §Phase 7. Per-table S3
+   client routing for Polaris/Tabular tables that vend creds at
+   `loadTable` time. `IcebergRustCatalog` already exposes
+   per-table config maps; needs a router on the blob-store side.
 4. **Verify + validate subcommands** — `pg2iceberg-validate` and the
-   verifier in `pg2iceberg-iceberg::verify` aren't exposed in the CLI
-   yet.
+   verifier in `pg2iceberg-iceberg::verify` aren't exposed in the
+   CLI yet.
 5. **Invariant watcher task** — `pg2iceberg-validate::watcher`
-   exists but the binary's `Handler::Watcher` arm is a no-op. Wire
-   it as a follow-on.
-6. **Testcontainers integration** — once the ban-script allowance
-   for tests is in, wire an end-to-end test that boots PG + runs
-   `connect-pg` / `migrate-coord` / a short `run`.
+   exists but the binary's `Handler::Watcher` arm is a no-op.
+6. **Testcontainers integration** — boot real PG + Iceberg REST
+   reference + MinIO; exercise `connect-pg` / `migrate-coord` / a
+   short `run` end-to-end. Existing `reference_integration_tests.md`
+   has the Colima setup.
+7. **mTLS / custom CA / channel binding** — `TlsMode` is currently
+   `Disable | Webpki`. Add `CustomCa { path }` and `Mtls { ... }`
+   when a deployment needs them.
 
 ---
 

@@ -30,7 +30,9 @@ pg2iceberg-validate.workspace = true
 # Real iceberg + object_store types — same fork pin as the rest of the
 # workspace, applied via [patch.crates-io] in the workspace Cargo.toml.
 iceberg = { version = "0.9", features = [] }
-object_store = { version = "0.11", default-features = false }
+iceberg-catalog-rest = { version = "0.9", default-features = false }
+# `aws` enables the S3 backend; `gcp`/`azure` are deferred follow-ons.
+object_store = { version = "0.11", default-features = false, features = ["aws"] }
 
 # Async runtime + signals + CLI + config.
 tokio = { version = "1", features = [

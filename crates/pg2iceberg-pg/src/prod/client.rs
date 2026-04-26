@@ -18,6 +18,7 @@
 //! the client surfaces that error — we don't try to surface mid-call
 //! disconnects through a side channel today.
 
+use crate::prod::tls::{build_rustls_connector, TlsMode};
 use crate::{DecodedMessage, PgClient, PgError, ReplicationStream, Result, SnapshotId};
 use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent};
@@ -33,23 +34,47 @@ pub struct PgClientImpl {
 }
 
 impl PgClientImpl {
-    /// Connect to Postgres in **logical replication mode** with NoTls.
-    ///
-    /// The configuration string follows libpq's URI/keyword format. The
-    /// caller is responsible for setting `dbname` since libpq doesn't
-    /// require it but `START_REPLICATION` does. Replication mode is
-    /// added implicitly here.
-    ///
-    /// TLS is intentionally not wired yet — most managed Postgres needs
-    /// it; that's a follow-on patch.
+    /// Connect to Postgres in **logical replication mode** with TLS
+    /// disabled. Convenience wrapper for tests / sample configs that
+    /// point at a local Postgres that doesn't require encryption.
+    /// Production-managed Postgres almost always wants `connect_with`
+    /// + `TlsMode::Webpki`.
     pub async fn connect(conn_str: &str) -> Result<Self> {
+        Self::connect_with(conn_str, TlsMode::Disable).await
+    }
+
+    /// Connect with the configured [`TlsMode`]. The conn string follows
+    /// libpq URI/keyword format; the caller is responsible for setting
+    /// `dbname` (required by `START_REPLICATION`). Logical-replication
+    /// mode is added implicitly.
+    pub async fn connect_with(conn_str: &str, tls: TlsMode) -> Result<Self> {
         let mut config: tokio_postgres::Config = conn_str
             .parse()
             .map_err(|e: tokio_postgres::Error| PgError::Connection(e.to_string()))?;
         config.replication_mode(ReplicationMode::Logical);
 
+        match tls {
+            TlsMode::Disable => Self::finish_connect(&config, NoTls).await,
+            TlsMode::Webpki => {
+                let connector = build_rustls_connector()?;
+                Self::finish_connect(&config, connector).await
+            }
+        }
+    }
+
+    async fn finish_connect<T>(config: &tokio_postgres::Config, tls: T) -> Result<Self>
+    where
+        T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        T::Stream: Send,
+        T::TlsConnect: Send,
+        <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+    {
         let (client, connection) = config
-            .connect(NoTls)
+            .connect(tls)
             .await
             .map_err(|e| PgError::Connection(e.to_string()))?;
 
@@ -57,8 +82,6 @@ impl PgClientImpl {
         // `client` surfaces the error; we don't try to log here to
         // keep the prod module dep-light.
         let handle = tokio::spawn(async move {
-            // Errors are visible to operations on the client; they
-            // also surface as a closed connection.
             let _ = connection.await;
         });
 

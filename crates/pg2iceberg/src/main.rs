@@ -74,9 +74,13 @@ async fn main() -> Result<()> {
 // ── connect-pg ──────────────────────────────────────────────────────────
 
 async fn connect_pg(cfg: &Config) -> Result<()> {
-    use pg2iceberg_pg::{prod::PgClientImpl, PgClient};
-    tracing::info!(slot = %cfg.pg.slot, publication = %cfg.pg.publication, "connecting to source PG");
-    let client = PgClientImpl::connect(&cfg.pg.conn)
+    use pg2iceberg_pg::{
+        prod::{PgClientImpl, TlsMode},
+        PgClient,
+    };
+    let tls = TlsMode::parse(&cfg.pg.tls).context("parse pg tls mode")?;
+    tracing::info!(slot = %cfg.pg.slot, publication = %cfg.pg.publication, ?tls, "connecting to source PG");
+    let client = PgClientImpl::connect_with(&cfg.pg.conn, tls)
         .await
         .context("PG connect")?;
     let exists = client
@@ -99,31 +103,38 @@ async fn connect_pg(cfg: &Config) -> Result<()> {
 // ── connect-iceberg ────────────────────────────────────────────────────
 
 async fn connect_iceberg(cfg: &Config) -> Result<()> {
-    use pg2iceberg_iceberg::{prod::IcebergRustCatalog, Catalog as _};
-    use std::collections::HashMap;
+    use pg2iceberg_iceberg::prod::IcebergRustCatalog;
     use std::sync::Arc;
 
-    let warehouse = match &cfg.iceberg {
-        config::IcebergConfig::Memory { warehouse } => warehouse.clone(),
-    };
-    tracing::info!(%warehouse, "opening Iceberg memory catalog");
+    match cfg.iceberg.clone() {
+        config::IcebergConfig::Memory { warehouse } => {
+            tracing::info!(%warehouse, "opening Iceberg memory catalog");
+            let inner = run::build_memory_catalog(&warehouse).await?;
+            let catalog = IcebergRustCatalog::new(Arc::new(inner));
+            ensure_namespaces(&catalog, &cfg.tables).await?;
+        }
+        config::IcebergConfig::Rest {
+            uri,
+            warehouse,
+            token,
+            props,
+        } => {
+            tracing::info!(%uri, %warehouse, "opening Iceberg REST catalog");
+            let inner = run::build_rest_catalog(&uri, &warehouse, token.as_deref(), &props).await?;
+            let catalog = IcebergRustCatalog::new(Arc::new(inner));
+            ensure_namespaces(&catalog, &cfg.tables).await?;
+        }
+    }
+    println!("OK: Iceberg catalog connection established");
+    Ok(())
+}
 
-    let inner: iceberg::memory::MemoryCatalog =
-        <iceberg::memory::MemoryCatalogBuilder as iceberg::CatalogBuilder>::load(
-            iceberg::memory::MemoryCatalogBuilder::default(),
-            "pg2iceberg",
-            HashMap::from([(
-                iceberg::memory::MEMORY_CATALOG_WAREHOUSE.to_string(),
-                warehouse,
-            )]),
-        )
-        .await
-        .context("MemoryCatalog load")?;
-    let catalog = IcebergRustCatalog::new(Arc::new(inner));
-
-    // Pre-create namespaces declared in config so `connect-iceberg`
-    // also doubles as a "warm up the catalog" command.
-    for t in &cfg.tables {
+async fn ensure_namespaces<C: iceberg::Catalog + Send + Sync + 'static>(
+    catalog: &pg2iceberg_iceberg::prod::IcebergRustCatalog<C>,
+    tables: &[config::TableConfig],
+) -> Result<()> {
+    use pg2iceberg_iceberg::Catalog as _;
+    for t in tables {
         let schema = t.to_table_schema()?;
         catalog
             .ensure_namespace(&schema.ident.namespace)
@@ -131,7 +142,6 @@ async fn connect_iceberg(cfg: &Config) -> Result<()> {
             .with_context(|| format!("ensure namespace for {}", schema.ident))?;
         tracing::info!(ident = %schema.ident, "namespace ready");
     }
-    println!("OK: Iceberg catalog connection established");
     Ok(())
 }
 
@@ -139,11 +149,14 @@ async fn connect_iceberg(cfg: &Config) -> Result<()> {
 
 async fn migrate_coord(cfg: &Config) -> Result<()> {
     use pg2iceberg_coord::{
-        prod::{connect, PostgresCoordinator},
+        prod::{connect_with, PostgresCoordinator, TlsMode},
         schema::CoordSchema,
     };
-    tracing::info!(schema = %cfg.coord.schema, "connecting to coord PG");
-    let conn = connect(&cfg.coord.conn).await.context("coord connect")?;
+    let tls = TlsMode::parse(&cfg.coord.tls).context("parse coord tls mode")?;
+    tracing::info!(schema = %cfg.coord.schema, ?tls, "connecting to coord PG");
+    let conn = connect_with(&cfg.coord.conn, tls)
+        .await
+        .context("coord connect")?;
     let schema = CoordSchema::sanitize(&cfg.coord.schema);
     let coord = PostgresCoordinator::new(conn, schema);
     coord.migrate().await.context("coord migrate")?;

@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use pg2iceberg_core::{ColumnSchema, IcebergType, Namespace, PgType, TableIdent, TableSchema};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +36,9 @@ pub struct PgConfig {
     pub slot: String,
     /// Publication name. Created on first run from the `tables` list.
     pub publication: String,
+    /// TLS mode: `"disable"` (default) or `"webpki"`.
+    #[serde(default = "default_tls_mode")]
+    pub tls: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +55,13 @@ pub struct CoordConfig {
     /// `consumer` tables). Default `default`.
     #[serde(default = "default_group")]
     pub group: String,
+    /// TLS mode: `"disable"` (default) or `"webpki"`.
+    #[serde(default = "default_tls_mode")]
+    pub tls: String,
+}
+
+fn default_tls_mode() -> String {
+    "disable".into()
 }
 
 fn default_coord_schema() -> String {
@@ -61,8 +72,10 @@ fn default_group() -> String {
     "default".into()
 }
 
-/// Iceberg catalog choice. Today only `memory` (in-process
-/// `MemoryCatalog`) is wired. REST/Glue/SQL/HMS are follow-ons.
+/// Iceberg catalog choice. `memory` is in-process; `rest` covers
+/// Polaris, Tabular, Snowflake-managed-catalog, the open-source
+/// Iceberg REST reference, and any other REST-protocol catalog.
+/// Glue / SQL / S3Tables / HMS are follow-ons.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum IcebergConfig {
@@ -70,15 +83,60 @@ pub enum IcebergConfig {
         /// Warehouse URI, e.g. `memory:///warehouse`.
         warehouse: String,
     },
+    Rest {
+        /// Catalog endpoint, e.g. `https://catalog.example.com`.
+        uri: String,
+        /// Warehouse identifier as understood by the REST catalog
+        /// (often an S3 URI or a logical warehouse name).
+        warehouse: String,
+        /// Optional bearer token (typed as `oauth2-server-uri` etc.
+        /// later when we wire OAuth2). Today: a static bearer.
+        #[serde(default)]
+        token: Option<String>,
+        /// Free-form props passed straight through to
+        /// `RestCatalogBuilder::load`. Useful for SigV4 / OAuth2 /
+        /// custom headers without us having to enumerate every
+        /// REST-catalog vendor's quirks.
+        #[serde(default)]
+        props: BTreeMap<String, String>,
+    },
 }
 
-/// Blob store choice. Today only `memory` (in-process
-/// `object_store::memory::InMemory`). S3/GCS/Azure are follow-ons
-/// with their own auth-config sections.
+/// Blob store choice. `memory` is in-process; `s3` covers AWS S3,
+/// MinIO, Cloudflare R2 (via `endpoint`), Wasabi (via `endpoint`),
+/// and anything else exposing the S3 API. `gcs`/`azure` are
+/// follow-ons.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BlobConfig {
     Memory,
+    S3 {
+        bucket: String,
+        /// AWS region (`us-east-1` etc.). For S3-compatible stores
+        /// (MinIO, R2) any non-empty string works as long as
+        /// `endpoint` is set.
+        region: String,
+        /// Optional path prefix within the bucket. Useful for shared
+        /// buckets — staging files land under `<prefix>/...`.
+        #[serde(default)]
+        prefix: Option<String>,
+        /// Optional custom S3 endpoint (e.g.
+        /// `https://minio.local:9000` for MinIO,
+        /// `https://<account>.r2.cloudflarestorage.com` for R2).
+        /// If unset, `object_store` resolves AWS S3.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Static AWS credentials. If absent, `object_store` falls
+        /// back to its standard chain (env vars, instance profile,
+        /// AWS SSO etc.), which is what production should use.
+        #[serde(default)]
+        access_key_id: Option<String>,
+        #[serde(default)]
+        secret_access_key: Option<String>,
+        /// Optional session token (for STS-vended creds).
+        #[serde(default)]
+        session_token: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
