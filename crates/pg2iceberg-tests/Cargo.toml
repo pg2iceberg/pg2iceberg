@@ -20,5 +20,6 @@ pg2iceberg-logical.workspace = true
 pg2iceberg-pg.workspace = true
 pg2iceberg-snapshot.workspace = true
 pg2iceberg-stream.workspace = true
+bytes = "1"
 pollster = "0.4"
 proptest.workspace = true

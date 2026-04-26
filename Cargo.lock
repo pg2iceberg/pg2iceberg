@@ -1598,7 +1598,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1631,7 +1631,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#554809c7d64ac46e988c635ba521d419ce12d9c1"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#db0f93e85cfa909ac95607955b1bd4c69dc4f6a9"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2583,6 +2583,7 @@ dependencies = [
 name = "pg2iceberg-tests"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
@@ -2865,7 +2866,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -2902,7 +2903,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]

@@ -104,6 +104,34 @@ impl Catalog for MemoryCatalog {
             id,
             data_files: prepared.data_files,
             delete_files: prepared.equality_deletes,
+            removed_paths: Vec::new(),
+        });
+        table.metadata.current_snapshot_id = Some(id);
+        Ok(table.metadata.clone())
+    }
+
+    async fn commit_compaction(
+        &self,
+        prepared: pg2iceberg_iceberg::PreparedCompaction,
+    ) -> Result<TableMetadata> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(&prepared.ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {}", prepared.ident)))?;
+
+        // Empty compaction (nothing added, nothing removed) is a noop.
+        if prepared.added_data_files.is_empty() && prepared.removed_paths.is_empty() {
+            return Ok(table.metadata.clone());
+        }
+
+        let id = table.next_snapshot_id;
+        table.next_snapshot_id += 1;
+        table.snapshots.push(Snapshot {
+            id,
+            data_files: prepared.added_data_files,
+            delete_files: Vec::new(),
+            removed_paths: prepared.removed_paths,
         });
         table.metadata.current_snapshot_id = Some(id);
         Ok(table.metadata.clone())

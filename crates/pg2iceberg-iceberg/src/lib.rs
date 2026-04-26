@@ -3,6 +3,7 @@
 //! Wraps `iceberg-rust` in production. The sim impl in `pg2iceberg-sim` keeps
 //! metadata in memory.
 
+pub mod compact;
 pub mod file_index;
 pub mod fold;
 pub mod materialize;
@@ -12,6 +13,7 @@ pub mod reader;
 pub mod verify;
 pub mod writer;
 
+pub use compact::{compact_table, CompactError, CompactionConfig, CompactionOutcome};
 pub use file_index::{rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
@@ -58,6 +60,23 @@ pub struct PreparedCommit {
     pub equality_deletes: Vec<DataFile>,
 }
 
+/// Built by [`crate::compact::compact_table`] and consumed by
+/// [`Catalog::commit_compaction`]. Produces an `Operation::Replace`
+/// snapshot: drop everything in `removed_paths`, add everything in
+/// `added_data_files` atomically.
+#[derive(Clone, Debug)]
+pub struct PreparedCompaction {
+    pub ident: TableIdent,
+    /// Newly written compacted data files (and any equality-delete files
+    /// the rewrite leaves in place — usually empty since compaction
+    /// applies pending deletes inline).
+    pub added_data_files: Vec<DataFile>,
+    /// File paths that this compaction supersedes. Iceberg will drop them
+    /// from the new snapshot's manifest list; readers see the compacted
+    /// output instead.
+    pub removed_paths: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DataFile {
     pub path: String,
@@ -76,11 +95,20 @@ pub struct DataFile {
 /// Iceberg MoR semantics: a delete file at snapshot `N` applies only to data
 /// files at snapshots `< N` (data and deletes from the same snapshot are
 /// kept consistent by the materializer).
+///
+/// Compaction snapshots populate `removed_paths` with the paths of data /
+/// delete files that were live in prior snapshots but are no longer
+/// referenced by this snapshot's manifest list. Verifier and FileIndex
+/// rebuild paths skip any data/delete file whose path appears in a
+/// compaction's `removed_paths` set.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub id: i64,
     pub data_files: Vec<DataFile>,
     pub delete_files: Vec<DataFile>,
+    /// File paths superseded by this snapshot. Empty for non-compaction
+    /// snapshots.
+    pub removed_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +179,16 @@ pub trait Catalog: Send + Sync {
     async fn load_table(&self, ident: &TableIdent) -> Result<Option<TableMetadata>>;
     async fn create_table(&self, schema: &TableSchema) -> Result<TableMetadata>;
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata>;
+    /// Commit a compaction snapshot (Operation::Replace): drop the listed
+    /// files, add the new ones, atomically. Default impl errors so impls
+    /// that don't yet support compaction surface a clear error rather
+    /// than silently no-op.
+    async fn commit_compaction(&self, prepared: PreparedCompaction) -> Result<TableMetadata> {
+        let _ = prepared;
+        Err(IcebergError::Other(
+            "commit_compaction not implemented for this Catalog impl".into(),
+        ))
+    }
     async fn evolve_schema(
         &self,
         ident: &TableIdent,

@@ -159,11 +159,21 @@ pub async fn rebuild_from_catalog(
         .cloned()
         .collect();
 
+    // Same compaction-aware skipping as the verifier — files superseded
+    // by a Replace snapshot don't contribute to the FileIndex.
+    let removed_paths: BTreeSet<String> = snapshots
+        .iter()
+        .flat_map(|s| s.removed_paths.iter().cloned())
+        .collect();
+
     // Per-snapshot deleted-PK sets, ordered by snap id.
     let mut deletes_per_snap: Vec<(i64, BTreeSet<String>)> = Vec::with_capacity(snapshots.len());
     for snap in &snapshots {
         let mut snap_deleted = BTreeSet::new();
         for df in &snap.delete_files {
+            if removed_paths.contains(&df.path) {
+                continue;
+            }
             let bytes = blob_store.get(&df.path).await.map_err(VerifyError::Blob)?;
             let rows = read_data_file(&bytes, &pk_schema).map_err(VerifyError::Decode)?;
             for row in rows {
@@ -176,6 +186,9 @@ pub async fn rebuild_from_catalog(
     let mut fi = FileIndex::new();
     for snap in &snapshots {
         for df in &snap.data_files {
+            if removed_paths.contains(&df.path) {
+                continue;
+            }
             let bytes = blob_store.get(&df.path).await.map_err(VerifyError::Blob)?;
             let rows = read_data_file(&bytes, &schema.columns).map_err(VerifyError::Decode)?;
             let mut live_in_file = Vec::new();

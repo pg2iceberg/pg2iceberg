@@ -199,6 +199,57 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         metadata_from_table(&prepared.ident, &updated)
     }
 
+    async fn commit_compaction(
+        &self,
+        prepared: crate::PreparedCompaction,
+    ) -> Result<TableMetadata> {
+        if prepared.added_data_files.is_empty() && prepared.removed_paths.is_empty() {
+            // Pure no-op: hand back current metadata without bumping a
+            // snapshot.
+            let it = to_iceberg_table_ident(&prepared.ident)?;
+            let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
+            return metadata_from_table(&prepared.ident, &table);
+        }
+
+        let it = to_iceberg_table_ident(&prepared.ident)?;
+        let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let part_field_count = table.metadata().default_partition_spec().fields().len();
+
+        // Translate our DataFile values into iceberg::DataFile, same
+        // shape commit_snapshot uses.
+        let mut iceberg_added: Vec<IcebergDataFile> =
+            Vec::with_capacity(prepared.added_data_files.len());
+        for df in &prepared.added_data_files {
+            let partition =
+                build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
+            iceberg_added.push(
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(df.path.clone())
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(df.byte_size)
+                    .record_count(df.record_count)
+                    .partition(partition)
+                    .partition_spec_id(spec_id)
+                    .build()
+                    .map_err(|e| IcebergError::Other(format!("compacted file build: {e}")))?,
+            );
+        }
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(iceberg_added)
+            .remove_paths(prepared.removed_paths.iter().cloned());
+        let tx = action.apply(tx).map_err(map_iceberg_err)?;
+        let updated = tx
+            .commit(self.inner.as_ref())
+            .await
+            .map_err(map_iceberg_err)?;
+        metadata_from_table(&prepared.ident, &updated)
+    }
+
     async fn evolve_schema(
         &self,
         ident: &TableIdent,
@@ -236,6 +287,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
+        use iceberg::spec::Operation;
         let it = to_iceberg_table_ident(ident)?;
         let table = match self.inner.load_table(&it).await {
             Ok(t) => t,
@@ -248,7 +300,17 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             Err(e) => return Err(map_iceberg_err(e)),
         };
         let mut out: Vec<Snapshot> = Vec::new();
-        let snaps: Vec<_> = table.metadata().snapshots().cloned().collect();
+        let mut snaps: Vec<_> = table.metadata().snapshots().cloned().collect();
+        // Sort by sequence_number ASC so we visit each snapshot AFTER its
+        // parent. The path-cache lookup below relies on the parent already
+        // being populated when we compute `removed_paths` for a Replace.
+        snaps.sort_by_key(|s| s.sequence_number());
+        // Cache of snapshot_id → all live file paths in that snapshot's
+        // manifest list. We need the previous snapshot's full path set to
+        // compute `removed_paths` for compaction snapshots — diffing
+        // parent_paths - current_paths gives the set of files dropped by
+        // this Replace.
+        let mut paths_per_snap: BTreeMap<i64, std::collections::BTreeSet<String>> = BTreeMap::new();
         for snap in snaps {
             // Use the iceberg snapshot_id for manifest filtering (matches the
             // `added_snapshot_id` field stored in manifest entries), but report
@@ -258,26 +320,35 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             // break the verifier and FileIndex.
             let snap_id = snap.snapshot_id();
             let seq_num = snap.sequence_number();
+            let parent_id = snap.parent_snapshot_id();
+            let is_replace = matches!(snap.summary().operation, Operation::Replace);
             let manifest_list = snap
                 .load_manifest_list(table.file_io(), table.metadata())
                 .await
                 .map_err(map_iceberg_err)?;
             let mut data_files: Vec<DataFile> = Vec::new();
             let mut delete_files: Vec<DataFile> = Vec::new();
+            // All file paths reachable in this snapshot's manifest list,
+            // regardless of which snapshot first added them. Used both as
+            // the cache for the next snapshot's diff and as the "current"
+            // side of the diff for Replace snapshots.
+            let mut all_paths_this_snap: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             for entry in manifest_list.entries() {
-                // Iceberg snapshots inherit prior manifests by reference;
-                // restrict to the ones first introduced by *this* snapshot
-                // so our `Snapshot.data_files` matches the sim catalog's
-                // "files added in this commit" semantics.
-                if entry.added_snapshot_id != snap_id {
-                    continue;
-                }
                 let manifest = entry
                     .load_manifest(table.file_io())
                     .await
                     .map_err(map_iceberg_err)?;
                 for me in manifest.entries() {
                     let df = me.data_file();
+                    all_paths_this_snap.insert(df.file_path().to_string());
+
+                    // Match the sim's "files added in this commit"
+                    // semantics: only surface entries first introduced
+                    // by this snapshot.
+                    if entry.added_snapshot_id != snap_id {
+                        continue;
+                    }
                     let partition_values = iceberg_struct_to_partition_literals(df.partition());
                     let our = DataFile {
                         path: df.file_path().to_string(),
@@ -294,10 +365,37 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     }
                 }
             }
+
+            // Compute removed_paths: only meaningful for Replace
+            // snapshots; for Append it'd just always be empty (Append
+            // never drops paths).
+            let removed_paths: Vec<String> = if is_replace {
+                if let Some(pid) = parent_id {
+                    if let Some(parent_paths) = paths_per_snap.get(&pid) {
+                        parent_paths
+                            .difference(&all_paths_this_snap)
+                            .cloned()
+                            .collect()
+                    } else {
+                        // Parent not in cache (shouldn't happen since we
+                        // walk in order), surface empty rather than
+                        // erroring.
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            paths_per_snap.insert(snap_id, all_paths_this_snap);
+
             out.push(Snapshot {
                 id: seq_num,
                 data_files,
                 delete_files,
+                removed_paths,
             });
         }
         out.sort_by_key(|s| s.id);
@@ -1026,6 +1124,98 @@ mod tests {
         for s in &snaps {
             assert!(s.delete_files.is_empty());
         }
+    }
+
+    /// Compaction round-trip: append three small data files via
+    /// `commit_snapshot`, then `commit_compaction` swaps them for one
+    /// compacted file. Subsequent `snapshots()` returns four snapshots
+    /// total; the compaction one is `Operation::Replace` and carries
+    /// `removed_paths` for the three originals. Verifier-style readers
+    /// (and `compute_live_files`) see only the compacted file.
+    #[tokio::test]
+    async fn commit_compaction_swaps_files_atomically() {
+        use crate::PreparedCompaction;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+
+        // Append three data files in three separate snapshots.
+        let mut original_paths: Vec<String> = Vec::new();
+        for i in 0..3 {
+            let path = format!("memory:///warehouse/public/orders/data-{i}.parquet");
+            original_paths.push(path.clone());
+            c.commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: vec![DataFile {
+                    path,
+                    record_count: 1,
+                    byte_size: 100,
+                    equality_field_ids: vec![],
+                    partition_values: Vec::new(),
+                }],
+                equality_deletes: vec![],
+            })
+            .await
+            .unwrap();
+        }
+
+        // Compact: drop all three, add a single compacted file.
+        let compacted_path = "memory:///warehouse/public/orders/data-compact-0.parquet";
+        c.commit_compaction(PreparedCompaction {
+            ident: ident(),
+            added_data_files: vec![DataFile {
+                path: compacted_path.into(),
+                record_count: 3,
+                byte_size: 256,
+                equality_field_ids: vec![],
+                partition_values: Vec::new(),
+            }],
+            removed_paths: original_paths.clone(),
+        })
+        .await
+        .unwrap();
+
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(snaps.len(), 4, "3 appends + 1 compaction");
+        // The compaction is the most recent snapshot. Its
+        // `removed_paths` should list all three original files; its
+        // `data_files` should contain only the compacted output.
+        let compaction = snaps.last().unwrap();
+        assert_eq!(compaction.data_files.len(), 1);
+        assert_eq!(compaction.data_files[0].path, compacted_path);
+        let mut got_removed = compaction.removed_paths.clone();
+        got_removed.sort();
+        let mut want_removed = original_paths.clone();
+        want_removed.sort();
+        assert_eq!(got_removed, want_removed);
+
+        // Older snapshots' data_files are still present in the per-snapshot
+        // delta view (this is the "files added in snap N" semantic). The
+        // verifier and `compute_live_files` filter them out via the
+        // cumulative `removed_paths` set.
+        for snap in &snaps[..3] {
+            assert_eq!(snap.data_files.len(), 1);
+            assert!(snap.removed_paths.is_empty());
+        }
+    }
+
+    /// A no-op compaction (nothing added, nothing removed) should not
+    /// produce a snapshot bump.
+    #[tokio::test]
+    async fn commit_compaction_with_empty_input_is_noop() {
+        use crate::PreparedCompaction;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let meta = c
+            .commit_compaction(PreparedCompaction {
+                ident: ident(),
+                added_data_files: vec![],
+                removed_paths: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(meta.current_snapshot_id.is_none());
     }
 
     #[tokio::test]

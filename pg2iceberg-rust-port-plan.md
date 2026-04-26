@@ -676,6 +676,63 @@ See `config.example.yaml` for the full surface.
     `WriterError::DeletePartitionUnresolved` rather than Go's
     silent drop, so the failure is visible in logs/metrics.
 
+**Future tier-3 resolution strategies (deferred):** several options
+exist for resolving the tier-3 case without requiring REPLICA
+IDENTITY FULL. Captured here so we don't re-derive them under
+pressure later.
+
+  - **A. Lazy catalog scan, manifest-stat pruned (preferred).**
+    On tier-3, walk the catalog's snapshot history. For each data
+    file, use the manifest's `lower_bounds`/`upper_bounds` on the
+    PK column to skip files that can't contain the PK; load
+    parquet only for candidates. The matching file's manifest
+    entry already carries `partition_values` — no inference, no
+    path parsing. Cost: free in steady state; slow on rare
+    misses; bounded tight by stats. iceberg-rust already supports
+    parquet bloom filters which would prune even harder.
+    Implementation seam: extend `compute_partition_tuple`'s
+    tier-2 fallthrough with an async catalog scan, fed the same
+    `&dyn Catalog` the materializer already holds.
+  - **B. Sidecar PK→partition index.** Durable
+    `_pg2iceberg.pk_partition_index` table (in coord PG, or as
+    its own Iceberg control-plane table — see
+    `project_control_plane_metadata`). Every commit appends
+    `(table_ident, pk_key, partition_values, snapshot_id)`.
+    FileIndex becomes a memoization layer. Tier-3 disappears
+    across restarts and compaction. Cost: extra write per row
+    per commit; doubles commit IO at high throughput. The
+    industrial-strength choice if tier-3 fires often.
+  - **C. Multi-partition fan-out.** Emit one equality-delete
+    file per existing partition, all with the same PK. Iceberg
+    readers apply each delete to its own partition; only the
+    matching one does work. Always correct, no lookups. Cost:
+    linear in partition count per delete — a 1000-partition
+    table inflates one delete into 1000 manifest entries.
+    Compaction reclaims them but steady-state IO is bad. Useful
+    only as a fallback under A.
+  - **D. Position deletes for tier-3.** Switch the tier-3 path
+    to position deletes (file path + row position) instead of
+    equality deletes. Position deletes don't need partition
+    tagging — the file path implies the partition. Costs: heavier
+    per-row encoding, mixed-shape readers, special-cased writer.
+  - **E. Block on FileIndex rebuild (cheap partial fix).**
+    `register_table` already calls `rebuild_from_catalog`
+    synchronously; the cold-start tier-3 window is whatever time
+    elapses between rebuild kickoff and the first cycle. For
+    very large tables a rebuild may run long enough that an
+    early Delete arrives mid-rebuild. Adding an explicit gate
+    on the materializer ("don't process Delete WAL until rebuild
+    finishes for that table") closes that specific window.
+    Trivial change; doesn't help the compaction-race or
+    foreign-write cases.
+
+  Likely shipping plan: **A + E**. A is the honest fallback
+  (catalog as source of truth, no new persistence, degrades to
+  tier-3 error only for genuinely-impossible deletes). E covers
+  the most common tier-3 trigger trivially. C/D as last-resort
+  fallbacks under A if needed; B if a deployment hits tier-3
+  often enough to justify the extra commit IO.
+
 **Remaining items for the binary (now P0.5 / P1):**
 
 1. **Glue / SQL / S3Tables / HMS catalog backends** — variants of

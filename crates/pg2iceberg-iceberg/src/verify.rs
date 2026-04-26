@@ -67,11 +67,26 @@ pub async fn read_materialized_state(
         .cloned()
         .collect();
 
-    // Per-snapshot deleted-pk sets, in snapshot order.
+    // Cumulative set of file paths removed by compaction snapshots.
+    // A data/delete file whose path is in here at the time we'd otherwise
+    // read it is invisible to subsequent snapshots — its rows have been
+    // folded into a compacted file (and any deletes already applied at
+    // compaction time).
+    let removed_paths: BTreeSet<String> = snapshots
+        .iter()
+        .flat_map(|s| s.removed_paths.iter().cloned())
+        .collect();
+
+    // Per-snapshot deleted-pk sets, in snapshot order. Skip delete files
+    // that have been compacted away — their PKs are already filtered out
+    // of the surviving data files.
     let mut deletes_per_snap: Vec<(i64, BTreeSet<String>)> = Vec::with_capacity(snapshots.len());
     for snap in &snapshots {
         let mut snap_deleted = BTreeSet::new();
         for df in &snap.delete_files {
+            if removed_paths.contains(&df.path) {
+                continue;
+            }
             let bytes = blob_store.get(&df.path).await?;
             let rows = read_data_file(&bytes, &pk_schema)?;
             for row in rows {
@@ -84,6 +99,11 @@ pub async fn read_materialized_state(
     let mut visible: Vec<Row> = Vec::new();
     for snap in &snapshots {
         for df in &snap.data_files {
+            // Compaction-replaced files are invisible — their surviving rows
+            // live in a later compaction snapshot's `data_files`.
+            if removed_paths.contains(&df.path) {
+                continue;
+            }
             let bytes = blob_store.get(&df.path).await?;
             let rows = read_data_file(&bytes, &schema.columns)?;
             for row in rows {
@@ -276,6 +296,7 @@ mod tests {
                 id: snap_id,
                 data_files,
                 delete_files,
+                removed_paths: Vec::new(),
             });
     }
 
