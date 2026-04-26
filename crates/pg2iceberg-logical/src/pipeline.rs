@@ -61,8 +61,10 @@ impl BlobNamer for CounterBlobNamer {
 }
 
 /// The pipeline. Generic over the coord impl so the type system carries the
-/// `Coordinator` choice all the way through.
-pub struct Pipeline<C: Coordinator> {
+/// `Coordinator` choice all the way through. `?Sized` so callers that
+/// only have an `Arc<dyn Coordinator>` (the lifecycle helper) can use
+/// it without re-parameterizing.
+pub struct Pipeline<C: Coordinator + ?Sized> {
     sink: Sink,
     coord: Arc<C>,
     blob_store: Arc<dyn BlobStore>,
@@ -74,7 +76,7 @@ pub struct Pipeline<C: Coordinator> {
     shut_down: bool,
 }
 
-impl<C: Coordinator> Pipeline<C> {
+impl<C: Coordinator + ?Sized> Pipeline<C> {
     pub fn new(
         coord: Arc<C>,
         blob_store: Arc<dyn BlobStore>,

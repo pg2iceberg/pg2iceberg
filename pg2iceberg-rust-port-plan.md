@@ -309,19 +309,32 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 > (Go's 8 checks), and the invariant watcher are all wired into the
 > binary.
 >
-> **Snapshot orchestration is now library code, not binary code:**
-> `pg2iceberg_snapshot::run_snapshot_phase` is the helper the binary
-> calls — and the same helper the fault-DST exercises end-to-end. This
-> closes the "wiring isn't tested" gap. Fixed a real bug surfaced by
-> the new test: `Snapshotter` now persists progress *after every
-> successful chunk* (was: only at end-of-pass), so a mid-chunk fault
-> resumes correctly instead of restarting from chunk 0.
+> **The full lifecycle is library code, exercised end-to-end by DST:**
+> - `pg2iceberg_validate::run_logical_lifecycle` — startup
+>   validation, slot existence check, publication + slot creation,
+>   `start_replication`, pipeline + materializer + watcher
+>   construction, table registration, consumer registration,
+>   snapshot decision (drives resumable `Snapshotter`), main loop,
+>   shutdown drain. **Everything** the logical-mode binary does post
+>   prod-component construction.
+> - `pg2iceberg_query::run_query_lifecycle` — query-mode
+>   counterpart: pipeline construction, table registration with
+>   watermark column, source factory, poll/flush loop, drain.
+> - The binary's `run_inner` is **39 lines**, `run_query` is **29
+>   lines** — both are construction + one library call.
+> - Sim impls `PgClient` (via `SimPgClient` shim) and
+>   `ReplicationStream` (via `AsyncSimStream` adapter), so the same
+>   library functions drive prod and sim. Bug surfaced + fixed:
+>   `Snapshotter` now persists progress *after every successful
+>   chunk* (was: only at end-of-pass).
 >
 > **Fault injection** (Phase 6.5) wires deterministic
 > `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +
-> a fault-DST harness with proptest + pinned regressions. **413 tests
-> pass, 3 ignored** (tier-3 contract test, one upstream iceberg-rust
-> flake, materializer-crash recovery placeholder).
+> a fault-DST harness with proptest + pinned regressions including
+> end-to-end lifecycle tests. **418 tests pass, 4 ignored** (tier-3
+> contract test, one upstream iceberg-rust flake, materializer-crash
+> recovery placeholder, lifecycle-resume placeholder pending
+> Iceberg-state setup helpers).
 >
 > **Pending work, prioritized:**
 >
@@ -363,11 +376,12 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 >   only the pipeline. Now that FileIndex rebuild is wired, crashing
 >   the materializer too is unblocked. (Fault DST has a pinned
 >   `#[ignore]` placeholder for it.)
-> - **More wiring extracted to libraries** — snapshot orchestration is
->   library code now; the binary's `run_inner` main loop, query-mode
->   poller, and verify driver are still binary-only. Same pattern
->   applies: extract them so DST exercises the production code paths
->   directly (not parallel hand-rolled harnesses).
+> - **More wiring extracted to libraries** — snapshot phase, the
+>   materialize tick (cycle + compaction), and the watcher tick are
+>   library code now. Still binary-only: query-mode poll loop, verify
+>   driver, and the outer `select!`/sigint plumbing. Same pattern
+>   applies — extract them so DST exercises the production code
+>   paths directly (not parallel hand-rolled harnesses).
 > - **Multi-table parallelism in maintenance ops** —
 >   `compact_cycle` / `expire_cycle` / `cleanup_orphans_cycle` walk
 >   tables sequentially.

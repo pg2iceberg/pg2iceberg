@@ -145,7 +145,7 @@ pub async fn run_snapshot<S, C>(
 ) -> Result<Lsn>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator,
+    C: Coordinator + ?Sized,
 {
     run_snapshot_chunked(source, schemas, pipeline, DEFAULT_CHUNK_SIZE).await
 }
@@ -169,7 +169,7 @@ pub async fn run_snapshot_chunked<S, C>(
 ) -> Result<Lsn>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator,
+    C: Coordinator + ?Sized,
 {
     // Non-resumable variant: just runs a single pass with empty
     // progress and no incremental saving.
@@ -224,7 +224,7 @@ impl Snapshotter {
     ) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator,
+        C: Coordinator + ?Sized,
     {
         self.run_chunks(source, schemas, pipeline, None).await
     }
@@ -243,7 +243,7 @@ impl Snapshotter {
     ) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator,
+        C: Coordinator + ?Sized,
     {
         let snap_lsn = source.snapshot_lsn().await?;
 
@@ -320,7 +320,7 @@ async fn snapshot_one_pass<S, C>(
 ) -> Result<(usize, SnapshotProgressMap)>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator,
+    C: Coordinator + ?Sized,
 {
     assert!(chunk_size > 0, "chunk_size must be > 0");
 
@@ -372,7 +372,7 @@ async fn run_chunk_loop<S, C>(
 ) -> Result<()>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator,
+    C: Coordinator + ?Sized,
 {
     'tables: for (i, schema) in schemas.iter().enumerate() {
         let xid = SNAPSHOT_XID_BASE.wrapping_add(i as u32);
@@ -529,7 +529,7 @@ pub async fn run_snapshot_phase<S, C>(
 ) -> Result<SnapshotPhaseOutcome>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator,
+    C: Coordinator + ?Sized,
 {
     let cp_pre = coord
         .load_checkpoint()

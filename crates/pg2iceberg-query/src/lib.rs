@@ -24,6 +24,7 @@
 
 pub mod buffer;
 pub mod pipeline;
+pub mod runtime;
 
 use async_trait::async_trait;
 use pg2iceberg_core::{PgValue, Row, TableIdent};
@@ -31,6 +32,7 @@ use thiserror::Error;
 
 pub use buffer::Buffer;
 pub use pipeline::{QueryPipeline, QueryPipelineError};
+pub use runtime::{run_query_lifecycle, QueryLifecycle, QueryLifecycleError};
 
 #[derive(Debug, Error)]
 pub enum QueryError {

@@ -15,6 +15,7 @@
 mod config;
 mod realio;
 mod run;
+mod setup;
 mod snapshot_src;
 
 use anyhow::{Context, Result};

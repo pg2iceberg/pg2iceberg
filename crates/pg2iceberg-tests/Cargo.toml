@@ -20,6 +20,8 @@ pg2iceberg-logical.workspace = true
 pg2iceberg-pg.workspace = true
 pg2iceberg-snapshot.workspace = true
 pg2iceberg-stream.workspace = true
+pg2iceberg-validate.workspace = true
 bytes = "1"
 pollster = "0.4"
 proptest.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "time"] }

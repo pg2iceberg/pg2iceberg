@@ -14,7 +14,7 @@
 //! 4. SIGINT calls `Pipeline::shutdown` and exits cleanly.
 
 use crate::config::Config;
-use crate::realio::{RealClock, RealIdGen};
+use crate::snapshot_src::PgSnapshotSource;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pg2iceberg_coord::{
@@ -22,26 +22,15 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     Coordinator,
 };
-use crate::snapshot_src::PgSnapshotSource;
-use pg2iceberg_core::{Clock, IdGen, InMemoryMetrics, Lsn, Metrics, Mode, TableSchema};
-use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome};
-use pg2iceberg_iceberg::{prod::IcebergRustCatalog, Catalog as _};
+use pg2iceberg_core::{IdGen, TableSchema};
+use pg2iceberg_iceberg::prod::IcebergRustCatalog;
 use pg2iceberg_logical::{
-    materializer::CounterMaterializerNamer, pipeline::BlobNamer, Handler, Materializer, Pipeline,
-    Schedule, Ticker,
+    materializer::CounterMaterializerNamer, pipeline::BlobNamer, Materializer,
 };
-use pg2iceberg_pg::{
-    prod::{PgClientImpl, TlsMode as PgTls},
-    PgClient,
-};
+use pg2iceberg_pg::prod::{PgClientImpl, TlsMode as PgTls};
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
-use pg2iceberg_validate::{
-    validate_startup, InvariantWatcher, SlotState, StartupValidation, TableExistence,
-    WatcherInputs,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 
 /// Production blob namer. Uses an [`IdGen`]-supplied UUID per blob so
@@ -207,362 +196,38 @@ async fn run_inner<C>(
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
-    let clock = Arc::new(RealClock);
-    let id_gen = Arc::new(RealIdGen::new());
-    let worker_id = id_gen.worker_id();
-    tracing::info!(worker = %worker_id.0, "starting pg2iceberg");
-
-    // ── coord ──────────────────────────────────────────────────────────
-    let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
-        // The coord shares the source PG's TLS choice unless a
-        // separate `state.postgres_url` is set with its own
-        // sslmode in the URL — for that, libpq parses the
-        // sslmode from the URL itself and `tokio-postgres` honors
-        // it via the conn-string parser.
-        "webpki" => CoordTls::Webpki,
-        _ => CoordTls::Disable,
-    };
-    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
+    // Build prod components (PG connection, coord migrate, schema
+    // discovery, blob namer) and assemble the `LogicalLifecycle`.
+    // Everything past this is library code in
+    // `pg2iceberg_validate::run_logical_lifecycle` — slot creation,
+    // table registration, consumer heartbeat, snapshot decision,
+    // main loop, drain. The fault-DST exercises the same lifecycle
+    // helper with sim plumbing, so any change to lifecycle behavior
+    // gets fault-tested.
+    let id_gen = Arc::new(crate::realio::RealIdGen::new());
+    let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
+        Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
+    let lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
         .await
-        .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    let coord = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
-    coord.migrate().await.context("coord migrate")?;
+        .context("build logical lifecycle")?;
 
-    let catalog = Arc::new(catalog);
-
-    // ── pg source ──────────────────────────────────────────────────────
-    let pg_tls = match cfg.source.postgres.tls_label() {
-        "webpki" => PgTls::Webpki,
-        _ => PgTls::Disable,
-    };
-    let pg = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
-        .await
-        .context("PG connect")?;
-
-    // Resolve each table's schema: explicit `columns:` block in YAML
-    // wins; otherwise we discover from `information_schema.columns` +
-    // `pg_index`. Discovery requires the source PG to already have
-    // the table — this fails clearly at startup if a typo or missing
-    // table is in config.
-    let mut resolved_schemas: Vec<pg2iceberg_core::TableSchema> =
-        Vec::with_capacity(cfg.tables.len());
-    for t in &cfg.tables {
-        let schema = if t.has_explicit_columns() {
-            t.to_table_schema()?
-        } else {
-            let (ns, name) = t.qualified()?;
-            tracing::info!(table = %t.name, "discovering schema from PG");
-            let mut s = pg
-                .discover_schema(&ns, &name)
-                .await
-                .with_context(|| format!("discover schema for {}", t.name))?;
-            // Operator-supplied PK overrides whatever discovery
-            // found — useful when the source table has no PK index
-            // but operators know the natural identity columns.
-            if !t.primary_key.is_empty() {
-                let pk_set: std::collections::BTreeSet<&str> =
-                    t.primary_key.iter().map(String::as_str).collect();
-                for col in &mut s.columns {
-                    let now_pk = pk_set.contains(col.name.as_str());
-                    col.is_primary_key = now_pk;
-                    if now_pk {
-                        col.nullable = false;
-                    }
-                }
-            }
-            // Partition spec is always YAML-driven — discovery
-            // doesn't infer it from the source PG (which has no
-            // notion of "Iceberg partitioning").
-            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
-                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
-            s
-        };
-        if !schema.columns.iter().any(|c| c.is_primary_key) {
-            anyhow::bail!(
-                "table {} has no primary key; pg2iceberg requires a PK on every \
-                 replicated table — set one in PG or supply `primary_key:` in YAML",
-                t.name
-            );
-        }
-        resolved_schemas.push(schema);
-    }
-    let table_idents: Vec<_> = resolved_schemas.iter().map(|s| s.ident.clone()).collect();
-    let slot_name = &cfg.source.logical.slot_name;
-    let publication_name = &cfg.source.logical.publication_name;
-
-    // ── startup validation (Go's `pipeline/validate.go`) ───────────────
-    // Inspect coord checkpoint, source PG slot, and Iceberg table state
-    // for the 8 invariants from the Go reference. Refuse to start (with
-    // an actionable error) when something is off — e.g. a fresh
-    // checkpoint paired with an existing slot, or a slot that has
-    // recycled past the last-flushed LSN. Runs before we'd auto-create
-    // any state, so an operator who forgot to drop a slot doesn't end
-    // up silently re-snapshotting on top of one.
-    run_startup_validation(&pg, catalog.as_ref(), &coord, &resolved_schemas, slot_name)
-        .await
-        .context("startup validation")?;
-
-    let slot_was_fresh = !pg
-        .slot_exists(slot_name)
-        .await
-        .context("slot exists check")?;
-    if slot_was_fresh {
-        if let Err(e) = pg.create_publication(publication_name, &table_idents).await {
-            tracing::warn!(error = %e, "create_publication failed; assuming it exists");
-        }
-        let cp = pg.create_slot(slot_name).await.context("create_slot")?;
-        tracing::info!(slot = %slot_name, ?cp, "replication slot created");
-    } else {
-        tracing::info!(slot = %slot_name, "replication slot exists, resuming");
-    }
-
-    let mut stream = pg
-        .start_replication(slot_name, Lsn(0), publication_name)
-        .await
-        .context("START_REPLICATION")?;
-
-    // ── pipeline + materializer ────────────────────────────────────────
-    let blob_namer = Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
-    let mut pipeline = Pipeline::new(coord.clone(), blob.clone(), blob_namer, cfg.sink.flush_rows);
-
-    let mat_namer = Arc::new(CounterMaterializerNamer::new("materialized"));
-    let mut materializer: Materializer<IcebergRustCatalog<C>> = Materializer::new(
-        coord.clone() as Arc<dyn Coordinator>,
-        blob.clone(),
-        catalog.clone(),
-        mat_namer,
-        &cfg.state.group,
-        // Materializer cycle limit isn't in the Go YAML; we use 64
-        // for now and surface as a knob if profiling shows we need it.
-        64,
-    );
-
-    for schema in &resolved_schemas {
-        materializer
-            .register_table(schema.clone())
-            .await
-            .context("register table")?;
-    }
-    tracing::info!(count = resolved_schemas.len(), "tables registered");
-
-    coord
-        .register_consumer(&cfg.state.group, &worker_id, Duration::from_secs(60))
-        .await
-        .context("register_consumer")?;
-
-    // ── snapshot phase (fresh-slot bootstrap) ──────────────────────────
-    // pg2iceberg is a *mirror*, not a CDC tool — Iceberg must reflect
-    // 100% of PG state. Replication only emits events for changes
-    // *after* slot creation, so without a snapshot we'd lose every row
-    // that existed beforehand. The orchestration logic lives in
-    // `pg2iceberg_snapshot::run_snapshot_phase` so the fault-DST
-    // exercises the *exact* code path the binary runs.
-    if slot_was_fresh {
-        // Per-table `skip_snapshot: true` opt-out, mapped to TableIdents.
-        let skip_idents: std::collections::BTreeSet<pg2iceberg_core::TableIdent> = cfg
-            .tables
-            .iter()
-            .filter(|t| t.skip_snapshot)
-            .filter_map(|t| {
-                let (ns, name) = t.qualified().ok()?;
-                Some(pg2iceberg_core::TableIdent {
-                    namespace: pg2iceberg_core::Namespace(vec![ns]),
-                    name,
-                })
-            })
-            .collect();
-        let to_snapshot: Vec<TableSchema> = resolved_schemas
-            .iter()
-            .filter(|s| !skip_idents.contains(&s.ident))
-            .cloned()
-            .collect();
-        if to_snapshot.is_empty() {
-            tracing::info!("snapshot phase: every configured table is skip_snapshot=true; nothing to do");
-        } else {
-            tracing::info!(
-                count = to_snapshot.len(),
-                "snapshot phase starting (fresh slot bootstrap)"
-            );
-            let source = PgSnapshotSource::open(&cfg.source.postgres, &to_snapshot)
-                .await
-                .context("open snapshot source")?;
-            tracing::info!(snap_lsn = ?source.snapshot_lsn(), "snapshot tx LSN captured");
-            // Resumable orchestration. Returns Skipped if checkpoint
-            // already says Complete; otherwise drives the resumable
-            // Snapshotter and persists progress per chunk so a
-            // mid-snapshot crash + restart resumes at the next chunk.
-            match run_snapshot_phase(
-                &source,
-                coord.clone() as Arc<dyn Coordinator>,
-                &resolved_schemas,
-                &skip_idents,
-                &mut pipeline,
-                pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
-            )
-            .await
-            .context("run_snapshot_phase")?
-            {
-                SnapshotPhaseOutcome::Skipped => {
-                    tracing::info!("snapshot phase: skipped (checkpoint says complete)");
-                }
-                SnapshotPhaseOutcome::Completed { snapshot_lsn } => {
-                    // Ack the slot — PG advances `confirmed_flush_lsn`;
-                    // replication resumes from snap_lsn onward.
-                    stream
-                        .send_standby(snapshot_lsn, snapshot_lsn)
-                        .await
-                        .context("post-snapshot send_standby")?;
-                    // Materialize once so snapshot rows land in Iceberg
-                    // before the live-replication loop. Subsequent live
-                    // events show up via the Materialize handler.
-                    materializer
-                        .cycle()
-                        .await
-                        .context("post-snapshot materializer cycle")?;
-                    tracing::info!(?snapshot_lsn, "snapshot phase complete");
-                }
-            }
-        }
-    }
-
-    // ── invariant watcher ──────────────────────────────────────────────
-    // Plan §9 invariants checked at every Watcher tick:
-    //   1. pipeline.flushed_lsn ≤ slot.confirmed_flush_lsn
-    //   2. mat_cursor[t] ≤ max(log_index.end_offset[t])
-    //   3. pipeline.flushed_lsn monotonic
-    // Violations are logged + counted on the metrics surface; we don't
-    // exit because they're observability signals, not operator-fatal
-    // state. (A real prod metrics backend lands when we wire Prometheus
-    // — for now `InMemoryMetrics` keeps the surface complete without an
-    // exporter dep.)
-    let metrics: Arc<dyn Metrics> = Arc::new(InMemoryMetrics::new());
-    let watcher = InvariantWatcher::new(coord.clone() as Arc<dyn Coordinator>, metrics.clone());
-    let watched_tables: Vec<pg2iceberg_core::TableIdent> = resolved_schemas
-        .iter()
-        .map(|s| s.ident.clone())
-        .collect();
-
-    // ── main loop ──────────────────────────────────────────────────────
-    let mut ticker = Ticker::new(clock.now(), Schedule::default());
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-
-    tracing::info!("entering replication loop; SIGINT or SIGTERM to stop");
-
-    loop {
-        let now = clock.now();
-        let next = ticker.next_due();
-        let until_next = (next.0.saturating_sub(now.0)).max(0) as u64;
-        let tick_sleep = Duration::from_micros(until_next.min(1_000_000));
-
+    let shutdown = async move {
         tokio::select! {
             biased;
-            _ = sigint.recv() => {
-                tracing::info!("SIGINT received, shutting down");
-                break;
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("SIGTERM received, shutting down");
-                break;
-            }
-            res = stream.recv() => {
-                let msg = res.context("replication recv")?;
-                pipeline.process(msg).await.context("pipeline.process")?;
-            }
-            _ = tokio::time::sleep(tick_sleep) => {}
+            _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
         }
+    };
 
-        for h in ticker.fire_due(clock.now()) {
-            match h {
-                Handler::Flush => {
-                    if let Err(e) = pipeline.flush().await {
-                        tracing::error!(error = %e, "pipeline.flush failed");
-                        return Err(anyhow::anyhow!(e));
-                    }
-                }
-                Handler::Standby => {
-                    let lsn = pipeline.flushed_lsn();
-                    if let Err(e) = stream.send_standby(lsn, lsn).await {
-                        tracing::warn!(error = %e, "send_standby failed");
-                    }
-                }
-                Handler::Materialize => {
-                    if let Err(e) = materializer.cycle().await {
-                        tracing::error!(error = %e, "materializer.cycle failed");
-                        return Err(anyhow::anyhow!(e));
-                    }
-                    // Compaction runs at the end of every materializer
-                    // cycle, gated by file-count thresholds. Failures
-                    // are non-fatal — replication keeps progressing,
-                    // the next cycle retries. Mirrors Go's behavior.
-                    if cfg.sink.target_file_size > 0 {
-                        let cfg_compact = cfg.sink.compaction_config();
-                        match materializer.compact_cycle(&cfg_compact).await {
-                            Ok(outcomes) if !outcomes.is_empty() => {
-                                for (ident, o) in &outcomes {
-                                    tracing::info!(
-                                        table = %ident,
-                                        in_data = o.input_data_files,
-                                        in_del = o.input_delete_files,
-                                        out_data = o.output_data_files,
-                                        rows = o.rows_rewritten,
-                                        rows_removed = o.rows_removed_by_deletes,
-                                        bytes_before = o.bytes_before,
-                                        bytes_after = o.bytes_after,
-                                        "compaction"
-                                    );
-                                }
-                            }
-                            Ok(_) => {} // every table below threshold; quiet
-                            Err(e) => {
-                                tracing::warn!(error = %e, "materializer.compact_cycle failed");
-                            }
-                        }
-                    }
-                }
-                Handler::Watcher => {
-                    let confirmed = pg
-                        .slot_confirmed_flush_lsn(slot_name)
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or(Lsn::ZERO);
-                    let inputs = WatcherInputs {
-                        pipeline_flushed_lsn: pipeline.flushed_lsn(),
-                        slot_confirmed_flush_lsn: confirmed,
-                        group: cfg.state.group.clone(),
-                        watched_tables: watched_tables.clone(),
-                    };
-                    let violations = watcher.check(&inputs).await;
-                    for v in &violations {
-                        tracing::warn!(violation = %v, "invariant violation");
-                    }
-                }
-            }
-        }
-
-        let _heartbeat = coord
-            .register_consumer(&cfg.state.group, &worker_id, Duration::from_secs(60))
-            .await;
-    }
-
-    // ── shutdown ───────────────────────────────────────────────────────
-    tracing::info!("draining pipeline before exit");
-    if let Err(e) = pipeline.flush().await {
-        tracing::warn!(error = %e, "final flush failed");
-    }
-    let final_lsn = pipeline.flushed_lsn();
-    if let Err(e) = stream.send_standby(final_lsn, final_lsn).await {
-        tracing::warn!(error = %e, "final send_standby failed");
-    }
-    let _ = coord
-        .unregister_consumer(&cfg.state.group, &worker_id)
-        .await;
-    tracing::info!(?final_lsn, "exited cleanly");
+    tracing::info!("entering replication lifecycle");
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, Box::pin(shutdown))
+        .await
+        .context("logical lifecycle")?;
     Ok(())
 }
+
 
 /// Query-mode driver. Polls each table for rows whose watermark
 /// column has advanced past the stored cursor, dedups by PK, writes
@@ -583,147 +248,25 @@ async fn run_query<C>(
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
-    use crate::snapshot_src::PgWatermarkSource;
-    use pg2iceberg_logical::materializer::CounterMaterializerNamer;
-    use pg2iceberg_query::QueryPipeline;
-
-    let clock = Arc::new(RealClock);
-    let id_gen = Arc::new(RealIdGen::new());
-    tracing::info!(worker = %id_gen.worker_id().0, "starting pg2iceberg in query mode");
-
-    // ── coord (still needed for checkpoint watermark persistence) ────
-    let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
-        "webpki" => CoordTls::Webpki,
-        _ => CoordTls::Disable,
-    };
-    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
-        .await
-        .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
-    coord_concrete.migrate().await.context("coord migrate")?;
-    let coord: Arc<dyn Coordinator> = coord_concrete.clone();
-
-    let catalog = Arc::new(catalog);
-
-    // ── pg connection for schema discovery (replication-mode is fine
-    // ── here; we only run SELECTs against pg_catalog).
-    let pg_tls = match cfg.source.postgres.tls_label() {
-        "webpki" => PgTls::Webpki,
-        _ => PgTls::Disable,
-    };
-    let pg = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
-        .await
-        .context("PG connect")?;
-
-    // Resolve schemas + watermark columns.
-    let mut tables: Vec<(TableSchema, String)> = Vec::with_capacity(cfg.tables.len());
-    for t in &cfg.tables {
-        if t.watermark_column.is_empty() {
-            anyhow::bail!(
-                "query mode requires `watermark_column` on every table; missing on {}",
-                t.name
-            );
-        }
-        let schema = if t.has_explicit_columns() {
-            t.to_table_schema()?
-        } else {
-            let (ns, name) = t.qualified()?;
-            tracing::info!(table = %t.name, "discovering schema from PG");
-            let mut s = pg
-                .discover_schema(&ns, &name)
-                .await
-                .with_context(|| format!("discover schema for {}", t.name))?;
-            if !t.primary_key.is_empty() {
-                let pk_set: std::collections::BTreeSet<&str> =
-                    t.primary_key.iter().map(String::as_str).collect();
-                for col in &mut s.columns {
-                    let now_pk = pk_set.contains(col.name.as_str());
-                    col.is_primary_key = now_pk;
-                    if now_pk {
-                        col.nullable = false;
-                    }
-                }
-            }
-            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
-                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
-            s
-        };
-        if !schema.columns.iter().any(|c| c.is_primary_key) {
-            anyhow::bail!(
-                "table {} has no primary key; query mode requires PKs for dedup",
-                t.name
-            );
-        }
-        tables.push((schema, t.watermark_column.clone()));
-    }
-
-    let source = PgWatermarkSource::open(&cfg.source.postgres, &tables)
-        .await
-        .context("open watermark source")?;
-
-    let mat_namer = Arc::new(CounterMaterializerNamer::new("materialized"));
-    let mut pipeline: QueryPipeline<IcebergRustCatalog<C>> =
-        QueryPipeline::new(coord.clone(), catalog.clone(), blob.clone(), mat_namer);
-    for (schema, wm_col) in &tables {
-        pipeline
-            .register_table(schema.clone(), wm_col.clone())
-            .await
-            .with_context(|| format!("register {}", schema.ident))?;
-    }
-    tracing::info!(count = tables.len(), "query-mode tables registered");
-
-    // Poll interval — Go uses `query.poll_interval`; default to 30s.
-    let poll_interval = if cfg.source.query.poll_interval.is_empty() {
-        Duration::from_secs(30)
-    } else {
-        humantime::parse_duration(&cfg.source.query.poll_interval)
-            .with_context(|| {
-                format!(
-                    "parse query.poll_interval `{}`",
-                    cfg.source.query.poll_interval
-                )
-            })?
-    };
-    tracing::info!(?poll_interval, "query-mode poll interval");
-
-    let _ = clock;
+    // Build prod components, then hand off to
+    // `pg2iceberg_query::run_query_lifecycle`. Same pattern as
+    // logical mode: construction here, lifecycle orchestration in
+    // library code so the fault-DST exercises the same path.
+    let lifecycle = crate::setup::build_query_lifecycle(&cfg, catalog, blob).await?;
 
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-
-    loop {
-        // First-cycle no-wait so a fresh deploy doesn't sit idle.
-        match pipeline.poll(&source).await {
-            Ok(n) if n > 0 => tracing::info!(rows = n, "query-mode poll"),
-            Ok(_) => {} // quiet on no-op cycles
-            Err(e) => tracing::warn!(error = %e, "query-mode poll failed"),
-        }
-        match pipeline.flush().await {
-            Ok(n) if n > 0 => tracing::info!(rows = n, "query-mode flush"),
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "query-mode flush failed"),
-        }
-
+    let shutdown = async move {
         tokio::select! {
             biased;
-            _ = sigint.recv() => {
-                tracing::info!("SIGINT received, query-mode shutting down");
-                break;
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("SIGTERM received, query-mode shutting down");
-                break;
-            }
-            _ = tokio::time::sleep(poll_interval) => {}
+            _ = sigint.recv() => tracing::info!("SIGINT received, query-mode shutting down"),
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, query-mode shutting down"),
         }
-    }
+    };
 
-    // Final flush on exit.
-    if let Err(e) = pipeline.flush().await {
-        tracing::warn!(error = %e, "final query-mode flush failed");
-    }
+    pg2iceberg_query::run_query_lifecycle(lifecycle, Box::pin(shutdown))
+        .await
+        .context("query lifecycle")?;
     Ok(())
 }
 
@@ -1040,76 +583,6 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Run the 8 plan-§Phase-12 startup validations from
-/// `pg2iceberg-validate`. Reads the coord checkpoint, queries each
-/// configured table's existence + current snapshot id from the
-/// catalog, and reads the slot's `restart_lsn` /
-/// `confirmed_flush_lsn` from the source PG. Refuses to start on any
-/// violation with an actionable error message.
-async fn run_startup_validation<C>(
-    pg: &PgClientImpl,
-    catalog: &IcebergRustCatalog<C>,
-    coord: &Arc<PostgresCoordinator>,
-    schemas: &[TableSchema],
-    slot_name: &str,
-) -> Result<()>
-where
-    C: iceberg::Catalog + Send + Sync + 'static,
-{
-    let checkpoint = coord.load_checkpoint().await.context("load checkpoint")?;
-
-    let mut tables: Vec<TableExistence> = Vec::with_capacity(schemas.len());
-    for schema in schemas {
-        let meta = catalog
-            .load_table(&schema.ident)
-            .await
-            .with_context(|| format!("load_table({}) for validation", schema.ident))?;
-        let iceberg_name = format!("{}.{}", schema.ident.namespace, schema.ident.name);
-        tables.push(TableExistence {
-            pg_table: schema.ident.clone(),
-            iceberg_name,
-            existed: meta.is_some(),
-            current_snapshot_id: meta.and_then(|m| m.current_snapshot_id),
-        });
-    }
-
-    let slot_exists = pg
-        .slot_exists(slot_name)
-        .await
-        .context("slot_exists for validation")?;
-    let slot = if slot_exists {
-        let restart_lsn = pg
-            .slot_restart_lsn(slot_name)
-            .await
-            .context("slot_restart_lsn for validation")?
-            .unwrap_or(Lsn::ZERO);
-        let confirmed_flush_lsn = pg
-            .slot_confirmed_flush_lsn(slot_name)
-            .await
-            .context("slot_confirmed_flush_lsn for validation")?
-            .unwrap_or(Lsn::ZERO);
-        Some(SlotState {
-            exists: true,
-            restart_lsn,
-            confirmed_flush_lsn,
-        })
-    } else {
-        Some(SlotState {
-            exists: false,
-            restart_lsn: Lsn::ZERO,
-            confirmed_flush_lsn: Lsn::ZERO,
-        })
-    };
-
-    let v = StartupValidation {
-        checkpoint,
-        tables,
-        slot,
-        config_mode: Mode::Logical,
-        slot_name: slot_name.to_string(),
-    };
-    validate_startup(&v).map_err(|e| anyhow::anyhow!(e))
-}
 
 #[cfg(test)]
 mod tests {

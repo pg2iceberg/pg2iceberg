@@ -2528,6 +2528,8 @@ dependencies = [
  "pg2iceberg-stream",
  "pollster",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2597,8 +2599,10 @@ dependencies = [
  "pg2iceberg-sim",
  "pg2iceberg-snapshot",
  "pg2iceberg-stream",
+ "pg2iceberg-validate",
  "pollster",
  "proptest",
+ "tokio",
 ]
 
 [[package]]
@@ -2616,6 +2620,8 @@ dependencies = [
  "pg2iceberg-stream",
  "pollster",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

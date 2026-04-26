@@ -24,7 +24,7 @@ use pg2iceberg_core::{
     ChangeEvent, ColumnName, ColumnSchema, Lsn, Op, PgValue, Row, TableIdent, TableSchema,
     Timestamp,
 };
-use pg2iceberg_pg::DecodedMessage;
+use pg2iceberg_pg::{DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId};
 use pg2iceberg_query::{watermark_compare, QueryError, WatermarkSource};
 use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -606,6 +606,57 @@ impl SimReplicationStream {
     }
 }
 
+/// Wraps a `SimReplicationStream` so it satisfies the
+/// [`pg2iceberg_pg::ReplicationStream`] trait. The async `recv`
+/// returns immediately when a message is available; on empty queue,
+/// it returns `Pending` so the binary's tokio `select!` picks the
+/// timeout branch.
+///
+/// This lets the production main loop (in `pg2iceberg-validate`) be
+/// reused unchanged with sim plumbing — the fault-DST exercises the
+/// same code path as the binary.
+pub struct AsyncSimStream {
+    inner: SimReplicationStream,
+}
+
+impl AsyncSimStream {
+    pub fn new(inner: SimReplicationStream) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner_mut(&mut self) -> &mut SimReplicationStream {
+        &mut self.inner
+    }
+}
+
+#[async_trait]
+impl pg2iceberg_pg::ReplicationStream for AsyncSimStream {
+    async fn recv(
+        &mut self,
+    ) -> std::result::Result<pg2iceberg_pg::DecodedMessage, pg2iceberg_pg::PgError> {
+        match self.inner.recv() {
+            Some(msg) => Ok(msg),
+            None => {
+                // Sim queue is drained. Return Pending so the binary's
+                // `select!` picks the timer branch. In the binary
+                // this means "wait for the next replication event or
+                // timer tick" — same semantics as prod's blocking
+                // recv.
+                std::future::pending().await
+            }
+        }
+    }
+
+    async fn send_standby(
+        &mut self,
+        flushed: Lsn,
+        _applied: Lsn,
+    ) -> std::result::Result<(), pg2iceberg_pg::PgError> {
+        self.inner.send_standby(flushed);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl SnapshotSource for SimPostgres {
     async fn snapshot_lsn(&self) -> std::result::Result<Lsn, SnapshotError> {
@@ -683,5 +734,131 @@ impl WatermarkSource for SimPostgres {
             rows.truncate(n);
         }
         Ok(rows)
+    }
+}
+
+#[async_trait]
+impl SlotMonitor for SimPostgres {
+    async fn confirmed_flush_lsn(
+        &self,
+        slot: &str,
+    ) -> std::result::Result<Option<Lsn>, PgError> {
+        match self.slot_state(slot) {
+            Ok(s) => Ok(Some(s.confirmed_flush_lsn)),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// `SimPostgres`-backed [`PgClient`] for tests. Adapts the sim's
+/// methods (which take a publication argument at create_slot time, and
+/// don't have an `export_snapshot` concept) to the prod
+/// `PgClient` trait surface.
+///
+/// Lets the same library lifecycle helper
+/// (`pg2iceberg_validate::run_logical_lifecycle`) drive both prod and
+/// sim end-to-end, so the fault-DST exercises slot creation,
+/// publication creation, and start_replication semantics — not just
+/// the loop body.
+pub struct SimPgClient {
+    db: SimPostgres,
+    /// `PgClient::create_slot(slot)` doesn't take a publication; the
+    /// sim's slot model requires one. We track the most-recently
+    /// created publication here so create_slot can bind to it.
+    /// Mirrors prod's loose coupling: prod's `CREATE_REPLICATION_SLOT`
+    /// also doesn't bind a publication; the publication is supplied at
+    /// `START_REPLICATION` time.
+    pending_publication: std::sync::Mutex<Option<String>>,
+}
+
+impl SimPgClient {
+    pub fn new(db: SimPostgres) -> Self {
+        Self {
+            db,
+            pending_publication: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn db(&self) -> &SimPostgres {
+        &self.db
+    }
+}
+
+#[async_trait]
+impl PgClient for SimPgClient {
+    async fn create_publication(
+        &self,
+        name: &str,
+        tables: &[TableIdent],
+    ) -> std::result::Result<(), PgError> {
+        self.db
+            .create_publication(name, tables)
+            .map_err(|e| PgError::Other(e.to_string()))?;
+        *self.pending_publication.lock().unwrap() = Some(name.to_string());
+        Ok(())
+    }
+
+    async fn create_slot(&self, slot: &str) -> std::result::Result<Lsn, PgError> {
+        let pub_ = self
+            .pending_publication
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| {
+                PgError::Other(
+                    "SimPgClient::create_slot called before create_publication; \
+                     prod expects an inverse order matching CREATE_REPLICATION_SLOT \
+                     followed by START_REPLICATION ... publication_names ..., but \
+                     the sim binds at create_slot time."
+                        .into(),
+                )
+            })?;
+        self.db
+            .create_slot(slot, &pub_)
+            .map_err(|e| PgError::Other(e.to_string()))
+    }
+
+    async fn slot_exists(&self, slot: &str) -> std::result::Result<bool, PgError> {
+        Ok(self.db.slot_state(slot).is_ok())
+    }
+
+    async fn slot_restart_lsn(&self, slot: &str) -> std::result::Result<Option<Lsn>, PgError> {
+        match self.db.slot_state(slot) {
+            Ok(s) => Ok(Some(s.restart_lsn)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn slot_confirmed_flush_lsn(
+        &self,
+        slot: &str,
+    ) -> std::result::Result<Option<Lsn>, PgError> {
+        match self.db.slot_state(slot) {
+            Ok(s) => Ok(Some(s.confirmed_flush_lsn)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn export_snapshot(&self) -> std::result::Result<SnapshotId, PgError> {
+        // Sim doesn't have a notion of exported snapshot — the sim's
+        // SnapshotSource impl reads at the current LSN directly.
+        // Return a placeholder ID; callers that actually use the
+        // string would be testing prod-only behavior.
+        Ok(SnapshotId("sim-placeholder".into()))
+    }
+
+    async fn start_replication(
+        &self,
+        slot: &str,
+        _start: Lsn,
+        _publication: &str,
+    ) -> std::result::Result<Box<dyn ReplicationStream>, PgError> {
+        // Sim's stream resumes from the slot's restart_lsn — `start`
+        // is informational; callers ack via send_standby to advance.
+        let stream = self
+            .db
+            .start_replication(slot)
+            .map_err(|e| PgError::Other(e.to_string()))?;
+        Ok(Box::new(AsyncSimStream::new(stream)))
     }
 }

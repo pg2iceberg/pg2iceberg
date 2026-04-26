@@ -65,6 +65,22 @@ pub trait ReplicationStream: Send {
     async fn send_standby(&mut self, flushed: Lsn, applied: Lsn) -> Result<()>;
 }
 
+/// Read-only slot inspection. Smaller than [`PgClient`] so non-PG
+/// sources (sim, query-mode reads) can supply confirmed_flush_lsn to
+/// the invariant watcher without needing to fake the whole replication
+/// surface. Blanket-impl'd for any `PgClient`.
+#[async_trait]
+pub trait SlotMonitor: Send + Sync {
+    async fn confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
+}
+
+#[async_trait]
+impl<P: PgClient + ?Sized> SlotMonitor for P {
+    async fn confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>> {
+        PgClient::slot_confirmed_flush_lsn(self, slot).await
+    }
+}
+
 #[async_trait]
 pub trait PgClient: Send + Sync {
     async fn create_publication(&self, name: &str, tables: &[TableIdent]) -> Result<()>;
