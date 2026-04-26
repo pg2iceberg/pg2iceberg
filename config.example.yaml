@@ -20,16 +20,21 @@ tables:
     # iceberg:
     #   partition:                   # Iceberg partition spec
     #     - day(created_at)          # day/month/year/hour
-    #     - bucket[16](id)           # murmur3-bucket
+    #     - bucket[16](id)           # murmur3-bucket  ← apply not yet wired
     #     - region                   # identity
-    #     - truncate[4](name)        # truncate
+    #     - truncate[4](name)        # truncate         ← apply not yet wired
     #
-    # NOTE: today's Rust port creates partitioned tables with the
-    # right spec on the iceberg side, but the writer-side
-    # per-partition file routing is not yet wired — commits to
-    # partitioned tables fail with a clear "not yet wired" error.
-    # Use unpartitioned tables for now; partition routing lands as
-    # a follow-on alongside the Phase 7 vended-creds router.
+    # NOTE: identity / year / month / day / hour transforms work
+    # end-to-end (parse, create_table, per-row routing, commit).
+    # bucket[N] / truncate[W] parse and create the table with the
+    # right spec, but per-row computation isn't wired yet — those
+    # writes will fail with a clear "not yet wired" error.
+    #
+    # Operational note for `Delete`: when partition source columns
+    # are NOT in the primary key, configure `ALTER TABLE ... REPLICA
+    # IDENTITY FULL` on the Postgres source so logical replication
+    # carries old-row partition values. Otherwise deletes on
+    # partitioned tables error with `partition column missing`.
 
 source:
   mode: logical                # "logical" or "query"

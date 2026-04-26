@@ -17,10 +17,10 @@ pub use fold::{fold_events, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
 pub use reader::read_data_file;
 pub use verify::read_materialized_state;
-pub use writer::{DataChunk, PreparedFiles, TableWriter, WriterError};
+pub use writer::{DataChunk, PreparedChunk, PreparedFiles, TableWriter, WriterError};
 
 use async_trait::async_trait;
-use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
+use pg2iceberg_core::{Namespace, PartitionLiteral, TableIdent, TableSchema};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,6 +66,10 @@ pub struct DataFile {
     /// For equality-delete files, the field IDs that participate in the
     /// equality predicate (typically the PK columns). Empty for data files.
     pub equality_field_ids: Vec<i32>,
+    /// One literal per partition spec field, in `TableSchema.partition_spec`
+    /// order. Empty for unpartitioned tables. The catalog translates this to
+    /// an `iceberg::spec::Struct` at commit time.
+    pub partition_values: Vec<PartitionLiteral>,
 }
 
 /// One Iceberg snapshot. Snapshots are append-only and ordered by `id`.

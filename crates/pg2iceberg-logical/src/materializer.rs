@@ -28,9 +28,9 @@ use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{names, Labels};
 use pg2iceberg_core::{ColumnName, Metrics, NoopMetrics, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::{
-    fold_events, pk_key, promote_re_inserts, read_data_file, rebuild_from_catalog,
-    resolve_unchanged_cols, Catalog, DataFile, FileIndex, IcebergError, MaterializedRow,
-    PreparedCommit, TableWriter, WriterError,
+    fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, resolve_unchanged_cols,
+    Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PreparedCommit, TableWriter,
+    WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -257,64 +257,51 @@ impl<C: Catalog> Materializer<C> {
             return Ok(0);
         }
 
-        // 5. Prepare + upload.
+        // 5. Prepare + upload. Output is one parquet file per (partition,
+        //    kind) — for unpartitioned tables that's a single file per kind.
         let prepared_files = entry.writer.prepare(&folded)?;
-
-        // PKs of the rows that ended up in the new data file (Insert+Update).
-        let new_data_pks: Vec<String> = folded
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.op,
-                    pg2iceberg_core::Op::Insert | pg2iceberg_core::Op::Update
-                )
-            })
-            .map(|r| pk_key(&r.row, &entry.pk_cols))
-            .collect();
-        // PKs touched by the equality-delete file (Update+Delete).
-        let deleted_pks: Vec<String> = folded
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.op,
-                    pg2iceberg_core::Op::Update | pg2iceberg_core::Op::Delete
-                )
-            })
-            .map(|r| pk_key(&r.row, &entry.pk_cols))
-            .collect();
-
-        let mut data_files = Vec::new();
-        let mut delete_files = Vec::new();
         let pk_field_ids = entry.writer.pk_field_ids();
 
-        if let Some(chunk) = prepared_files.data {
+        // Track per-data-file which PKs ended up where, so the FileIndex
+        // update below points at the right partition file.
+        let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared_files.data.len());
+        let mut data_pk_groups: Vec<(String, Vec<String>)> =
+            Vec::with_capacity(prepared_files.data.len());
+        let mut deleted_pks: Vec<String> = Vec::new();
+
+        for chunk in prepared_files.data {
             let path = self.namer.next_path(ident, "data").await;
-            let byte_size = chunk.bytes.len() as u64;
+            let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
-                .put(&path, Bytes::clone(&chunk.bytes))
+                .put(&path, Bytes::clone(&chunk.chunk.bytes))
                 .await?;
             data_files.push(DataFile {
-                path,
-                record_count: chunk.record_count,
+                path: path.clone(),
+                record_count: chunk.chunk.record_count,
                 byte_size,
                 equality_field_ids: vec![],
+                partition_values: chunk.partition_values,
             });
+            data_pk_groups.push((path, chunk.pk_keys));
         }
-        if let Some(chunk) = prepared_files.equality_deletes {
+
+        let mut delete_files: Vec<DataFile> =
+            Vec::with_capacity(prepared_files.equality_deletes.len());
+        for chunk in prepared_files.equality_deletes {
             let path = self.namer.next_path(ident, "eq-delete").await;
-            let byte_size = chunk.bytes.len() as u64;
+            let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
-                .put(&path, Bytes::clone(&chunk.bytes))
+                .put(&path, Bytes::clone(&chunk.chunk.bytes))
                 .await?;
             delete_files.push(DataFile {
                 path,
-                record_count: chunk.record_count,
+                record_count: chunk.chunk.record_count,
                 byte_size,
-                equality_field_ids: pk_field_ids,
+                equality_field_ids: pk_field_ids.clone(),
+                partition_values: chunk.partition_values,
             });
+            deleted_pks.extend(chunk.pk_keys);
         }
-
-        let new_data_path = data_files.first().map(|d| d.path.clone());
 
         // 6. Commit catalog snapshot — durability gate.
         self.catalog
@@ -334,8 +321,8 @@ impl<C: Catalog> Materializer<C> {
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         // Removed PKs first (so a later add for the same PK overrides cleanly).
         entry_mut.file_index.remove_pks(&deleted_pks);
-        if let Some(path) = new_data_path {
-            entry_mut.file_index.add_file(path, new_data_pks);
+        for (path, pks) in data_pk_groups {
+            entry_mut.file_index.add_file(path, pks);
         }
 
         let folded_len = folded.len();

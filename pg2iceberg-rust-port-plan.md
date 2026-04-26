@@ -631,7 +631,7 @@ See `config.example.yaml` for the full surface.
   - `"vended"` errors with "not yet wired" — that's the Phase 7
     vended-credentials S3 router.
 
-**Iceberg partition spec — partial:**
+**Iceberg partition spec — most of it landed:**
 
 - **Parsing + create-table:** done. YAML
   `tables[].iceberg.partition: ["day(col)", "bucket[16](id)", ...]`
@@ -641,22 +641,29 @@ See `config.example.yaml` for the full surface.
   `iceberg::spec::UnboundPartitionSpec` and creates the table
   partitioned. `load_table` round-trips the spec back through
   `from_iceberg_schema`.
-- **Per-partition file routing — NOT YET WIRED.** `commit_snapshot`
-  refuses commits to partitioned tables with a clear "writer-side
-  per-partition routing is not yet wired" error rather than letting
-  iceberg's `validate_partition_value` reject `Struct::empty()` with
-  a less informative error. Use unpartitioned tables today.
+- **Per-partition file routing — done.** `TableWriter::prepare`
+  groups folded rows by their per-row partition tuple and emits one
+  parquet chunk per `(partition_tuple, kind)` group. The materializer
+  uploads each chunk to a unique blob path and constructs a `DataFile`
+  carrying `partition_values: Vec<PartitionLiteral>`. The catalog
+  translates the per-file values to an `iceberg::spec::Struct` at
+  `commit_snapshot` time. Snapshots round-trip back through
+  `iceberg_struct_to_partition_literals` so reads of partitioned
+  tables stay self-consistent.
 - **Transform application — partial.** `apply_transform` in
   `pg2iceberg_core::partition` handles identity / year / month / day /
   hour over `PgValue`. Bucket and truncate parse correctly and
-  partition-spec values land on the iceberg side, but `apply_transform`
-  for them returns "not yet wired"; wire alongside the writer.
-- **Writer follow-on (Phase 7.x):** group folded rows by
-  `partition_tuple = (apply_transform(value, transform), ...)`,
-  encode one parquet file per partition group, attach
-  `partition: Struct::from_iter(...)` to each `DataFile` at
-  `commit_snapshot` time. iceberg-rust 0.9 has
-  `RecordBatchPartitionSplitter` we can lean on for the arrow side.
+  partition-spec values land on the iceberg side, but applying them
+  per-row returns "not yet wired"; that surfaces as a `WriterError::PartitionTransform`
+  inside `TableWriter::prepare`. Plug in murmur3 (~30 LOC) and the
+  decimal/string/integer truncate to close that gap.
+- **Operational constraint.** The writer needs the partition source
+  columns present on every row it sees. For `Insert`/`Update` rows
+  this is automatic; for `Delete` rows the row carries only PK
+  columns, so partition columns must either (a) be in the PK, or
+  (b) be present via `REPLICA IDENTITY FULL` on the source table.
+  The writer errors clearly with `WriterError::PartitionColumnMissing`
+  if neither holds.
 
 **Remaining items for the binary (now P0.5 / P1):**
 

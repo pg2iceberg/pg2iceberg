@@ -199,6 +199,7 @@ mod tests {
                     record_count: 1,
                     byte_size: 100,
                     equality_field_ids: vec![],
+                    partition_values: Vec::new(),
                 }],
                 equality_deletes: vec![],
             }))

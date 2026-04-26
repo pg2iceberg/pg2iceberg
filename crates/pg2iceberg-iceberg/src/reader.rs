@@ -150,7 +150,7 @@ mod tests {
             },
         ];
         let prepared = w.prepare(&rows).unwrap();
-        let bytes = prepared.data.unwrap().bytes;
+        let bytes = prepared.data.into_iter().next().unwrap().chunk.bytes;
         let decoded = read_data_file(&bytes, &schema.columns).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0], row(1, 10));
@@ -193,7 +193,11 @@ mod tests {
                 unchanged_cols: vec![],
             }])
             .unwrap();
-        let decoded = read_data_file(&prepared.data.unwrap().bytes, &schema.columns).unwrap();
+        let decoded = read_data_file(
+            &prepared.data.into_iter().next().unwrap().chunk.bytes,
+            &schema.columns,
+        )
+        .unwrap();
         assert_eq!(decoded[0].get(&col("note")), Some(&PgValue::Null));
     }
 }

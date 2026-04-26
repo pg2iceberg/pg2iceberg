@@ -25,7 +25,7 @@ use pg2iceberg_core::{
     Checkpoint, ColumnName, Lsn, Mode, PgValue, SnapshotState, TableIdent, TableSchema,
 };
 use pg2iceberg_iceberg::{
-    pk_key, promote_re_inserts, rebuild_from_catalog, Catalog, DataFile, FileIndex, IcebergError,
+    promote_re_inserts, rebuild_from_catalog, Catalog, DataFile, FileIndex, IcebergError,
     PreparedCommit, TableWriter, WriterError,
 };
 use pg2iceberg_logical::materializer::MaterializerNamer;
@@ -245,56 +245,47 @@ impl<C: Catalog> QueryPipeline<C> {
 
         let prepared = entry.writer.prepare(&rows)?;
 
-        // PKs that ended up in the data file (Insert + promoted Update).
-        let new_data_pks: Vec<String> = rows
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.op,
-                    pg2iceberg_core::Op::Insert | pg2iceberg_core::Op::Update
-                )
-            })
-            .map(|r| pk_key(&r.row, &entry.pk_cols))
-            .collect();
-        // PKs touched by the equality-delete file (promoted re-inserts).
-        let deleted_pks: Vec<String> = rows
-            .iter()
-            .filter(|r| matches!(r.op, pg2iceberg_core::Op::Update))
-            .map(|r| pk_key(&r.row, &entry.pk_cols))
-            .collect();
-
-        let mut data_files = Vec::new();
-        let mut delete_files = Vec::new();
         let pk_field_ids = entry.writer.pk_field_ids();
 
-        if let Some(chunk) = prepared.data {
+        // Track per-data-file PK group so the FileIndex update points each
+        // PK at its partition file.
+        let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
+        let mut data_pk_groups: Vec<(String, Vec<String>)> =
+            Vec::with_capacity(prepared.data.len());
+        let mut deleted_pks: Vec<String> = Vec::new();
+
+        for chunk in prepared.data {
             let path = self.namer.next_path(ident, "query-data").await;
-            let byte_size = chunk.bytes.len() as u64;
+            let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
-                .put(&path, Bytes::clone(&chunk.bytes))
+                .put(&path, Bytes::clone(&chunk.chunk.bytes))
                 .await?;
             data_files.push(DataFile {
-                path,
-                record_count: chunk.record_count,
+                path: path.clone(),
+                record_count: chunk.chunk.record_count,
                 byte_size,
                 equality_field_ids: vec![],
+                partition_values: chunk.partition_values,
             });
+            data_pk_groups.push((path, chunk.pk_keys));
         }
-        if let Some(chunk) = prepared.equality_deletes {
+
+        let mut delete_files: Vec<DataFile> = Vec::with_capacity(prepared.equality_deletes.len());
+        for chunk in prepared.equality_deletes {
             let path = self.namer.next_path(ident, "query-eq-delete").await;
-            let byte_size = chunk.bytes.len() as u64;
+            let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
-                .put(&path, Bytes::clone(&chunk.bytes))
+                .put(&path, Bytes::clone(&chunk.chunk.bytes))
                 .await?;
             delete_files.push(DataFile {
                 path,
-                record_count: chunk.record_count,
+                record_count: chunk.chunk.record_count,
                 byte_size,
-                equality_field_ids: pk_field_ids,
+                equality_field_ids: pk_field_ids.clone(),
+                partition_values: chunk.partition_values,
             });
+            deleted_pks.extend(chunk.pk_keys);
         }
-
-        let new_data_path = data_files.first().map(|d| d.path.clone());
 
         self.catalog
             .commit_snapshot(PreparedCommit {
@@ -307,8 +298,8 @@ impl<C: Catalog> QueryPipeline<C> {
         // Update FileIndex post-commit (mirrors the materializer ordering).
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         entry_mut.file_index.remove_pks(&deleted_pks);
-        if let Some(path) = new_data_path {
-            entry_mut.file_index.add_file(path, new_data_pks);
+        for (path, pks) in data_pk_groups {
+            entry_mut.file_index.add_file(path, pks);
         }
 
         // Persist the updated watermark snapshot. Order: catalog commit

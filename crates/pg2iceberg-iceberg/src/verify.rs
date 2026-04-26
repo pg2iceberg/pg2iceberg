@@ -237,24 +237,34 @@ mod tests {
         let prepared = w.prepare(rows).unwrap();
         let mut data_files = Vec::new();
         let mut delete_files = Vec::new();
-        if let Some(chunk) = prepared.data {
-            let path = format!("{path_prefix}-data");
-            block_on(blob.put(&path, chunk.bytes.clone())).unwrap();
+        for (i, chunk) in prepared.data.into_iter().enumerate() {
+            let path = if i == 0 {
+                format!("{path_prefix}-data")
+            } else {
+                format!("{path_prefix}-data-{i}")
+            };
+            block_on(blob.put(&path, chunk.chunk.bytes.clone())).unwrap();
             data_files.push(DataFile {
                 path,
-                record_count: chunk.record_count,
+                record_count: chunk.chunk.record_count,
                 byte_size: 0,
                 equality_field_ids: vec![],
+                partition_values: chunk.partition_values,
             });
         }
-        if let Some(chunk) = prepared.equality_deletes {
-            let path = format!("{path_prefix}-eqdel");
-            block_on(blob.put(&path, chunk.bytes.clone())).unwrap();
+        for (i, chunk) in prepared.equality_deletes.into_iter().enumerate() {
+            let path = if i == 0 {
+                format!("{path_prefix}-eqdel")
+            } else {
+                format!("{path_prefix}-eqdel-{i}")
+            };
+            block_on(blob.put(&path, chunk.chunk.bytes.clone())).unwrap();
             delete_files.push(DataFile {
                 path,
-                record_count: chunk.record_count,
+                record_count: chunk.chunk.record_count,
                 byte_size: 0,
-                equality_field_ids: prepared.pk_field_ids,
+                equality_field_ids: prepared.pk_field_ids.clone(),
+                partition_values: chunk.partition_values,
             });
         }
         cat.snaps

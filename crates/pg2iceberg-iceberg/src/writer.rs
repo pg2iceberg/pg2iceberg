@@ -1,23 +1,11 @@
 //! `TableWriter`: produces Iceberg merge-on-read output (data files + equality
 //! deletes) from a folded `Vec<MaterializedRow>`.
 //!
-//! Mirrors `iceberg/tablewriter.go:130-380` (`Prepare`). Phase 7 first-pass
-//! deferrals: partitioning, FileIndex/TOAST resolution, schema evolution,
-//! decimal/uuid/binary value encoding. Each is a Phase 7.5 task.
-//!
-//! ## Output shape
-//!
-//! - Final `Insert` for a PK → 1 row in the data file.
-//! - Final `Update` for a PK → 1 row in the data file *and* 1 row in the
-//!   equality-delete file (drops any prior row with this PK).
-//! - Final `Delete` for a PK → 1 row in the equality-delete file *only*.
-//!
-//! Pure inserts produce no equality delete; that mirrors `tablewriter.go:301`'s
-//! `if rs.Op == "U" || rs.Op == "D"` filter and keeps Phase 7.5 (re-insert
-//! after delete) honest — the materializer will emit an equality delete
-//! through a separate path once FileIndex tells it the PK existed before.
+//! For partitioned tables the writer fans rows out into one parquet file per
+//! `(partition_tuple, kind)` group; the materializer then commits each group
+//! as a separate `DataFile` with its `partition_values` carried through.
 
-use crate::fold::MaterializedRow;
+use crate::fold::{pk_key, MaterializedRow};
 use arrow_array::builder::{
     BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
     StringBuilder, TimestampMicrosecondBuilder,
@@ -27,7 +15,10 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, Op, PgValue, Row, TableSchema};
+use pg2iceberg_core::{
+    apply_transform, ColumnName, ColumnSchema, IcebergType, Op, PartitionField, PartitionLiteral,
+    PgValue, Row, TableSchema,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -48,6 +39,19 @@ pub enum WriterError {
     /// Phase 7 doesn't yet wire decimal/uuid/binary builders.
     #[error("type {0:?} is not yet supported by the writer (Phase 7.5)")]
     TypeNotYetSupported(IcebergType),
+    /// Partition column missing from a row (typical for `Delete` rows on a
+    /// partitioned table where the partition column is not in the PK).
+    #[error(
+        "partition column `{column}` missing from {op:?} row on partitioned table; \
+         move the column into the PK or set REPLICA IDENTITY FULL on the source table"
+    )]
+    PartitionColumnMissing { column: String, op: Op },
+    #[error("partition transform failure on column `{column}`: {source}")]
+    PartitionTransform {
+        column: String,
+        #[source]
+        source: pg2iceberg_core::partition::PartitionError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, WriterError>;
@@ -61,21 +65,40 @@ pub struct DataChunk {
     pub record_count: u64,
 }
 
+/// One parquet file's worth of rows that share a partition tuple. The
+/// materializer uploads `chunk.bytes` and constructs a [`crate::DataFile`]
+/// carrying `partition_values` so the catalog can build the right Iceberg
+/// `Struct`.
+#[derive(Clone, Debug)]
+pub struct PreparedChunk {
+    /// One literal per partition spec field, in the same order as
+    /// `TableSchema.partition_spec`. Empty for unpartitioned tables.
+    pub partition_values: Vec<PartitionLiteral>,
+    pub chunk: DataChunk,
+    /// PKs of the rows in this chunk. The materializer feeds these into
+    /// `FileIndex` (data chunks) or uses them as the "deleted PKs" set
+    /// (equality-delete chunks).
+    pub pk_keys: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct PreparedFiles {
-    /// Full-schema rows for `Insert` and `Update` final ops.
-    pub data: Option<DataChunk>,
-    /// PK-only rows for `Update` and `Delete` final ops.
-    pub equality_deletes: Option<DataChunk>,
-    /// PK field-id list, populated whenever `equality_deletes` is `Some`. The
-    /// materializer hands this to the catalog as the equality-delete file's
-    /// `equality_field_ids` manifest column.
+    /// Full-schema rows for `Insert` and `Update` final ops, one entry per
+    /// distinct partition tuple.
+    pub data: Vec<PreparedChunk>,
+    /// PK-only rows for `Update` and `Delete` final ops, one entry per
+    /// distinct partition tuple.
+    pub equality_deletes: Vec<PreparedChunk>,
+    /// PK field-id list, populated whenever any equality-delete chunk is
+    /// emitted. The materializer hands this to the catalog as the
+    /// equality-delete file's `equality_field_ids` manifest column.
     pub pk_field_ids: Vec<i32>,
 }
 
 pub struct TableWriter {
     schema: TableSchema,
     pk_columns: Vec<ColumnSchema>,
+    pk_col_names: Vec<ColumnName>,
     /// Subset of `schema.columns` that are PK; precomputed for the
     /// equality-delete file.
     pk_arrow_schema: Arc<Schema>,
@@ -85,11 +108,16 @@ pub struct TableWriter {
 impl TableWriter {
     pub fn new(schema: TableSchema) -> Self {
         let pk_columns: Vec<ColumnSchema> = schema.primary_key_columns().cloned().collect();
+        let pk_col_names: Vec<ColumnName> = pk_columns
+            .iter()
+            .map(|c| ColumnName(c.name.clone()))
+            .collect();
         let full_arrow_schema = Arc::new(arrow_schema_for(&schema.columns));
         let pk_arrow_schema = Arc::new(arrow_schema_for(&pk_columns));
         Self {
             schema,
             pk_columns,
+            pk_col_names,
             pk_arrow_schema,
             full_arrow_schema,
         }
@@ -103,33 +131,30 @@ impl TableWriter {
         self.pk_columns.iter().map(|c| c.field_id).collect()
     }
 
-    /// Take folded rows, partition by op into data + equality-delete builders,
-    /// and serialize each to a single Parquet chunk. Phase 7 doesn't split
-    /// across multiple chunks (no rolling threshold yet); the caller flushes
-    /// per materializer cycle.
+    /// Take folded rows, split by op into data + equality-delete buckets,
+    /// then group each bucket by partition tuple. Each group is serialized
+    /// to one parquet chunk; the caller flushes per materializer cycle.
     pub fn prepare(&self, rows: &[MaterializedRow]) -> Result<PreparedFiles> {
         if rows.is_empty() {
             return Ok(PreparedFiles {
-                data: None,
-                equality_deletes: None,
+                data: Vec::new(),
+                equality_deletes: Vec::new(),
                 pk_field_ids: self.pk_field_ids(),
             });
         }
 
-        let mut data_rows: Vec<&Row> = Vec::new();
-        let mut delete_rows: Vec<&Row> = Vec::new();
+        let mut data_rows: Vec<&MaterializedRow> = Vec::new();
+        let mut delete_rows: Vec<&MaterializedRow> = Vec::new();
 
         for r in rows {
             match r.op {
-                Op::Insert => data_rows.push(&r.row),
+                Op::Insert => data_rows.push(r),
                 Op::Update => {
-                    data_rows.push(&r.row);
-                    delete_rows.push(&r.row);
+                    data_rows.push(r);
+                    delete_rows.push(r);
                 }
-                Op::Delete => delete_rows.push(&r.row),
+                Op::Delete => delete_rows.push(r),
                 Op::Relation | Op::Truncate => {
-                    // Materializer fold should never produce these; treat as
-                    // programmer error if it ever happens.
                     return Err(WriterError::Encode(format!(
                         "unexpected op in folded rows: {:?}",
                         r.op
@@ -138,24 +163,10 @@ impl TableWriter {
             }
         }
 
-        let data = if data_rows.is_empty() {
-            None
-        } else {
-            Some(write_chunk(
-                &self.full_arrow_schema,
-                &self.schema.columns,
-                &data_rows,
-            )?)
-        };
-        let equality_deletes = if delete_rows.is_empty() {
-            None
-        } else {
-            Some(write_chunk(
-                &self.pk_arrow_schema,
-                &self.pk_columns,
-                &delete_rows,
-            )?)
-        };
+        let data =
+            self.group_and_encode(&data_rows, &self.full_arrow_schema, &self.schema.columns)?;
+        let equality_deletes =
+            self.group_and_encode(&delete_rows, &self.pk_arrow_schema, &self.pk_columns)?;
 
         Ok(PreparedFiles {
             data,
@@ -163,6 +174,92 @@ impl TableWriter {
             pk_field_ids: self.pk_field_ids(),
         })
     }
+
+    fn group_and_encode(
+        &self,
+        rows: &[&MaterializedRow],
+        arrow_schema: &Arc<Schema>,
+        cols: &[ColumnSchema],
+    ) -> Result<Vec<PreparedChunk>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // For unpartitioned tables we skip tuple computation entirely and
+        // emit a single chunk. This matches the pre-partitioning behavior
+        // bit-for-bit.
+        if !self.schema.is_partitioned() {
+            let row_refs: Vec<&Row> = rows.iter().map(|r| &r.row).collect();
+            let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
+            let pk_keys = rows
+                .iter()
+                .map(|r| pk_key(&r.row, &self.pk_col_names))
+                .collect();
+            return Ok(vec![PreparedChunk {
+                partition_values: Vec::new(),
+                chunk,
+                pk_keys,
+            }]);
+        }
+
+        // Partitioned table: compute per-row tuple, group by tuple, encode
+        // one parquet file per group. PartitionLiteral does not implement
+        // Hash/Ord (Float/Double NaN handling), so we use a linear-scan
+        // group keyed by tuple equality. Number of partitions per
+        // materializer cycle is small in practice.
+        type Group<'a> = (Vec<PartitionLiteral>, Vec<&'a MaterializedRow>);
+        let mut groups: Vec<Group> = Vec::new();
+        for r in rows {
+            let tuple = self.compute_partition_tuple(r)?;
+            if let Some(slot) = groups.iter_mut().find(|(k, _)| k == &tuple) {
+                slot.1.push(r);
+            } else {
+                groups.push((tuple, vec![r]));
+            }
+        }
+
+        let mut out: Vec<PreparedChunk> = Vec::with_capacity(groups.len());
+        for (partition_values, group_rows) in groups {
+            let row_refs: Vec<&Row> = group_rows.iter().map(|r| &r.row).collect();
+            let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
+            let pk_keys = group_rows
+                .iter()
+                .map(|r| pk_key(&r.row, &self.pk_col_names))
+                .collect();
+            out.push(PreparedChunk {
+                partition_values,
+                chunk,
+                pk_keys,
+            });
+        }
+        Ok(out)
+    }
+
+    fn compute_partition_tuple(&self, r: &MaterializedRow) -> Result<Vec<PartitionLiteral>> {
+        self.schema
+            .partition_spec
+            .iter()
+            .map(|f| compute_partition_literal(f, r))
+            .collect()
+    }
+}
+
+fn compute_partition_literal(
+    field: &PartitionField,
+    r: &MaterializedRow,
+) -> Result<PartitionLiteral> {
+    let key = ColumnName(field.source_column.clone());
+    let value = r
+        .row
+        .get(&key)
+        .ok_or_else(|| WriterError::PartitionColumnMissing {
+            column: field.source_column.clone(),
+            op: r.op,
+        })?;
+    apply_transform(value, field.transform).map_err(|e| WriterError::PartitionTransform {
+        column: field.source_column.clone(),
+        source: e,
+    })
 }
 
 fn arrow_schema_for(cols: &[ColumnSchema]) -> Schema {
@@ -353,7 +450,8 @@ mod tests {
     use crate::fold::MaterializedRow;
     use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
+    use pg2iceberg_core::value::{DaysSinceEpoch, TimestampMicros};
+    use pg2iceberg_core::{Namespace, PartitionField, TableIdent, TableSchema, Transform};
     use std::collections::BTreeMap;
 
     fn schema_id_qty() -> TableSchema {
@@ -414,8 +512,8 @@ mod tests {
     fn empty_input_returns_empty_prepared_files() {
         let w = TableWriter::new(schema_id_qty());
         let p = w.prepare(&[]).unwrap();
-        assert!(p.data.is_none());
-        assert!(p.equality_deletes.is_none());
+        assert!(p.data.is_empty());
+        assert!(p.equality_deletes.is_empty());
     }
 
     #[test]
@@ -428,10 +526,12 @@ mod tests {
                 unchanged_cols: vec![],
             }])
             .unwrap();
-        assert!(p.data.is_some());
-        assert!(p.equality_deletes.is_none());
+        assert_eq!(p.data.len(), 1);
+        assert!(p.equality_deletes.is_empty());
 
-        let batch = read_parquet(&p.data.as_ref().unwrap().bytes);
+        let chunk = &p.data[0];
+        assert!(chunk.partition_values.is_empty());
+        let batch = read_parquet(&chunk.chunk.bytes);
         assert_eq!(batch.num_rows(), 1);
         let id_col = batch
             .column_by_name("id")
@@ -459,12 +559,13 @@ mod tests {
                 unchanged_cols: vec![],
             }])
             .unwrap();
-        assert!(p.data.is_none());
-        let chunk = p.equality_deletes.unwrap();
-        assert_eq!(chunk.record_count, 1);
+        assert!(p.data.is_empty());
+        assert_eq!(p.equality_deletes.len(), 1);
+        let chunk = &p.equality_deletes[0];
+        assert_eq!(chunk.chunk.record_count, 1);
         assert_eq!(p.pk_field_ids, vec![1]);
 
-        let batch = read_parquet(&chunk.bytes);
+        let batch = read_parquet(&chunk.chunk.bytes);
         // Equality-delete file has *only* PK columns.
         let arrow_schema = batch.schema();
         let names: Vec<&str> = arrow_schema
@@ -492,8 +593,10 @@ mod tests {
                 unchanged_cols: vec![],
             }])
             .unwrap();
-        let data = p.data.unwrap();
-        let dels = p.equality_deletes.unwrap();
+        assert_eq!(p.data.len(), 1);
+        assert_eq!(p.equality_deletes.len(), 1);
+        let data = &p.data[0].chunk;
+        let dels = &p.equality_deletes[0].chunk;
         assert_eq!(data.record_count, 1);
         assert_eq!(dels.record_count, 1);
 
@@ -539,8 +642,10 @@ mod tests {
                 },
             ])
             .unwrap();
-        assert_eq!(p.data.unwrap().record_count, 2); // I + U
-        assert_eq!(p.equality_deletes.unwrap().record_count, 2); // U + D
+        assert_eq!(p.data.len(), 1);
+        assert_eq!(p.data[0].chunk.record_count, 2); // I + U
+        assert_eq!(p.equality_deletes.len(), 1);
+        assert_eq!(p.equality_deletes[0].chunk.record_count, 2); // U + D
     }
 
     #[test]
@@ -553,7 +658,7 @@ mod tests {
                 unchanged_cols: vec![],
             }])
             .unwrap();
-        let batch = read_parquet(&p.data.as_ref().unwrap().bytes);
+        let batch = read_parquet(&p.data[0].chunk.bytes);
         for (i, field) in batch.schema().fields().iter().enumerate() {
             let id = field
                 .metadata()
@@ -615,7 +720,7 @@ mod tests {
                 unchanged_cols: vec![],
             }])
             .unwrap();
-        let batch = read_parquet(&p.data.unwrap().bytes);
+        let batch = read_parquet(&p.data[0].chunk.bytes);
         assert_eq!(
             batch
                 .column_by_name("name")
@@ -691,5 +796,295 @@ mod tests {
             err,
             WriterError::TypeNotYetSupported(IcebergType::Uuid)
         ));
+    }
+
+    // ── partitioned writes ────────────────────────────────────────────────
+
+    fn schema_partitioned_by_region() -> TableSchema {
+        TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "orders".into(),
+            },
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "region".into(),
+                    field_id: 2,
+                    ty: IcebergType::String,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+            partition_spec: vec![PartitionField {
+                source_column: "region".into(),
+                name: "region".into(),
+                transform: Transform::Identity,
+            }],
+        }
+    }
+
+    fn row_with_region(id: i32, region: &str) -> Row {
+        let mut r = BTreeMap::new();
+        r.insert(col("id"), PgValue::Int4(id));
+        r.insert(col("region"), PgValue::Text(region.into()));
+        r
+    }
+
+    #[test]
+    fn identity_partition_splits_data_by_partition_value() {
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let p = w
+            .prepare(&[
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_region(1, "us"),
+                    unchanged_cols: vec![],
+                },
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_region(2, "us"),
+                    unchanged_cols: vec![],
+                },
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_region(3, "eu"),
+                    unchanged_cols: vec![],
+                },
+            ])
+            .unwrap();
+        assert_eq!(p.data.len(), 2, "two distinct regions → two data chunks");
+        assert!(p.equality_deletes.is_empty());
+
+        let mut by_region: BTreeMap<String, u64> = BTreeMap::new();
+        for chunk in &p.data {
+            assert_eq!(chunk.partition_values.len(), 1);
+            match &chunk.partition_values[0] {
+                PartitionLiteral::String(s) => {
+                    by_region.insert(s.clone(), chunk.chunk.record_count);
+                }
+                other => panic!("expected String literal, got {other:?}"),
+            }
+        }
+        assert_eq!(by_region.get("us"), Some(&2));
+        assert_eq!(by_region.get("eu"), Some(&1));
+    }
+
+    fn schema_partitioned_by_day_of_created_at_pk() -> TableSchema {
+        TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "events".into(),
+            },
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    // Partition column is in PK so deletes can compute the tuple.
+                    name: "created_at".into(),
+                    field_id: 2,
+                    ty: IcebergType::TimestampTz,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+            ],
+            partition_spec: vec![PartitionField {
+                source_column: "created_at".into(),
+                name: "created_at_day".into(),
+                transform: Transform::Day,
+            }],
+        }
+    }
+
+    fn row_with_ts(id: i32, micros: i64) -> Row {
+        let mut r = BTreeMap::new();
+        r.insert(col("id"), PgValue::Int4(id));
+        r.insert(
+            col("created_at"),
+            PgValue::TimestampTz(TimestampMicros(micros)),
+        );
+        r
+    }
+
+    #[test]
+    fn day_partition_groups_by_day_bucket() {
+        let w = TableWriter::new(schema_partitioned_by_day_of_created_at_pk());
+        // Two rows on day 19_723 (2024-01-01), one on day 19_724.
+        let day_micros: i64 = 86_400_000_000;
+        let p = w
+            .prepare(&[
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_ts(1, 19_723 * day_micros + 3_600_000_000),
+                    unchanged_cols: vec![],
+                },
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_ts(2, 19_723 * day_micros + 7_200_000_000),
+                    unchanged_cols: vec![],
+                },
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_ts(3, 19_724 * day_micros + 1),
+                    unchanged_cols: vec![],
+                },
+            ])
+            .unwrap();
+        assert_eq!(p.data.len(), 2);
+        let mut by_day: BTreeMap<i32, u64> = BTreeMap::new();
+        for chunk in &p.data {
+            match &chunk.partition_values[0] {
+                PartitionLiteral::Int(d) => {
+                    by_day.insert(*d, chunk.chunk.record_count);
+                }
+                other => panic!("expected Int literal, got {other:?}"),
+            }
+        }
+        assert_eq!(by_day.get(&19_723), Some(&2));
+        assert_eq!(by_day.get(&19_724), Some(&1));
+    }
+
+    #[test]
+    fn delete_with_partition_column_in_pk_routes_correctly() {
+        // partition col is in PK, so delete row carries it.
+        let w = TableWriter::new(schema_partitioned_by_day_of_created_at_pk());
+        let day_micros: i64 = 86_400_000_000;
+        let p = w
+            .prepare(&[MaterializedRow {
+                op: Op::Delete,
+                row: row_with_ts(1, 19_723 * day_micros),
+                unchanged_cols: vec![],
+            }])
+            .unwrap();
+        assert_eq!(p.equality_deletes.len(), 1);
+        match &p.equality_deletes[0].partition_values[0] {
+            PartitionLiteral::Int(19_723) => {}
+            other => panic!("expected Int(19723), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_missing_partition_column_errors_clearly() {
+        // Schema partitions by `region`, but delete row has only `id`.
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let err = w
+            .prepare(&[MaterializedRow {
+                op: Op::Delete,
+                row: pk_only(1),
+                unchanged_cols: vec![],
+            }])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WriterError::PartitionColumnMissing { ref column, op: Op::Delete } if column == "region"
+        ));
+    }
+
+    #[test]
+    fn pk_keys_are_carried_per_chunk() {
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let p = w
+            .prepare(&[
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_region(1, "us"),
+                    unchanged_cols: vec![],
+                },
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: row_with_region(2, "eu"),
+                    unchanged_cols: vec![],
+                },
+            ])
+            .unwrap();
+        let mut by_region: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for chunk in &p.data {
+            if let PartitionLiteral::String(r) = &chunk.partition_values[0] {
+                by_region.insert(r.clone(), chunk.pk_keys.clone());
+            }
+        }
+        assert_eq!(by_region.get("us").unwrap().len(), 1);
+        assert_eq!(by_region.get("eu").unwrap().len(), 1);
+        // PK keys carry only the PK columns (id), not partition value.
+        assert!(by_region.get("us").unwrap()[0].contains("1"));
+    }
+
+    #[test]
+    fn update_on_partitioned_table_emits_data_and_delete_in_same_partition() {
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let p = w
+            .prepare(&[MaterializedRow {
+                op: Op::Update,
+                row: row_with_region(1, "us"),
+                unchanged_cols: vec![],
+            }])
+            .unwrap();
+        assert_eq!(p.data.len(), 1);
+        assert_eq!(p.equality_deletes.len(), 1);
+        match &p.data[0].partition_values[0] {
+            PartitionLiteral::String(s) if s == "us" => {}
+            other => panic!("expected us, got {other:?}"),
+        }
+        match &p.equality_deletes[0].partition_values[0] {
+            PartitionLiteral::String(s) if s == "us" => {}
+            other => panic!("expected us, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn day_partition_on_date_column() {
+        let schema = TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "events".into(),
+            },
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "d".into(),
+                    field_id: 2,
+                    ty: IcebergType::Date,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+            ],
+            partition_spec: vec![PartitionField {
+                source_column: "d".into(),
+                name: "d_day".into(),
+                transform: Transform::Day,
+            }],
+        };
+        let w = TableWriter::new(schema);
+        let mut r = BTreeMap::new();
+        r.insert(col("id"), PgValue::Int4(1));
+        r.insert(col("d"), PgValue::Date(DaysSinceEpoch(20_000)));
+        let p = w
+            .prepare(&[MaterializedRow {
+                op: Op::Insert,
+                row: r,
+                unchanged_cols: vec![],
+            }])
+            .unwrap();
+        match &p.data[0].partition_values[0] {
+            PartitionLiteral::Int(20_000) => {}
+            other => panic!("expected Int(20000), got {other:?}"),
+        }
     }
 }

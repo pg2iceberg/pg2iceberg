@@ -25,15 +25,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::spec::{
-    DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, NestedField,
-    PrimitiveType, Schema as IcebergSchema, Struct, Type,
+    DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, Literal,
+    NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema, Struct, Type,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog as IcebergCatalogTrait, ErrorKind, NamespaceIdent, TableCreation,
     TableIdent as IcebergTableIdent,
 };
-use pg2iceberg_core::{typemap::IcebergType, ColumnSchema, Namespace, TableIdent, TableSchema};
+use pg2iceberg_core::{
+    typemap::IcebergType, ColumnSchema, Namespace, PartitionLiteral, TableIdent, TableSchema,
+};
 
 use crate::{
     apply_schema_changes, Catalog, DataFile, IcebergError, PreparedCommit, Result, SchemaChange,
@@ -134,31 +136,13 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let it = to_iceberg_table_ident(&prepared.ident)?;
         let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
         let spec_id = table.metadata().default_partition_spec_id();
-
-        // Per-partition routing on the writer side isn't wired yet —
-        // see `prepare_partitioned` follow-on. For now, refuse to
-        // commit data files into a partitioned table with empty
-        // partition values; iceberg-rust's `validate_partition_value`
-        // would reject this with a less informative error.
-        if !table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .is_empty()
-        {
-            return Err(IcebergError::Other(format!(
-                "table {} is partitioned but the writer-side per-partition routing \
-                 is not yet wired in the Rust port — every Insert/Update/Delete would \
-                 land at `Struct::empty()` and fail iceberg validation. \
-                 Drop the `iceberg.partition` block in YAML to mirror unpartitioned \
-                 today, or wire the writer (Phase: per-partition routing follow-on).",
-                prepared.ident
-            )));
-        }
+        let part_field_count = table.metadata().default_partition_spec().fields().len();
 
         let mut all_files: Vec<IcebergDataFile> =
             Vec::with_capacity(prepared.data_files.len() + prepared.equality_deletes.len());
         for df in &prepared.data_files {
+            let partition =
+                build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
             all_files.push(
                 DataFileBuilder::default()
                     .content(DataContentType::Data)
@@ -166,7 +150,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     .file_format(DataFileFormat::Parquet)
                     .file_size_in_bytes(df.byte_size)
                     .record_count(df.record_count)
-                    .partition(Struct::empty())
+                    .partition(partition)
                     .partition_spec_id(spec_id)
                     .build()
                     .map_err(|e| IcebergError::Other(format!("data file build: {e}")))?,
@@ -180,6 +164,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     df.path
                 )));
             }
+            let partition =
+                build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
             all_files.push(
                 DataFileBuilder::default()
                     .content(DataContentType::EqualityDeletes)
@@ -188,7 +174,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     .file_size_in_bytes(df.byte_size)
                     .record_count(df.record_count)
                     .equality_ids(Some(df.equality_field_ids.clone()))
-                    .partition(Struct::empty())
+                    .partition(partition)
                     .partition_spec_id(spec_id)
                     .build()
                     .map_err(|e| IcebergError::Other(format!("delete file build: {e}")))?,
@@ -292,11 +278,13 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     .map_err(map_iceberg_err)?;
                 for me in manifest.entries() {
                     let df = me.data_file();
+                    let partition_values = iceberg_struct_to_partition_literals(df.partition());
                     let our = DataFile {
                         path: df.file_path().to_string(),
                         record_count: df.record_count(),
                         byte_size: df.file_size_in_bytes(),
                         equality_field_ids: df.equality_ids().unwrap_or_default(),
+                        partition_values,
                     };
                     match df.content_type() {
                         DataContentType::Data => data_files.push(our),
@@ -525,6 +513,89 @@ fn to_iceberg_unbound_partition_spec(
     Ok(builder.build())
 }
 
+/// Translate our per-file `partition_values` to an iceberg `Struct`. Length
+/// must match the table's partition spec; we error rather than pad/truncate
+/// to keep upstream bugs visible.
+fn build_partition_struct(
+    values: &[PartitionLiteral],
+    expected_field_count: usize,
+    file_path: &str,
+) -> Result<Struct> {
+    if values.len() != expected_field_count {
+        return Err(IcebergError::Other(format!(
+            "file {} carries {} partition values but the table's default spec has {}; \
+             writer and catalog disagree on partition arity",
+            file_path,
+            values.len(),
+            expected_field_count
+        )));
+    }
+    if expected_field_count == 0 {
+        return Ok(Struct::empty());
+    }
+    let lits: Vec<Option<Literal>> = values.iter().map(partition_literal_to_iceberg).collect();
+    Ok(Struct::from_iter(lits))
+}
+
+/// Inverse of [`partition_literal_to_iceberg`]. Used by `snapshots()` to
+/// surface partition values back through our `DataFile`.
+fn iceberg_struct_to_partition_literals(s: &Struct) -> Vec<PartitionLiteral> {
+    s.iter().map(iceberg_literal_to_partition).collect()
+}
+
+fn iceberg_literal_to_partition(lit: Option<&Literal>) -> PartitionLiteral {
+    use pg2iceberg_core::partition::{f32_no_nan::F32, f64_no_nan::F64};
+    let Some(Literal::Primitive(p)) = lit else {
+        return PartitionLiteral::Null;
+    };
+    match p {
+        PrimitiveLiteral::Boolean(b) => PartitionLiteral::Boolean(*b),
+        PrimitiveLiteral::Int(n) => PartitionLiteral::Int(*n),
+        PrimitiveLiteral::Long(n) => PartitionLiteral::Long(*n),
+        PrimitiveLiteral::Float(f) => PartitionLiteral::Float(F32(f.0)),
+        PrimitiveLiteral::Double(f) => PartitionLiteral::Double(F64(f.0)),
+        PrimitiveLiteral::String(s) => PartitionLiteral::String(s.clone()),
+        PrimitiveLiteral::Binary(b) => PartitionLiteral::Binary(b.clone()),
+        // UUID partition values were translated as 16-byte BE; round-trip them
+        // back as raw binary so the writer's identity-on-UUID-source stays
+        // self-consistent.
+        PrimitiveLiteral::UInt128(u) => PartitionLiteral::Binary(u.to_be_bytes().to_vec()),
+        // Decimal / Int128 / AboveMax / BelowMin: not produced by our writer;
+        // surface as Null rather than panic so reads of foreign-written
+        // partition values don't crash the verifier.
+        _ => PartitionLiteral::Null,
+    }
+}
+
+fn partition_literal_to_iceberg(lit: &PartitionLiteral) -> Option<Literal> {
+    use pg2iceberg_core::partition::{f32_no_nan::F32, f64_no_nan::F64};
+    match lit {
+        PartitionLiteral::Null => None,
+        PartitionLiteral::Boolean(b) => Some(Literal::bool(*b)),
+        PartitionLiteral::Int(n) => Some(Literal::int(*n)),
+        PartitionLiteral::Long(n) => Some(Literal::long(*n)),
+        PartitionLiteral::Float(F32(f)) => Some(Literal::float(*f)),
+        PartitionLiteral::Double(F64(f)) => Some(Literal::double(*f)),
+        PartitionLiteral::String(s) => Some(Literal::string(s)),
+        // For now Binary covers raw bytes and UUID identity-partition values.
+        // iceberg-rust's UUID literal stores `UInt128`; if that becomes a
+        // real validation issue we'll add a `PartitionLiteral::Uuid` variant
+        // and translate it here. Today's writer rejects UUID identity
+        // partitioning before it reaches the catalog (see `apply_transform`
+        // for `PgValue::Uuid`).
+        PartitionLiteral::Binary(b) => {
+            if b.len() == 16 {
+                let arr: [u8; 16] = b.as_slice().try_into().expect("len-checked");
+                Some(Literal::Primitive(PrimitiveLiteral::UInt128(
+                    u128::from_be_bytes(arr),
+                )))
+            } else {
+                Some(Literal::binary(b.clone()))
+            }
+        }
+    }
+}
+
 fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Result<TableMetadata> {
     let part_spec = table.metadata().default_partition_spec();
     Ok(TableMetadata {
@@ -680,7 +751,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_to_partitioned_table_returns_clear_not_yet_wired_error() {
+    async fn commit_to_partitioned_table_with_partition_values_round_trips() {
+        use pg2iceberg_core::{PartitionLiteral, Transform};
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        let mut s = schema();
+        s.partition_spec = vec![pg2iceberg_core::PartitionField {
+            source_column: "qty".into(),
+            name: "qty".into(),
+            transform: Transform::Identity,
+        }];
+        c.create_table(&s).await.unwrap();
+        // Two distinct partition values land in the same snapshot as two
+        // separate data files.
+        let meta = c
+            .commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: vec![
+                    DataFile {
+                        path: "memory:///warehouse/public/orders/data-qty-1.parquet".into(),
+                        record_count: 3,
+                        byte_size: 256,
+                        equality_field_ids: vec![],
+                        partition_values: vec![PartitionLiteral::Long(1)],
+                    },
+                    DataFile {
+                        path: "memory:///warehouse/public/orders/data-qty-2.parquet".into(),
+                        record_count: 5,
+                        byte_size: 384,
+                        equality_field_ids: vec![],
+                        partition_values: vec![PartitionLiteral::Long(2)],
+                    },
+                ],
+                equality_deletes: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(meta.current_snapshot_id.is_some());
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].data_files.len(), 2);
+        let mut by_qty: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
+        for df in &snaps[0].data_files {
+            assert_eq!(df.partition_values.len(), 1);
+            if let PartitionLiteral::Long(q) = &df.partition_values[0] {
+                by_qty.insert(*q, df.record_count);
+            } else {
+                panic!(
+                    "expected Long partition value, got {:?}",
+                    df.partition_values[0]
+                );
+            }
+        }
+        assert_eq!(by_qty.get(&1), Some(&3));
+        assert_eq!(by_qty.get(&2), Some(&5));
+    }
+
+    #[tokio::test]
+    async fn writer_to_catalog_roundtrips_partition_values_for_identity_partitioned_table() {
+        use crate::TableWriter;
+        use pg2iceberg_core::value::PgValue;
+        use pg2iceberg_core::{ColumnName, Op, PartitionLiteral, Transform};
+        use std::collections::BTreeMap;
+
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        let mut s = schema();
+        // Partition by `note` (string identity). Force `note` non-nullable
+        // for this test so the writer doesn't have to handle null partitions.
+        s.columns[2].nullable = false;
+        s.partition_spec = vec![pg2iceberg_core::PartitionField {
+            source_column: "note".into(),
+            name: "note".into(),
+            transform: Transform::Identity,
+        }];
+        c.create_table(&s).await.unwrap();
+
+        // Prepare via TableWriter: 2 inserts into "us", 1 into "eu" → two
+        // data chunks tagged with the right partition tuples.
+        let w = TableWriter::new(s.clone());
+        let mut row_a = BTreeMap::new();
+        row_a.insert(ColumnName("id".into()), PgValue::Int4(1));
+        row_a.insert(ColumnName("qty".into()), PgValue::Int8(10));
+        row_a.insert(ColumnName("note".into()), PgValue::Text("us".into()));
+        let mut row_b = BTreeMap::new();
+        row_b.insert(ColumnName("id".into()), PgValue::Int4(2));
+        row_b.insert(ColumnName("qty".into()), PgValue::Int8(20));
+        row_b.insert(ColumnName("note".into()), PgValue::Text("us".into()));
+        let mut row_c = BTreeMap::new();
+        row_c.insert(ColumnName("id".into()), PgValue::Int4(3));
+        row_c.insert(ColumnName("qty".into()), PgValue::Int8(30));
+        row_c.insert(ColumnName("note".into()), PgValue::Text("eu".into()));
+        let prepared = w
+            .prepare(&[
+                crate::MaterializedRow {
+                    op: Op::Insert,
+                    row: row_a,
+                    unchanged_cols: vec![],
+                },
+                crate::MaterializedRow {
+                    op: Op::Insert,
+                    row: row_b,
+                    unchanged_cols: vec![],
+                },
+                crate::MaterializedRow {
+                    op: Op::Insert,
+                    row: row_c,
+                    unchanged_cols: vec![],
+                },
+            ])
+            .unwrap();
+        assert_eq!(prepared.data.len(), 2);
+
+        // Commit each chunk as a separate DataFile carrying its
+        // partition_values. This is the same shape the materializer
+        // produces.
+        let mut data_files: Vec<DataFile> = Vec::new();
+        for (i, chunk) in prepared.data.into_iter().enumerate() {
+            data_files.push(DataFile {
+                path: format!("memory:///warehouse/public/orders/data-{i}.parquet"),
+                record_count: chunk.chunk.record_count,
+                byte_size: chunk.chunk.bytes.len() as u64,
+                equality_field_ids: vec![],
+                partition_values: chunk.partition_values,
+            });
+        }
+        c.commit_snapshot(PreparedCommit {
+            ident: ident(),
+            data_files,
+            equality_deletes: vec![],
+        })
+        .await
+        .unwrap();
+
+        // Read back: snapshots() must surface the same partition values we
+        // wrote. This also covers `iceberg_struct_to_partition_literals`.
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].data_files.len(), 2);
+        let mut by_region: BTreeMap<String, u64> = BTreeMap::new();
+        for df in &snaps[0].data_files {
+            assert_eq!(df.partition_values.len(), 1);
+            if let PartitionLiteral::String(r) = &df.partition_values[0] {
+                by_region.insert(r.clone(), df.record_count);
+            } else {
+                panic!(
+                    "expected String partition value, got {:?}",
+                    df.partition_values[0]
+                );
+            }
+        }
+        assert_eq!(by_region.get("us"), Some(&2));
+        assert_eq!(by_region.get("eu"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn commit_to_partitioned_table_with_arity_mismatch_errors() {
         use pg2iceberg_core::Transform;
         let c = fresh().await;
         c.ensure_namespace(&ident().namespace).await.unwrap();
@@ -691,14 +917,17 @@ mod tests {
             transform: Transform::Identity,
         }];
         c.create_table(&s).await.unwrap();
+        // Empty partition_values for a partitioned table should error with a
+        // clear arity mismatch — not silently land at `Struct::empty()`.
         let err = c
             .commit_snapshot(PreparedCommit {
                 ident: ident(),
                 data_files: vec![DataFile {
-                    path: "memory:///warehouse/public/orders/data-0.parquet".into(),
+                    path: "memory:///warehouse/public/orders/data-bogus.parquet".into(),
                     record_count: 1,
-                    byte_size: 256,
+                    byte_size: 64,
                     equality_field_ids: vec![],
+                    partition_values: Vec::new(),
                 }],
                 equality_deletes: vec![],
             })
@@ -706,8 +935,8 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("partitioned"),
-            "expected partitioning error, got: {msg}"
+            msg.contains("partition arity") || msg.contains("partition values"),
+            "expected arity-mismatch error, got: {msg}"
         );
     }
 
@@ -763,6 +992,7 @@ mod tests {
                         record_count: 10 + i,
                         byte_size: 1024 + i * 100,
                         equality_field_ids: vec![],
+                        partition_values: Vec::new(),
                     }],
                     equality_deletes: vec![],
                 })
@@ -819,6 +1049,7 @@ mod tests {
                     record_count: 1,
                     byte_size: 64,
                     equality_field_ids: vec![1],
+                    partition_values: Vec::new(),
                 }],
             })
             .await
@@ -845,12 +1076,14 @@ mod tests {
                     record_count: 5,
                     byte_size: 1024,
                     equality_field_ids: vec![],
+                    partition_values: Vec::new(),
                 }],
                 equality_deletes: vec![DataFile {
                     path: "memory:///warehouse/public/orders/eq-deletes-0.parquet".into(),
                     record_count: 2,
                     byte_size: 128,
                     equality_field_ids: vec![1],
+                    partition_values: Vec::new(),
                 }],
             })
             .await
@@ -883,6 +1116,7 @@ mod tests {
                     record_count: 1,
                     byte_size: 64,
                     equality_field_ids: vec![],
+                    partition_values: Vec::new(),
                 }],
             })
             .await
@@ -1033,6 +1267,7 @@ mod tests {
                 record_count: 1,
                 byte_size: 256,
                 equality_field_ids: vec![],
+                partition_values: Vec::new(),
             }],
             equality_deletes: vec![],
         })
