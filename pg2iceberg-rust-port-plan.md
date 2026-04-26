@@ -307,8 +307,12 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 > covers all six iceberg transforms. Maintenance covers compaction +
 > snapshot expiry + orphan cleanup. Snapshot phase, startup validation
 > (Go's 8 checks), and the invariant watcher are all wired into the
-> binary. **399 tests pass, 2 ignored** (the tier-3 contract test +
-> one upstream iceberg-rust flake).
+> binary. **Fault injection** (Phase 6.5) wires deterministic
+> `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +
+> a fault-DST harness with proptest + pinned regressions. **410 tests
+> pass, 4 ignored** (tier-3 contract test, one upstream iceberg-rust
+> flake, plus two `#[ignore]`-d gap-flagging tests for non-resumable
+> snapshot and materializer-crash recovery).
 >
 > **Pending work, prioritized:**
 >
@@ -346,14 +350,16 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 >   `loadTable` time.
 >
 > **P2 (steady-state hardening):**
-> - **Phase 6.5 fault injection** — `FaultyBlobStore` /
->   `FaultyCoordinator` wrappers + DST step generators. Turns the
->   receipt-gated durability invariant from "structurally enforced"
->   into "structurally enforced AND empirically proven under random IO
->   failure."
 > - **DST: materializer-crash variant** — `dst.rs` currently crashes
 >   only the pipeline. Now that FileIndex rebuild is wired, crashing
->   the materializer too is unblocked.
+>   the materializer too is unblocked. (Fault DST has a pinned
+>   `#[ignore]` placeholder for it.)
+> - **Resumable snapshot via `Snapshotter` in the binary** — the fault
+>   DST `mid_snapshot_blob_put_fault_recovers_via_resumable_snapshotter`
+>   shows the resumable surface works under faults; the binary still
+>   uses the non-resumable `run_snapshot` free function. Switch to
+>   `Snapshotter` so a mid-snapshot blob/coord fault doesn't restart
+>   from chunk 0 on huge tables. Plan §Phase 11.5.
 > - **Multi-table parallelism in maintenance ops** —
 >   `compact_cycle` / `expire_cycle` / `cleanup_orphans_cycle` walk
 >   tables sequentially.
