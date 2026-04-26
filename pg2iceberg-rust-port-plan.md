@@ -328,25 +328,36 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 >   `Snapshotter` now persists progress *after every successful
 >   chunk* (was: only at end-of-pass).
 >
-> **Snapshot↔CDC fence wired.** Lifecycle now opens replication
-> *after* the snapshot phase, passing `snap_lsn` as the start LSN
-> so the server's replication-slot fence skips events committed
-> before the snapshot view. `PgSnapshotSource` captures
+> **Snapshot↔CDC fence wired.** Lifecycle opens replication *after*
+> the snapshot phase, passing `snap_lsn` as the start LSN so the
+> server's replication-slot fence skips events committed before
+> the snapshot view. `PgSnapshotSource` captures
 > `pg_current_wal_lsn()` *before* `BEGIN ISOLATION LEVEL REPEATABLE
 > READ` so concurrent commits in `[snap_lsn, BEGIN-time]` get
-> deduplicated by the materializer's PK-keyed equality-deletes
-> instead of being lost. Two pinned fault-DST tests verify both:
-> `snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream`
-> and
-> `fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity`.
-> (Note: `_pg2iceberg.markers` is a separate mechanism, unrelated
-> to this fence — purpose TBD from Go reference.)
+> deduplicated. Two pinned tests verify.
+>
+> **Blue-green marker alignment wired (sim-only).**
+> `_pg2iceberg.markers` is the operator-driven WAL-aligned snapshot
+> primitive for blue-green replica diffs (per Go's
+> `examples/blue-green/`). Lifecycle gains an opt-in
+> `meta_namespace`; pipeline filters marker INSERTs from user
+> staging, packages them in CommitBatch; coord persists +
+> dedup-emits per-table; materializer writes
+> `(uuid, table_name, snapshot_id)` to `<meta_namespace>.markers`.
+> Marker fast-path in main loop triggers immediate
+> flush+materialize on observation — guarantees alignment even
+> when blue and green have different materializer intervals. **5
+> pinned DST tests** (`dst_markers.rs`) cover the alignment
+> guarantees. Surfaced + fixed a real bug in the process:
+> `MemoryCoordinator::claim_offsets` was dropping markers from
+> empty-claims flushes. Prod emission is no-op until the
+> `log_index.flushable_lsn` schema migration lands.
 >
 > **Fault injection** (Phase 6.5) wires deterministic
 > `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +
 > a fault-DST harness with proptest + pinned regressions including
-> end-to-end lifecycle + fence tests. **420 tests pass, 4 ignored**
-> (tier-3 contract test, one upstream iceberg-rust flake,
+> end-to-end lifecycle + fence + marker tests. **425 tests pass, 4
+> ignored** (tier-3 contract test, one upstream iceberg-rust flake,
 > materializer-crash recovery placeholder, lifecycle-resume
 > placeholder pending Iceberg-state setup helpers).
 >
