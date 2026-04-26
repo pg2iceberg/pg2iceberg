@@ -205,14 +205,10 @@ pub mod f64_no_nan {
 /// Compute a partition literal for `value` under `transform`. Year /
 /// Month / Day / Hour expect `PgValue::Date` or `Timestamp` /
 /// `TimestampTz` inputs; identity passes the value through.
-///
-/// Bucket and Truncate currently return
-/// `Err(PartitionError::Invalid("not yet wired"))` — partition spec
-/// parses + table is created with the right transform on the
-/// iceberg side, but compute-at-write is a follow-on. Identity +
-/// time-bucket transforms cover the bulk of real partition layouts;
-/// bucket / truncate land when we wire the murmur3 + truncate
-/// functions over `PgValue` (small but separable work).
+/// `Bucket(N)` hashes the value via murmur3_x86_32 per iceberg
+/// [spec appendix B](https://iceberg.apache.org/spec/#appendix-b-32-bit-hash-requirements);
+/// `Truncate(W)` floors integers/decimals to multiples of W and
+/// truncates strings/binary to the first W code points/bytes.
 pub fn apply_transform(
     value: &PgValue,
     transform: Transform,
@@ -226,17 +222,8 @@ pub fn apply_transform(
         Transform::Month => time_bucket(value, TimeUnit::Month),
         Transform::Day => time_bucket(value, TimeUnit::Day),
         Transform::Hour => time_bucket(value, TimeUnit::Hour),
-        Transform::Bucket(_) => Err(PartitionError::Invalid(
-            "bucket transform is not yet wired in the writer; \
-             partition spec is set on the table but per-row routing \
-             needs the murmur3 application path"
-                .into(),
-        )),
-        Transform::Truncate(_) => Err(PartitionError::Invalid(
-            "truncate transform is not yet wired in the writer; \
-             follows-on alongside bucket"
-                .into(),
-        )),
+        Transform::Bucket(n) => bucket_value(value, n),
+        Transform::Truncate(w) => truncate_value(value, w),
     }
 }
 
@@ -322,6 +309,136 @@ fn ymd_from_epoch_days(days_since_epoch: i32) -> (i32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y_final = if m <= 2 { y + 1 } else { y };
     (y_final, m)
+}
+
+// ── bucket[N] transform ─────────────────────────────────────────────────
+
+fn bucket_value(value: &PgValue, n: u32) -> Result<PartitionLiteral, PartitionError> {
+    if n == 0 {
+        return Err(PartitionError::Invalid(
+            "bucket modulus must be positive".into(),
+        ));
+    }
+    let hash = bucket_hash(value)?;
+    // Iceberg spec: `(hash & Integer.MAX_VALUE) % N`.
+    let positive = hash & i32::MAX;
+    let bucket = positive.rem_euclid(n as i32);
+    Ok(PartitionLiteral::Int(bucket))
+}
+
+fn bucket_hash(value: &PgValue) -> Result<i32, PartitionError> {
+    match value {
+        // Per iceberg spec appendix B: int and date hash as i64-LE.
+        PgValue::Int2(x) => Ok(hash_i64(*x as i64)),
+        PgValue::Int4(x) => Ok(hash_i64(*x as i64)),
+        PgValue::Int8(x) => Ok(hash_i64(*x)),
+        PgValue::Date(d) => Ok(hash_i64(d.0 as i64)),
+        PgValue::Time(t) | PgValue::TimeTz { time: t, .. } => Ok(hash_i64(t.0)),
+        PgValue::Timestamp(t) | PgValue::TimestampTz(t) => Ok(hash_i64(t.0)),
+        PgValue::Text(s) | PgValue::Json(s) | PgValue::Jsonb(s) => Ok(hash_bytes(s.as_bytes())),
+        // UUID hashes as the canonical 16 big-endian bytes.
+        PgValue::Uuid(b) => Ok(hash_bytes(b)),
+        PgValue::Numeric(d) => Ok(hash_bytes(minimum_be_bytes(&d.unscaled_be_bytes))),
+        // Per iceberg spec: bool / float / double / binary aren't valid
+        // bucket inputs (booleans have only 2 values; floats hash NaN
+        // ambiguously; binary uses identity). Surface a clear error.
+        PgValue::Bool(_) | PgValue::Float4(_) | PgValue::Float8(_) | PgValue::Bytea(_) => {
+            Err(PartitionError::Invalid(format!(
+                "bucket transform does not accept value of type {value:?}; \
+                 iceberg spec restricts bucket to int/long/string/uuid/decimal/date/time/timestamp"
+            )))
+        }
+        PgValue::Null => Ok(0), // unreachable — apply_transform short-circuits Null
+    }
+}
+
+#[inline]
+fn hash_i64(v: i64) -> i32 {
+    hash_bytes(&v.to_le_bytes())
+}
+
+fn hash_bytes(v: &[u8]) -> i32 {
+    let mut cursor = std::io::Cursor::new(v);
+    // murmur3_32 returns u32; iceberg's hash function is `(u32 as i32)`.
+    murmur3::murmur3_32(&mut cursor, 0).expect("murmur3_32 cannot fail on Cursor<&[u8]>") as i32
+}
+
+/// Strip redundant sign-extension bytes from a big-endian two's-complement
+/// representation. Iceberg's bucket hash for decimals operates on this
+/// minimum-byte form, per [spec appendix B](https://iceberg.apache.org/spec/#appendix-b-32-bit-hash-requirements).
+fn minimum_be_bytes(bytes: &[u8]) -> &[u8] {
+    if bytes.len() <= 1 {
+        return bytes;
+    }
+    let is_negative = bytes[0] & 0x80 != 0;
+    let pad = if is_negative { 0xFF } else { 0x00 };
+    let mut start = 0;
+    while start < bytes.len() - 1 {
+        if bytes[start] != pad {
+            break;
+        }
+        // Stripping is safe only if the next byte preserves the original
+        // sign (its MSB matches what we'd implicitly extend).
+        let next_msb_set = bytes[start + 1] & 0x80 != 0;
+        if is_negative != next_msb_set {
+            break;
+        }
+        start += 1;
+    }
+    &bytes[start..]
+}
+
+// ── truncate[W] transform ───────────────────────────────────────────────
+
+fn truncate_value(value: &PgValue, w: u32) -> Result<PartitionLiteral, PartitionError> {
+    if w == 0 {
+        return Err(PartitionError::Invalid(
+            "truncate width must be positive".into(),
+        ));
+    }
+    let w_i64 = w as i64;
+    match value {
+        PgValue::Int2(x) => Ok(PartitionLiteral::Int(truncate_i64(*x as i64, w_i64) as i32)),
+        PgValue::Int4(x) => Ok(PartitionLiteral::Int(truncate_i64(*x as i64, w_i64) as i32)),
+        PgValue::Int8(x) => Ok(PartitionLiteral::Long(truncate_i64(*x, w_i64))),
+        PgValue::Text(s) | PgValue::Json(s) | PgValue::Jsonb(s) => Ok(PartitionLiteral::String(
+            // Iceberg spec: truncate to L Unicode code points, NOT bytes.
+            s.chars().take(w as usize).collect(),
+        )),
+        PgValue::Bytea(b) => Ok(PartitionLiteral::Binary(
+            b.iter().take(w as usize).copied().collect(),
+        )),
+        // Numeric truncate would require the i128 ↔ unscaled_be_bytes
+        // round-trip; not yet wired. Iceberg readers cope with rare-in-
+        // practice numeric partition layouts only; the spec's primary
+        // intent for truncate is on string/int columns.
+        PgValue::Numeric(_) => Err(PartitionError::Invalid(
+            "truncate transform on Decimal columns is not yet wired; \
+             use truncate on the unscaled int column or partition by \
+             a different transform"
+                .into(),
+        )),
+        PgValue::Bool(_)
+        | PgValue::Float4(_)
+        | PgValue::Float8(_)
+        | PgValue::Date(_)
+        | PgValue::Time(_)
+        | PgValue::TimeTz { .. }
+        | PgValue::Timestamp(_)
+        | PgValue::TimestampTz(_)
+        | PgValue::Uuid(_) => Err(PartitionError::Invalid(format!(
+            "truncate transform does not accept value of type {value:?}; \
+             iceberg spec restricts truncate to int/long/decimal/string/binary"
+        ))),
+        PgValue::Null => unreachable!("apply_transform short-circuits Null"),
+    }
+}
+
+/// Iceberg spec: `v - (((v % W) + W) % W)`. Equivalent to flooring `v`
+/// toward negative infinity to a multiple of W.
+#[inline]
+fn truncate_i64(v: i64, w: i64) -> i64 {
+    v - v.rem_euclid(w)
 }
 
 fn identity_literal(value: &PgValue) -> Result<PartitionLiteral, PartitionError> {
@@ -499,15 +616,231 @@ mod tests {
         }
     }
 
+    // ── bucket apply ──────────────────────────────────────────────────
+
+    fn bucket_unwrap(v: &PgValue, n: u32) -> i32 {
+        match apply_transform(v, Transform::Bucket(n)).unwrap() {
+            PartitionLiteral::Int(x) => x,
+            other => panic!("expected Int from bucket, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn bucket_and_truncate_error_at_apply_time() {
-        let v = PgValue::Int4(7);
+    fn bucket_int_long_match_iceberg_reference_values() {
+        // Cross-checked against iceberg-rust's own
+        // `transform::bucket::tests`:
+        // - bucket[10] of int(100) and long(100) both = 6
+        //   (tests/transform/bucket.rs::test_projection_bucket_integer/long).
+        assert_eq!(bucket_unwrap(&PgValue::Int4(100), 10), 6);
+        assert_eq!(bucket_unwrap(&PgValue::Int8(100), 10), 6);
+        // int and long with the same numeric value collide in iceberg's
+        // bucket spec, since both hash via i64-LE.
+        assert_eq!(
+            bucket_unwrap(&PgValue::Int4(1), 16),
+            bucket_unwrap(&PgValue::Int8(1), 16)
+        );
+    }
+
+    #[test]
+    fn bucket_string_hashes_utf8_bytes() {
+        // Same string → same bucket regardless of how often we hash.
+        let v = PgValue::Text("iceberg".into());
+        let a = bucket_unwrap(&v, 16);
+        let b = bucket_unwrap(&v, 16);
+        assert_eq!(a, b);
+        assert!((0..16).contains(&a));
+        // Different strings should *generally* land in different buckets,
+        // though collisions are possible. Just check the result is a valid
+        // bucket index.
+        let v2 = PgValue::Text("rust".into());
+        let c = bucket_unwrap(&v2, 16);
+        assert!((0..16).contains(&c));
+    }
+
+    #[test]
+    fn bucket_result_is_always_in_range() {
+        // Iceberg spec uses Java's int; bucket counts > i32::MAX aren't
+        // representable. Test with the realistic range operators pick.
+        for n in [1u32, 4, 16, 1000, 1_000_000] {
+            for v in [
+                PgValue::Int4(0),
+                PgValue::Int4(-1),
+                PgValue::Int4(i32::MIN),
+                PgValue::Int8(i64::MAX),
+                PgValue::Text("".into()),
+                PgValue::Text("hello world".into()),
+            ] {
+                let bucket = bucket_unwrap(&v, n);
+                assert!(
+                    (0..n as i32).contains(&bucket),
+                    "bucket[{n}] of {v:?} = {bucket}, out of range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_negative_values_still_land_in_positive_range() {
+        // (hash & i32::MAX) strips the sign bit; bucket must be ≥ 0.
+        for v in [-1, -100, i32::MIN, -i32::MAX] {
+            let bucket = bucket_unwrap(&PgValue::Int4(v), 16);
+            assert!((0..16).contains(&bucket));
+        }
+    }
+
+    #[test]
+    fn bucket_uuid_hashes_canonical_bytes() {
+        let v = PgValue::Uuid([0u8; 16]);
+        let bucket = bucket_unwrap(&v, 16);
+        assert!((0..16).contains(&bucket));
+    }
+
+    #[test]
+    fn bucket_rejects_unsupported_types() {
+        for v in [
+            PgValue::Bool(true),
+            PgValue::Float4(1.0),
+            PgValue::Float8(1.0),
+            PgValue::Bytea(vec![1, 2, 3]),
+        ] {
+            assert!(matches!(
+                apply_transform(&v, Transform::Bucket(16)),
+                Err(PartitionError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn bucket_decimal_uses_minimum_be_bytes() {
+        use crate::value::Decimal;
+        // 5 — same hash whether stored as [0x05], [0x00, 0x05], or [0x00, 0x00, 0x05].
+        let a = bucket_unwrap(
+            &PgValue::Numeric(Decimal {
+                unscaled_be_bytes: vec![0x05],
+                scale: 0,
+            }),
+            16,
+        );
+        let b = bucket_unwrap(
+            &PgValue::Numeric(Decimal {
+                unscaled_be_bytes: vec![0x00, 0x05],
+                scale: 0,
+            }),
+            16,
+        );
+        let c = bucket_unwrap(
+            &PgValue::Numeric(Decimal {
+                unscaled_be_bytes: vec![0x00, 0x00, 0x05],
+                scale: 0,
+            }),
+            16,
+        );
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn bucket_zero_n_errors() {
         assert!(matches!(
-            apply_transform(&v, Transform::Bucket(16)),
+            apply_transform(&PgValue::Int4(1), Transform::Bucket(0)),
             Err(PartitionError::Invalid(_))
         ));
+    }
+
+    // ── truncate apply ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_int_floors_to_multiple_of_w() {
+        // Spec: `v - (((v % W) + W) % W)` → floor toward negative infinity.
+        let cases: &[(i32, u32, i32)] = &[
+            (0, 4, 0),
+            (1, 4, 0),
+            (3, 4, 0),
+            (4, 4, 4),
+            (13, 4, 12),
+            (-1, 4, -4),
+            (-4, 4, -4),
+            (-5, 4, -8),
+        ];
+        for (v, w, expected) in cases {
+            match apply_transform(&PgValue::Int4(*v), Transform::Truncate(*w)).unwrap() {
+                PartitionLiteral::Int(got) => {
+                    assert_eq!(
+                        got, *expected,
+                        "truncate[{w}]({v}) = {got}, want {expected}"
+                    )
+                }
+                other => panic!("expected Int from truncate, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_int8_returns_long_literal() {
+        match apply_transform(&PgValue::Int8(1_000_000_000_007), Transform::Truncate(100)).unwrap()
+        {
+            PartitionLiteral::Long(got) => assert_eq!(got, 1_000_000_000_000),
+            other => panic!("expected Long, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_string_takes_first_w_code_points() {
+        match apply_transform(&PgValue::Text("hello world".into()), Transform::Truncate(5)).unwrap()
+        {
+            PartitionLiteral::String(s) => assert_eq!(s, "hello"),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_string_handles_multibyte_unicode() {
+        // 4 code points but multi-byte. Iceberg spec is clear: count
+        // characters, NOT bytes.
+        let v = PgValue::Text("café☕".into()); // c, a, f, é, ☕  → 5 code points
+        match apply_transform(&v, Transform::Truncate(4)).unwrap() {
+            PartitionLiteral::String(s) => assert_eq!(s, "café"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        match apply_transform(&v, Transform::Truncate(10)).unwrap() {
+            // Width >= length → return original unchanged.
+            PartitionLiteral::String(s) => assert_eq!(s, "café☕"),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_binary_takes_first_w_bytes() {
+        match apply_transform(
+            &PgValue::Bytea(vec![1, 2, 3, 4, 5, 6]),
+            Transform::Truncate(3),
+        )
+        .unwrap()
+        {
+            PartitionLiteral::Binary(b) => assert_eq!(b, vec![1, 2, 3]),
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_rejects_unsupported_types() {
+        for v in [
+            PgValue::Bool(true),
+            PgValue::Float4(1.0),
+            PgValue::Date(crate::value::DaysSinceEpoch(0)),
+            PgValue::Uuid([0u8; 16]),
+        ] {
+            assert!(matches!(
+                apply_transform(&v, Transform::Truncate(4)),
+                Err(PartitionError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn truncate_zero_w_errors() {
         assert!(matches!(
-            apply_transform(&v, Transform::Truncate(4)),
+            apply_transform(&PgValue::Int4(1), Transform::Truncate(0)),
             Err(PartitionError::Invalid(_))
         ));
     }

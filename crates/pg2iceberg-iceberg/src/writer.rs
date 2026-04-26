@@ -1043,6 +1043,119 @@ mod tests {
     }
 
     #[test]
+    fn bucket_partition_routes_rows_into_n_buckets() {
+        // Schema partitioned by bucket[4](id). Many rows → up to 4 chunks,
+        // each tagged with its bucket index.
+        let schema = TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "users".into(),
+            },
+            columns: vec![ColumnSchema {
+                name: "id".into(),
+                field_id: 1,
+                ty: IcebergType::Int,
+                nullable: false,
+                is_primary_key: true,
+            }],
+            partition_spec: vec![PartitionField {
+                source_column: "id".into(),
+                name: "id_bucket".into(),
+                transform: Transform::Bucket(4),
+            }],
+        };
+        let w = TableWriter::new(schema);
+        let rows: Vec<MaterializedRow> = (1..=20)
+            .map(|i| {
+                let mut r = BTreeMap::new();
+                r.insert(col("id"), PgValue::Int4(i));
+                MaterializedRow {
+                    op: Op::Insert,
+                    row: r,
+                    unchanged_cols: vec![],
+                }
+            })
+            .collect();
+        let p = w.prepare(&rows).unwrap();
+        // At least 2 buckets should be hit with 20 rows (probabilistically
+        // all 4); cap at 4 since N=4.
+        assert!(p.data.len() >= 2 && p.data.len() <= 4);
+        let mut total: u64 = 0;
+        for chunk in &p.data {
+            assert_eq!(chunk.partition_values.len(), 1);
+            match &chunk.partition_values[0] {
+                PartitionLiteral::Int(b) => {
+                    assert!((0..4).contains(b), "bucket index {b} out of range [0,4)")
+                }
+                other => panic!("expected Int, got {other:?}"),
+            }
+            total += chunk.chunk.record_count;
+        }
+        assert_eq!(total, 20);
+    }
+
+    #[test]
+    fn truncate_partition_routes_strings() {
+        // Partition by `truncate[2](name)` — first 2 chars of name.
+        let schema = TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "users".into(),
+            },
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "name".into(),
+                    field_id: 2,
+                    ty: IcebergType::String,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+            partition_spec: vec![PartitionField {
+                source_column: "name".into(),
+                name: "name_trunc".into(),
+                transform: Transform::Truncate(2),
+            }],
+        };
+        let w = TableWriter::new(schema);
+        let row = |id: i32, name: &str| {
+            let mut r = BTreeMap::new();
+            r.insert(col("id"), PgValue::Int4(id));
+            r.insert(col("name"), PgValue::Text(name.into()));
+            MaterializedRow {
+                op: Op::Insert,
+                row: r,
+                unchanged_cols: vec![],
+            }
+        };
+        let p = w
+            .prepare(&[
+                row(1, "alice"),
+                row(2, "alex"),
+                row(3, "bob"),
+                row(4, "alfred"),
+            ])
+            .unwrap();
+        assert_eq!(p.data.len(), 2, "two distinct prefixes → two chunks");
+        let mut by_prefix: BTreeMap<String, u64> = BTreeMap::new();
+        for chunk in &p.data {
+            if let PartitionLiteral::String(s) = &chunk.partition_values[0] {
+                by_prefix.insert(s.clone(), chunk.chunk.record_count);
+            }
+        }
+        // alice/alex/alfred share "al"; bob is its own prefix.
+        assert_eq!(by_prefix.get("al"), Some(&3));
+        assert_eq!(by_prefix.get("bo"), Some(&1));
+    }
+
+    #[test]
     fn day_partition_on_date_column() {
         let schema = TableSchema {
             ident: TableIdent {

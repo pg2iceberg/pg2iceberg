@@ -13,6 +13,9 @@ workspace = true
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# murmur3_x86_32 — required by Iceberg's bucket[N] transform spec.
+# Same crate iceberg-rust uses; tiny pure-compute, no IO.
+murmur3 = "0.5"
 
 [dev-dependencies]
 proptest.workspace = true

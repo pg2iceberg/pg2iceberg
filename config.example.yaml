@@ -20,15 +20,15 @@ tables:
     # iceberg:
     #   partition:                   # Iceberg partition spec
     #     - day(created_at)          # day/month/year/hour
-    #     - bucket[16](id)           # murmur3-bucket  ← apply not yet wired
+    #     - bucket[16](id)           # murmur3_x86_32 % N
     #     - region                   # identity
-    #     - truncate[4](name)        # truncate         ← apply not yet wired
+    #     - truncate[4](name)        # first W code points (strings)
+    #                                #   or floor to multiple of W (ints)
     #
-    # NOTE: identity / year / month / day / hour transforms work
-    # end-to-end (parse, create_table, per-row routing, commit).
-    # bucket[N] / truncate[W] parse and create the table with the
-    # right spec, but per-row computation isn't wired yet — those
-    # writes will fail with a clear "not yet wired" error.
+    # All six transforms work end-to-end. Decimal-truncate is the
+    # one corner that errors at apply time (mostly a niche partition
+    # layout) — partition by the underlying integer or use bucket
+    # instead.
     #
     # Operational note for `Delete`: when partition source columns
     # are NOT in the primary key, configure `ALTER TABLE ... REPLICA

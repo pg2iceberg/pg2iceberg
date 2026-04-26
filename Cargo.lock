@@ -2441,6 +2441,7 @@ name = "pg2iceberg-core"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "murmur3",
  "proptest",
  "serde",
  "thiserror",

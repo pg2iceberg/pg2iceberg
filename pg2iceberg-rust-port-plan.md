@@ -631,33 +631,32 @@ See `config.example.yaml` for the full surface.
   - `"vended"` errors with "not yet wired" — that's the Phase 7
     vended-credentials S3 router.
 
-**Iceberg partition spec — most of it landed:**
+**Iceberg partition spec — done:**
 
-- **Parsing + create-table:** done. YAML
+- **Parsing + create-table:** YAML
   `tables[].iceberg.partition: ["day(col)", "bucket[16](id)", ...]`
   parses through `pg2iceberg_core::parse_partition_spec` (all six
   transforms: identity, year, month, day, hour, bucket[N], truncate[W]).
   `IcebergRustCatalog::create_table` translates to
-  `iceberg::spec::UnboundPartitionSpec` and creates the table
-  partitioned. `load_table` round-trips the spec back through
-  `from_iceberg_schema`.
-- **Per-partition file routing — done.** `TableWriter::prepare`
-  groups folded rows by their per-row partition tuple and emits one
-  parquet chunk per `(partition_tuple, kind)` group. The materializer
-  uploads each chunk to a unique blob path and constructs a `DataFile`
-  carrying `partition_values: Vec<PartitionLiteral>`. The catalog
-  translates the per-file values to an `iceberg::spec::Struct` at
-  `commit_snapshot` time. Snapshots round-trip back through
-  `iceberg_struct_to_partition_literals` so reads of partitioned
-  tables stay self-consistent.
-- **Transform application — partial.** `apply_transform` in
-  `pg2iceberg_core::partition` handles identity / year / month / day /
-  hour over `PgValue`. Bucket and truncate parse correctly and
-  partition-spec values land on the iceberg side, but applying them
-  per-row returns "not yet wired"; that surfaces as a `WriterError::PartitionTransform`
-  inside `TableWriter::prepare`. Plug in murmur3 (~30 LOC) and the
-  decimal/string/integer truncate to close that gap.
-- **Operational constraint.** The writer needs the partition source
+  `iceberg::spec::UnboundPartitionSpec`. `load_table` round-trips
+  the spec back through `from_iceberg_schema`.
+- **Per-partition file routing.** `TableWriter::prepare` groups
+  folded rows by their per-row partition tuple and emits one parquet
+  chunk per `(partition_tuple, kind)` group. The materializer
+  uploads each chunk to a unique blob path and constructs a
+  `DataFile` carrying `partition_values: Vec<PartitionLiteral>`.
+  The catalog translates the per-file values to an
+  `iceberg::spec::Struct` at `commit_snapshot` time. Snapshots
+  round-trip back through `iceberg_struct_to_partition_literals`.
+- **Transform application.** `apply_transform` handles all six
+  transforms over `PgValue`: identity, year, month, day, hour,
+  bucket[N] (via murmur3_x86_32 per iceberg spec appendix B,
+  `(hash & i32::MAX) % N`), and truncate[W] (integer floor toward
+  -inf, first W code points for strings, first W bytes for binary).
+  Decimal-truncate is the one remaining apply-time gap (would need
+  `unscaled_be_bytes` ↔ `i128` round-trip), surfaced as a clear
+  error rather than silently coerced.
+- **Operational constraint.** The writer needs partition source
   columns present on every row it sees. For `Insert`/`Update` rows
   this is automatic; for `Delete` rows the row carries only PK
   columns, so partition columns must either (a) be in the PK, or
