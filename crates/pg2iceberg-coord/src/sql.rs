@@ -14,8 +14,9 @@ pub fn create_schema(schema: &CoordSchema) -> String {
     format!("CREATE SCHEMA IF NOT EXISTS {}", schema)
 }
 
-/// DDL for the five coord tables. Each statement is idempotent
-/// (`CREATE TABLE IF NOT EXISTS`). Mirrors `stream/coordinator_pg.go:73-104`.
+/// DDL for the six coord tables. Each statement is idempotent
+/// (`CREATE TABLE IF NOT EXISTS`). Mirrors `stream/coordinator_pg.go:73-104`
+/// plus a single-row `checkpoints` table for [`crate::Coordinator::save_checkpoint`].
 pub fn migrate(schema: &CoordSchema) -> Vec<String> {
     vec![
         format!(
@@ -64,6 +65,17 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
                 PRIMARY KEY (group_name, worker_id)
             )",
             schema.qualify("consumer")
+        ),
+        // Single-row table holding the serialized `Checkpoint` blob.
+        // `id` is hardcoded to 1 so the upsert is unambiguous and
+        // multi-writer races resolve to last-write-wins.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id         INT  PRIMARY KEY,
+                payload    JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+            schema.qualify("checkpoints")
         ),
     ]
 }
@@ -195,15 +207,32 @@ pub fn release_lock(schema: &CoordSchema) -> String {
     )
 }
 
+/// Upsert the single-row checkpoint blob (`id = 1`).
+pub fn upsert_checkpoint(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} (id, payload, updated_at) VALUES (1, $1, now()) \
+         ON CONFLICT (id) DO UPDATE SET payload = $1, updated_at = now()",
+        schema.qualify("checkpoints")
+    )
+}
+
+/// Read the single-row checkpoint blob. Returns 0 or 1 row.
+pub fn load_checkpoint(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT payload FROM {} WHERE id = 1",
+        schema.qualify("checkpoints")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn migrate_returns_five_idempotent_statements() {
+    fn migrate_returns_six_idempotent_statements() {
         let s = CoordSchema::default_name();
         let stmts = migrate(&s);
-        assert_eq!(stmts.len(), 5);
+        assert_eq!(stmts.len(), 6);
         for stmt in &stmts {
             assert!(
                 stmt.contains("CREATE TABLE IF NOT EXISTS"),
@@ -211,6 +240,18 @@ mod tests {
             );
             assert!(stmt.contains("_pg2iceberg."));
         }
+        // The new `checkpoints` table uses JSONB for the payload.
+        let last = stmts.last().unwrap();
+        assert!(last.contains("checkpoints"));
+        assert!(last.contains("JSONB"));
+    }
+
+    #[test]
+    fn upsert_checkpoint_uses_id_1_pk() {
+        let s = CoordSchema::default_name();
+        let q = upsert_checkpoint(&s);
+        assert!(q.contains("VALUES (1,"));
+        assert!(q.contains("ON CONFLICT (id) DO UPDATE"));
     }
 
     #[test]

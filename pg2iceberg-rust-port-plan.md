@@ -344,6 +344,42 @@ The fixed staged Parquet schema is the entire reason logical mode can keep slot-
 - Cursor / consumer / lock methods.
 - Integration test against real PG (testcontainers) for SQL correctness; **separate** from the DST harness.
 
+#### Phase 3 status — Postgres-backed Coordinator wired
+
+`pg2iceberg-coord/src/prod/PostgresCoordinator` implements every method
+of the `Coordinator` trait against a real `tokio_postgres::Client`,
+sharing `[crate::sql]` builders with the sim impl so wire SQL stays
+consistent. 12 unit tests pass (SQL builders, table-key formatting,
+duration→interval string conversion). What's wired:
+
+- `connect()` opens a regular-mode (non-replication) `tokio_postgres`
+  connection. The connection task is spawned on tokio and its
+  `AbortHandle` is owned by the coordinator so drops are
+  deterministic.
+- `migrate()` runs `CREATE SCHEMA IF NOT EXISTS` plus the six
+  `CREATE TABLE IF NOT EXISTS` statements. The `checkpoints` table
+  was added to support `save_checkpoint` / `load_checkpoint` (single
+  row, JSONB payload).
+- `claim_offsets` runs the ensure-row → claim-sequence → insert-log-index
+  sequence inside a single PG transaction. The `CoordCommitReceipt`
+  is minted only after `tx.commit()` returns, encoding the durability
+  invariant.
+- All methods serialize through a `tokio::sync::Mutex<Client>` because
+  `Client::transaction()` requires `&mut self`. In our use case all
+  coord ops are sequential through the materializer cycle, so the
+  serialization isn't a perf concern.
+
+**Remaining items:**
+
+1. **Testcontainers integration tests.** Spin up real PG, exercise
+   the full coordinator surface (concurrent claim_offsets, expired
+   consumers, lock contention, checkpoint round-trip). Same Docker
+   setup as the rest of the prod path
+   ([reference_integration_tests.md]).
+2. **TLS.** Same `NoTls` placeholder as the other prod paths.
+3. **Connection pool.** Single connection today; for high-throughput
+   deployments we'll want a pool. Defer until we have profiling data.
+
 ### Phase 4 — **SimPostgres** (week 3–4)
 
 The sim is where most DST mileage comes from. Build it before the prod logical pipeline.

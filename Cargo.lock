@@ -2144,8 +2144,12 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "pg2iceberg-core",
+ "postgres-types 0.2.13",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

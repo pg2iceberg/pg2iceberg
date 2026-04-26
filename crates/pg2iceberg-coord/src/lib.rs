@@ -18,6 +18,9 @@
 pub mod schema;
 pub mod sql;
 
+#[cfg(feature = "prod")]
+pub mod prod;
+
 use async_trait::async_trait;
 use pg2iceberg_core::{Checkpoint, Lsn, TableIdent, WorkerId};
 use serde::{Deserialize, Serialize};
