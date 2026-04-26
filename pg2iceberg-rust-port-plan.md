@@ -561,7 +561,73 @@ is purely a read-perf knob. Revisit if profiling shows in-batch churn.
 
 ### Phase 14 — Compaction + maintenance (week 12+)
 
-Ports `iceberg/compact.go`, `iceberg/maintain.go`. Note the existing partition bug (deferred, [project_compaction_partition_bug.md]) — do not re-introduce.
+#### Phase 14 status — compaction wired
+
+Compaction lands as the third major maintenance operation (after
+flush + materialize). Algorithm mirrors `iceberg/compact.go` minus the
+known partition bug: rows are routed through `TableWriter::prepare`,
+which fans them out by partition tuple, so output files are always
+single-partition.
+
+**Architecture:**
+
+- `pg2iceberg-iceberg/src/compact.rs` — `CompactionConfig`,
+  `CompactionOutcome`, `compact_table()` async function. Steps:
+  threshold check → read live deletes → identify affected files
+  (small-file or PK-touched-by-delete) → dedup with seq-aware delete
+  application → write per-partition compacted parquets via
+  `TableWriter::prepare` → commit via
+  `Catalog::commit_compaction(PreparedCompaction)`.
+- `Catalog::commit_compaction()` is a new trait method. Sim
+  (`MemoryCatalog`) appends a `Snapshot` with `removed_paths`
+  populated; prod (`IcebergRustCatalog`) uses the new
+  `RewriteFilesAction` from the iceberg-rust fork to issue an
+  `Operation::Replace` snapshot atomically.
+- `Snapshot.removed_paths: Vec<String>` — files dropped by a
+  compaction. Verifier (`read_materialized_state`) and FileIndex
+  rebuild skip any path in the cumulative removed set across
+  history. Without this they'd double-count rows post-compaction.
+- `Materializer::compact_cycle()` runs compaction across every
+  registered table, rebuilding FileIndex from the catalog after
+  each successful run.
+
+**Run loop integration:**
+
+Compaction runs at the end of every materialize cycle (matches Go's
+`tw.Compact()` invocation pattern). Failures are non-fatal — the
+warning is logged and replication keeps progressing. Set
+`sink.target_file_size: 0` in YAML to disable compaction entirely.
+
+**YAML shape (matches Go exactly):** all under `sink:`:
+- `compaction_data_files: 8` — trigger when live data files ≥ this.
+- `compaction_delete_files: 4` — trigger when live delete files ≥ this.
+- `target_file_size: 134217728` — files smaller than half this are
+  rewritten; output target.
+
+**Correctness properties verified:**
+
+- **Partition awareness.** Output files carry single-partition tuples
+  (the Go bug we don't replicate). Tested via
+  `partitioned_table_compacted_output_has_correct_partition_values`.
+- **Seq-aware deletes.** A delete at seq 5 cannot retroactively
+  drop a row from seq 7. Tested via
+  `delete_at_seq_5_does_not_drop_row_inserted_at_seq_7`.
+- **FileIndex rebuild post-compaction.** A re-insert of a previously
+  compacted PK still triggers `promote_re_inserts` on the next
+  materialize cycle. Tested via
+  `compact_cycle_then_subsequent_materialize_cycle_handles_new_inserts`.
+- **Atomicity.** `commit_compaction` either lands the full Replace
+  snapshot or none of it. Tested via the `RewriteFilesAction`
+  fork-side tests.
+
+**Maintenance items still deferred:**
+
+- Snapshot expiry / orphan-file cleanup (`iceberg/maintain.go`).
+- Concurrency: parallel parquet reads during compaction. Tokio's
+  `JoinSet` is the analog; not worth doing for compactions ≤ 10
+  files.
+- A separate `pg2iceberg compact` CLI subcommand for one-shot
+  out-of-band compactions.
 
 ---
 

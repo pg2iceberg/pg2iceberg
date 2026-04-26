@@ -179,7 +179,8 @@ impl Harness {
             self.blob.as_ref(),
             move |_ident, idx| {
                 let n = counter.fetch_add(1, Ordering::SeqCst);
-                format!("test/compact-{n}-{idx}.parquet")
+                let path = format!("test/compact-{n}-{idx}.parquet");
+                async move { path }
             },
             &schema.ident,
             schema,

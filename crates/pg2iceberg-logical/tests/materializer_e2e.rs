@@ -355,3 +355,86 @@ fn pipeline_holds_data_until_materializer_runs() {
     let snaps = block_on(h.catalog.snapshots(&ident())).unwrap();
     assert_eq!(snaps.len(), 1);
 }
+
+// ── compaction wiring ──────────────────────────────────────────────────
+
+#[test]
+fn compact_cycle_merges_small_files_after_many_materialize_cycles() {
+    let mut h = boot();
+    // 5 separate transactions → 5 separate snapshots after materialize.
+    for i in 1..=5 {
+        let mut tx = h.db.begin_tx();
+        tx.insert(&ident(), row(i, i * 10));
+        tx.commit(Timestamp(0)).unwrap();
+        drive_pipeline(&mut h);
+        run_materializer(&mut h);
+    }
+    let snaps_before = block_on(h.catalog.snapshots(&ident())).unwrap();
+    assert_eq!(snaps_before.len(), 5, "5 materialize cycles → 5 snapshots");
+
+    let cfg = pg2iceberg_iceberg::CompactionConfig {
+        data_file_threshold: 3,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+    };
+    let outcomes = block_on(h.materializer.compact_cycle(&cfg)).unwrap();
+    assert_eq!(outcomes.len(), 1, "one table compacted");
+    let (_ident, outcome) = &outcomes[0];
+    assert_eq!(outcome.input_data_files, 5);
+    assert_eq!(outcome.output_data_files, 1);
+    assert_eq!(outcome.rows_rewritten, 5);
+
+    // Iceberg state still matches PG ground truth post-compaction.
+    assert_eq!(read_iceberg(&h), read_pg(&h));
+}
+
+#[test]
+fn compact_cycle_below_threshold_returns_empty() {
+    let mut h = boot();
+    let mut tx = h.db.begin_tx();
+    tx.insert(&ident(), row(1, 10));
+    tx.commit(Timestamp(0)).unwrap();
+    drive_pipeline(&mut h);
+    run_materializer(&mut h);
+
+    let cfg = pg2iceberg_iceberg::CompactionConfig {
+        data_file_threshold: 8,
+        delete_file_threshold: 4,
+        target_size_bytes: 1024 * 1024 * 1024,
+    };
+    let outcomes = block_on(h.materializer.compact_cycle(&cfg)).unwrap();
+    assert!(outcomes.is_empty(), "below threshold: nothing compacted");
+}
+
+#[test]
+fn compact_cycle_then_subsequent_materialize_cycle_handles_new_inserts() {
+    // After compaction, the materializer's FileIndex is rebuilt. A fresh
+    // re-insert of an already-compacted PK must trigger
+    // promote_re_inserts so we emit an equality delete on the
+    // post-compaction file. End-to-end correctness through the
+    // FileIndex rebuild seam.
+    let mut h = boot();
+    for i in 1..=4 {
+        let mut tx = h.db.begin_tx();
+        tx.insert(&ident(), row(i, i * 10));
+        tx.commit(Timestamp(0)).unwrap();
+        drive_pipeline(&mut h);
+        run_materializer(&mut h);
+    }
+    let cfg = pg2iceberg_iceberg::CompactionConfig {
+        data_file_threshold: 3,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+    };
+    block_on(h.materializer.compact_cycle(&cfg)).unwrap();
+
+    // Re-insert PK 1 with a new value. PG ground truth replaces the row.
+    let mut tx = h.db.begin_tx();
+    tx.update(&ident(), row(1, 999));
+    tx.commit(Timestamp(0)).unwrap();
+    drive_pipeline(&mut h);
+    run_materializer(&mut h);
+
+    // Iceberg should match PG: PK 1 → qty 999, others unchanged.
+    assert_eq!(read_iceberg(&h), read_pg(&h));
+}

@@ -123,10 +123,12 @@ struct LiveFile {
 /// thresholds (no work needed), `Ok(Some(_))` after a successful
 /// compaction commit.
 ///
-/// `path_for_chunk` is called per output chunk; the caller is
-/// responsible for producing globally-unique paths (e.g. via UUID).
-/// `(table_ident, chunk_index)` is passed in.
-pub async fn compact_table<C, F>(
+/// `path_for_chunk` is an async closure called per output chunk; the
+/// caller is responsible for producing globally-unique paths (e.g. via
+/// UUID). `(table_ident, chunk_index)` is passed in. Async-shaped to
+/// match the materializer's existing async-trait `MaterializerNamer`,
+/// which generates UUID-suffixed paths via an async `IdGen`.
+pub async fn compact_table<C, F, Fut>(
     catalog: &C,
     blob_store: &dyn BlobStore,
     path_for_chunk: F,
@@ -137,7 +139,8 @@ pub async fn compact_table<C, F>(
 ) -> Result<Option<CompactionOutcome>>
 where
     C: Catalog + ?Sized,
-    F: Fn(&TableIdent, usize) -> String,
+    F: Fn(&TableIdent, usize) -> Fut,
+    Fut: std::future::Future<Output = String>,
 {
     let snapshots = catalog.snapshots(ident).await?;
     if snapshots.is_empty() {
@@ -266,7 +269,7 @@ where
     let mut added_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
     let mut bytes_after: u64 = 0;
     for (i, chunk) in prepared.data.into_iter().enumerate() {
-        let path = path_for_chunk(ident, i);
+        let path = path_for_chunk(ident, i).await;
         let byte_size = chunk.chunk.bytes.len() as u64;
         bytes_after += byte_size;
         blob_store

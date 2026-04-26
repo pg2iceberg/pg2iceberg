@@ -81,6 +81,17 @@ sink:
   flush_interval: 10s
   flush_rows: 1000
 
+  # Compaction thresholds — names match Go. Compaction runs at the end
+  # of every materializer cycle, gated by these counts. Set
+  # `target_file_size: 0` to disable compaction entirely.
+  #
+  # Output files are partition-aware (each output file carries a single
+  # partition tuple). Equality deletes are applied inline at compaction
+  # time; surviving rows are deduped and folded into the new files.
+  compaction_data_files: 8
+  compaction_delete_files: 4
+  target_file_size: 134217728   # 128 MiB
+
   # Free-form REST catalog props passthrough. Useful for
   # vendor-specific settings the Go config doesn't have a dedicated
   # field for.

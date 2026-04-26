@@ -50,6 +50,8 @@ pub enum MaterializerError {
     Writer(#[from] WriterError),
     #[error("table not registered: {0}")]
     UnknownTable(TableIdent),
+    #[error("compaction: {0}")]
+    Compact(String),
 }
 
 pub type Result<T> = std::result::Result<T, MaterializerError>;
@@ -196,6 +198,81 @@ impl<C: Catalog> Materializer<C> {
             total += self.cycle_table(&ident).await?;
         }
         Ok(total)
+    }
+
+    /// Run a compaction pass over every registered table. Returns the
+    /// vector of `(ident, outcome)` for tables where compaction actually
+    /// ran. Tables below their threshold contribute nothing.
+    ///
+    /// This is intentionally separate from `cycle()` because compaction
+    /// is much more expensive (reads + rewrites whole parquet files) and
+    /// runs on a slower cadence — typically once per minute — driven by
+    /// the binary's `Ticker::Handler::Compact`.
+    pub async fn compact_cycle(
+        &mut self,
+        config: &pg2iceberg_iceberg::CompactionConfig,
+    ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CompactionOutcome)>> {
+        let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
+        let mut out = Vec::new();
+        for ident in idents {
+            if let Some(outcome) = self.compact_table(&ident, config).await? {
+                out.push((ident, outcome));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compact a single table. After a successful compaction commit, the
+    /// table's in-memory FileIndex is rebuilt from the catalog so
+    /// subsequent materializer cycles route deletes against the new file
+    /// set rather than the old (now-superseded) one.
+    pub async fn compact_table(
+        &mut self,
+        ident: &TableIdent,
+        config: &pg2iceberg_iceberg::CompactionConfig,
+    ) -> Result<Option<pg2iceberg_iceberg::CompactionOutcome>> {
+        let entry = self
+            .tables
+            .get(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        let schema = entry.schema.clone();
+        let pk_cols = entry.pk_cols.clone();
+
+        let namer = self.namer.clone();
+        let outcome = pg2iceberg_iceberg::compact_table(
+            self.catalog.as_ref(),
+            self.blob_store.as_ref(),
+            move |t, _idx| {
+                let n = namer.clone();
+                let t = t.clone();
+                async move { n.next_path(&t, "compact").await }
+            },
+            ident,
+            &schema,
+            &pk_cols,
+            config,
+        )
+        .await
+        .map_err(|e| MaterializerError::Compact(e.to_string()))?;
+
+        // If we actually rewrote anything, rebuild FileIndex from the
+        // new catalog state. Stale entries pointing at compacted-away
+        // files would route deletes incorrectly.
+        if outcome.is_some() {
+            let entry_mut = self.tables.get_mut(ident).expect("checked above");
+            let fresh = pg2iceberg_iceberg::rebuild_from_catalog(
+                self.catalog.as_ref(),
+                self.blob_store.as_ref(),
+                ident,
+                &entry_mut.schema,
+                &entry_mut.pk_cols,
+            )
+            .await
+            .map_err(|e| MaterializerError::Compact(e.to_string()))?;
+            entry_mut.file_index = fresh;
+        }
+
+        Ok(outcome)
     }
 
     pub async fn cycle_table(&mut self, ident: &TableIdent) -> Result<usize> {

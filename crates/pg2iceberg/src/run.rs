@@ -374,6 +374,34 @@ where
                         tracing::error!(error = %e, "materializer.cycle failed");
                         return Err(anyhow::anyhow!(e));
                     }
+                    // Compaction runs at the end of every materializer
+                    // cycle, gated by file-count thresholds. Failures
+                    // are non-fatal — replication keeps progressing,
+                    // the next cycle retries. Mirrors Go's behavior.
+                    if cfg.sink.target_file_size > 0 {
+                        let cfg_compact = cfg.sink.compaction_config();
+                        match materializer.compact_cycle(&cfg_compact).await {
+                            Ok(outcomes) if !outcomes.is_empty() => {
+                                for (ident, o) in &outcomes {
+                                    tracing::info!(
+                                        table = %ident,
+                                        in_data = o.input_data_files,
+                                        in_del = o.input_delete_files,
+                                        out_data = o.output_data_files,
+                                        rows = o.rows_rewritten,
+                                        rows_removed = o.rows_removed_by_deletes,
+                                        bytes_before = o.bytes_before,
+                                        bytes_after = o.bytes_after,
+                                        "compaction"
+                                    );
+                                }
+                            }
+                            Ok(_) => {} // every table below threshold; quiet
+                            Err(e) => {
+                                tracing::warn!(error = %e, "materializer.compact_cycle failed");
+                            }
+                        }
+                    }
                 }
                 Handler::Watcher => {}
             }

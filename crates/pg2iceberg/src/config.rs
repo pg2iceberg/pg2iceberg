@@ -224,6 +224,21 @@ pub struct SinkConfig {
     #[serde(default = "default_flush_rows")]
     pub flush_rows: usize,
 
+    /// Compaction file-count thresholds. Names match Go
+    /// (`compaction_data_files`, `compaction_delete_files`). Compaction
+    /// runs as part of every materializer cycle, gated by these
+    /// thresholds — so most cycles do no compaction work.
+    #[serde(default = "default_compaction_data_files")]
+    pub compaction_data_files: usize,
+    #[serde(default = "default_compaction_delete_files")]
+    pub compaction_delete_files: usize,
+    /// Target output file size in bytes for compaction. Files smaller
+    /// than `target_file_size / 2` are eligible for rewrite. Matches
+    /// Go's `target_file_size`. 0 = disable compaction (no files are
+    /// ever rewritten).
+    #[serde(default = "default_target_file_size")]
+    pub target_file_size: u64,
+
     /// Free-form REST-catalog props passthrough. Not in the Go YAML
     /// shape but useful for vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
@@ -248,7 +263,22 @@ impl Default for SinkConfig {
             s3_region: default_region(),
             flush_interval: String::new(),
             flush_rows: default_flush_rows(),
+            compaction_data_files: default_compaction_data_files(),
+            compaction_delete_files: default_compaction_delete_files(),
+            target_file_size: default_target_file_size(),
             catalog_props: BTreeMap::new(),
+        }
+    }
+}
+
+impl SinkConfig {
+    /// Translate the Go-shaped sink fields into the iceberg crate's
+    /// `CompactionConfig` shape. Used on every materializer cycle.
+    pub fn compaction_config(&self) -> pg2iceberg_iceberg::CompactionConfig {
+        pg2iceberg_iceberg::CompactionConfig {
+            data_file_threshold: self.compaction_data_files,
+            delete_file_threshold: self.compaction_delete_files,
+            target_size_bytes: self.target_file_size,
         }
     }
 }
@@ -263,6 +293,18 @@ fn default_region() -> String {
 
 fn default_flush_rows() -> usize {
     1000
+}
+
+fn default_compaction_data_files() -> usize {
+    8
+}
+
+fn default_compaction_delete_files() -> usize {
+    4
+}
+
+fn default_target_file_size() -> u64 {
+    128 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
