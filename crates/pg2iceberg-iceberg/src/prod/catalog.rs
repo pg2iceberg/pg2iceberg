@@ -560,9 +560,18 @@ fn iceberg_literal_to_partition(lit: Option<&Literal>) -> PartitionLiteral {
         // back as raw binary so the writer's identity-on-UUID-source stays
         // self-consistent.
         PrimitiveLiteral::UInt128(u) => PartitionLiteral::Binary(u.to_be_bytes().to_vec()),
-        // Decimal / Int128 / AboveMax / BelowMin: not produced by our writer;
-        // surface as Null rather than panic so reads of foreign-written
-        // partition values don't crash the verifier.
+        // Decimal partition values: iceberg stores the unscaled `i128`. We
+        // can't recover scale from the literal alone (it lives in the
+        // partition spec field type) so we report 0 — verifier filtering
+        // works on unscaled equality, which is what iceberg actually
+        // compares on. Operators displaying partition values for human
+        // consumption should consult the schema for the scale.
+        PrimitiveLiteral::Int128(n) => PartitionLiteral::Decimal {
+            unscaled: *n,
+            scale: 0,
+        },
+        // AboveMax / BelowMin: surface as Null rather than panic so reads
+        // of foreign-written partition values don't crash the verifier.
         _ => PartitionLiteral::Null,
     }
 }
@@ -593,6 +602,7 @@ fn partition_literal_to_iceberg(lit: &PartitionLiteral) -> Option<Literal> {
                 Some(Literal::binary(b.clone()))
             }
         }
+        PartitionLiteral::Decimal { unscaled, .. } => Some(Literal::decimal(*unscaled)),
     }
 }
 

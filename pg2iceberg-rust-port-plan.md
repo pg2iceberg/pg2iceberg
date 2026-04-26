@@ -652,10 +652,9 @@ See `config.example.yaml` for the full surface.
   transforms over `PgValue`: identity, year, month, day, hour,
   bucket[N] (via murmur3_x86_32 per iceberg spec appendix B,
   `(hash & i32::MAX) % N`), and truncate[W] (integer floor toward
-  -inf, first W code points for strings, first W bytes for binary).
-  Decimal-truncate is the one remaining apply-time gap (would need
-  `unscaled_be_bytes` ↔ `i128` round-trip), surfaced as a clear
-  error rather than silently coerced.
+  -inf, first W code points for strings, first W bytes for binary,
+  unscaled-i128 floor for decimals — iceberg's 38-digit precision cap
+  fits in i128, so no big-int dep needed).
 - **Operational constraint.** The writer needs partition source
   columns present on every row it sees. For `Insert`/`Update` rows
   this is automatic; for `Delete` rows the row carries only PK

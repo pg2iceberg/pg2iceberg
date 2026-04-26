@@ -25,10 +25,8 @@ tables:
     #     - truncate[4](name)        # first W code points (strings)
     #                                #   or floor to multiple of W (ints)
     #
-    # All six transforms work end-to-end. Decimal-truncate is the
-    # one corner that errors at apply time (mostly a niche partition
-    # layout) — partition by the underlying integer or use bucket
-    # instead.
+    # All six transforms work end-to-end (identity, year/month/day/hour,
+    # bucket[N], truncate[W] — including over Numeric columns).
     #
     # Operational note for `Delete`: when partition source columns
     # are NOT in the primary key, configure `ALTER TABLE ... REPLICA

@@ -173,6 +173,12 @@ pub enum PartitionLiteral {
     Boolean(bool),
     /// Fixed-width binary (e.g. UUID).
     Binary(Vec<u8>),
+    /// Iceberg decimal partition value: unscaled i128 + scale. Iceberg
+    /// caps decimal precision at 38 digits, which fits in i128.
+    Decimal {
+        unscaled: i128,
+        scale: u8,
+    },
 }
 
 /// Newtype wrappers that opt into Eq via NaN-rejection. Float and
@@ -408,16 +414,7 @@ fn truncate_value(value: &PgValue, w: u32) -> Result<PartitionLiteral, Partition
         PgValue::Bytea(b) => Ok(PartitionLiteral::Binary(
             b.iter().take(w as usize).copied().collect(),
         )),
-        // Numeric truncate would require the i128 ↔ unscaled_be_bytes
-        // round-trip; not yet wired. Iceberg readers cope with rare-in-
-        // practice numeric partition layouts only; the spec's primary
-        // intent for truncate is on string/int columns.
-        PgValue::Numeric(_) => Err(PartitionError::Invalid(
-            "truncate transform on Decimal columns is not yet wired; \
-             use truncate on the unscaled int column or partition by \
-             a different transform"
-                .into(),
-        )),
+        PgValue::Numeric(d) => truncate_decimal(d, w),
         PgValue::Bool(_)
         | PgValue::Float4(_)
         | PgValue::Float8(_)
@@ -439,6 +436,41 @@ fn truncate_value(value: &PgValue, w: u32) -> Result<PartitionLiteral, Partition
 #[inline]
 fn truncate_i64(v: i64, w: i64) -> i64 {
     v - v.rem_euclid(w)
+}
+
+/// Decimal truncate per iceberg spec: applies `v - rem_euclid(v, W)` to
+/// the *unscaled* integer value, preserving the original scale. Mirrors
+/// the Go reference's `truncateDecimal` (which uses `big.Int` because Go
+/// stores decimals as strings); we use `i128` since iceberg caps precision
+/// at 38 digits and that fits.
+fn truncate_decimal(d: &crate::value::Decimal, w: u32) -> Result<PartitionLiteral, PartitionError> {
+    let unscaled = be_bytes_to_i128(&d.unscaled_be_bytes).ok_or_else(|| {
+        PartitionError::Invalid(format!(
+            "decimal unscaled value too wide ({} bytes); iceberg caps decimal \
+             precision at 38 digits which fits in 16 bytes",
+            d.unscaled_be_bytes.len()
+        ))
+    })?;
+    let w = w as i128;
+    let truncated = unscaled - unscaled.rem_euclid(w);
+    Ok(PartitionLiteral::Decimal {
+        unscaled: truncated,
+        scale: d.scale,
+    })
+}
+
+/// Sign-extend a variable-length big-endian two's-complement byte string
+/// to an `i128`. Returns `None` if the input is empty or wider than 16
+/// bytes (iceberg's 38-digit decimal cap fits in 16 bytes).
+fn be_bytes_to_i128(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let is_negative = bytes[0] & 0x80 != 0;
+    let mut buf = if is_negative { [0xFFu8; 16] } else { [0u8; 16] };
+    let start = 16 - bytes.len();
+    buf[start..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf))
 }
 
 fn identity_literal(value: &PgValue) -> Result<PartitionLiteral, PartitionError> {
@@ -835,6 +867,76 @@ mod tests {
                 Err(PartitionError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn truncate_decimal_floors_unscaled_value_and_keeps_scale() {
+        use crate::value::Decimal;
+        // 10.65, scale=2, W=50 → unscaled=1065, 1065 - (1065 % 50) = 1050 → 10.50
+        let d = Decimal {
+            unscaled_be_bytes: 1065i128
+                .to_be_bytes()
+                .iter()
+                .skip_while(|b| **b == 0)
+                .copied()
+                .collect(),
+            scale: 2,
+        };
+        match apply_transform(&PgValue::Numeric(d), Transform::Truncate(50)).unwrap() {
+            PartitionLiteral::Decimal { unscaled, scale } => {
+                assert_eq!(unscaled, 1050);
+                assert_eq!(scale, 2);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_decimal_handles_negative_unscaled() {
+        use crate::value::Decimal;
+        // -7, scale=0, W=4 → -7 - rem_euclid(-7, 4) = -7 - 1 = -8.
+        let d = Decimal {
+            unscaled_be_bytes: vec![0xF9], // -7 in 8-bit two's complement
+            scale: 0,
+        };
+        match apply_transform(&PgValue::Numeric(d), Transform::Truncate(4)).unwrap() {
+            PartitionLiteral::Decimal { unscaled, scale } => {
+                assert_eq!(unscaled, -8);
+                assert_eq!(scale, 0);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_decimal_preserves_arity_for_38_digit_unscaled() {
+        use crate::value::Decimal;
+        // 38-digit max value (10^38 - 1) ≈ 3.4e38, fits in i128.
+        let unscaled: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
+        let d = Decimal {
+            unscaled_be_bytes: unscaled.to_be_bytes().to_vec(),
+            scale: 10,
+        };
+        let got = apply_transform(&PgValue::Numeric(d), Transform::Truncate(100)).unwrap();
+        if let PartitionLiteral::Decimal { unscaled: u, scale } = got {
+            assert_eq!(u, unscaled - unscaled.rem_euclid(100));
+            assert_eq!(scale, 10);
+        } else {
+            panic!("expected Decimal, got {got:?}")
+        }
+    }
+
+    #[test]
+    fn truncate_decimal_rejects_unscaled_wider_than_16_bytes() {
+        use crate::value::Decimal;
+        let d = Decimal {
+            unscaled_be_bytes: vec![0; 17],
+            scale: 0,
+        };
+        assert!(matches!(
+            apply_transform(&PgValue::Numeric(d), Transform::Truncate(10)),
+            Err(PartitionError::Invalid(_))
+        ));
     }
 
     #[test]
