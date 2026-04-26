@@ -18,6 +18,7 @@
 //!   `LogicalReplicationMessage` → our [`crate::DecodedMessage`].
 
 pub mod client;
+pub mod discover;
 pub mod stream;
 pub mod tls;
 pub mod typemap;

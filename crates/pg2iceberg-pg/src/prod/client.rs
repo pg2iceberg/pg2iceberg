@@ -98,6 +98,26 @@ impl Drop for PgClientImpl {
     }
 }
 
+impl PgClientImpl {
+    /// Discover a table's columns + primary key from the source PG.
+    /// Mirrors `postgres/schema.go::DiscoverSchema` in the Go
+    /// reference. Operators can omit `columns:` from YAML and we'll
+    /// query `information_schema.columns` + `pg_index` at startup.
+    ///
+    /// Returns a [`pg2iceberg_core::TableSchema`] with auto-assigned
+    /// 1-based field ids, PK columns marked, and types mapped to
+    /// our [`PgType`] enum.
+    ///
+    /// [`PgType`]: pg2iceberg_core::typemap::PgType
+    pub async fn discover_schema(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<pg2iceberg_core::TableSchema> {
+        super::discover::discover_schema(&self.client, schema, table).await
+    }
+}
+
 #[async_trait]
 impl PgClient for PgClientImpl {
     async fn create_publication(&self, name: &str, tables: &[TableIdent]) -> Result<()> {

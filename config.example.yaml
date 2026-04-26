@@ -1,0 +1,79 @@
+# pg2iceberg config example. Mirrors the Go reference's YAML shape;
+# operators can drop their existing pg2iceberg.yaml in unchanged.
+# Fields that the Rust port doesn't yet consume (query mode,
+# control-plane metadata, materializer cycle knobs, etc.) are still
+# parsed cleanly and ignored.
+
+tables:
+  # Schema is discovered from `information_schema.columns` +
+  # `pg_index` at startup — same path the Go reference uses. PK
+  # columns are picked up automatically when the source has a
+  # PRIMARY KEY constraint. Fall through to explicit `columns:`
+  # below only when the source lacks a PK or you want to override
+  # the discovered shape.
+  - name: public.orders
+    # primary_key: [id]              # optional — overrides the
+                                      #            discovered PK
+    # columns:                       # optional — overrides discovery
+    #   - { name: id, pg_type: int4 }
+    #   - { name: qty, pg_type: int8, nullable: true }
+
+source:
+  mode: logical                # "logical" or "query"
+  postgres:
+    host: db.example.com
+    port: 5432
+    database: src
+    user: pg2iceberg
+    password: REDACTED
+    sslmode: require           # "disable" | "require" | "verify-ca" | "verify-full"
+                                # — Rust port treats anything non-disable as
+                                #   webpki-roots verification (mTLS / custom
+                                #   CA / hostname-only flavors are follow-ons).
+  logical:
+    publication_name: pg2iceberg_pub
+    slot_name: pg2iceberg_slot
+    # standby_interval: 10s
+
+sink:
+  catalog_uri: https://catalog.example.com
+
+  # Catalog auth flavor: "" (none) | "sigv4" (AWS Glue) | "bearer" |
+  # "oauth2". Only "bearer" and "" are currently exercised against
+  # Polaris/Tabular/Snowflake-managed-catalog and the Iceberg REST
+  # reference; "sigv4" + "oauth2" plumb through but aren't yet
+  # tested end-to-end.
+  catalog_auth: bearer
+  catalog_token: REDACTED-bearer-token
+  # catalog_client_id: ...
+  # catalog_client_secret: ...
+
+  # Credential mode for staging blobs:
+  # "static" (default) — explicit S3 keys below.
+  # "iam"             — instance profile / AWS SSO / env-var chain
+  #                      (object_store::aws::AmazonS3Builder::from_env).
+  # "vended"          — temporary creds from the catalog's LoadTable
+  #                      response. NOT YET WIRED in the Rust port; will
+  #                      error at startup (see plan §Phase 7).
+  credential_mode: static
+  warehouse: s3://my-warehouse/staged
+  namespace: default
+  s3_endpoint: https://s3.us-east-1.amazonaws.com
+  s3_access_key: REDACTED
+  s3_secret_key: REDACTED
+  s3_region: us-east-1
+  flush_interval: 10s
+  flush_rows: 1000
+
+  # Free-form REST catalog props passthrough. Useful for
+  # vendor-specific settings the Go config doesn't have a dedicated
+  # field for.
+  # catalog_props:
+  #   "header.X-Custom-Header": "value"
+
+state:
+  # Optional dedicated PG for the _pg2iceberg.* coordinator schema.
+  # If absent, the source PG hosts it (matches Go).
+  # postgres_url: postgres://coord_user:secret@coord-db.example.com/coord?sslmode=require
+  coordinator_schema: _pg2iceberg
+  # group: default

@@ -78,23 +78,29 @@ async fn connect_pg(cfg: &Config) -> Result<()> {
         prod::{PgClientImpl, TlsMode},
         PgClient,
     };
-    let tls = TlsMode::parse(&cfg.pg.tls).context("parse pg tls mode")?;
-    tracing::info!(slot = %cfg.pg.slot, publication = %cfg.pg.publication, ?tls, "connecting to source PG");
-    let client = PgClientImpl::connect_with(&cfg.pg.conn, tls)
+    let tls = match cfg.source.postgres.tls_label() {
+        "webpki" => TlsMode::Webpki,
+        _ => TlsMode::Disable,
+    };
+    tracing::info!(
+        slot = %cfg.source.logical.slot_name,
+        publication = %cfg.source.logical.publication_name,
+        ?tls,
+        "connecting to source PG",
+    );
+    let client = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), tls)
         .await
         .context("PG connect")?;
-    let exists = client
-        .slot_exists(&cfg.pg.slot)
-        .await
-        .context("slot lookup")?;
+    let slot = &cfg.source.logical.slot_name;
+    let exists = client.slot_exists(slot).await.context("slot lookup")?;
     if exists {
         let lsn = client
-            .slot_restart_lsn(&cfg.pg.slot)
+            .slot_restart_lsn(slot)
             .await
             .context("slot restart_lsn")?;
-        tracing::info!(slot = %cfg.pg.slot, ?lsn, "slot exists");
+        tracing::info!(slot = %slot, ?lsn, "slot exists");
     } else {
-        tracing::info!(slot = %cfg.pg.slot, "slot does not exist; would be created on first run");
+        tracing::info!(slot = %slot, "slot does not exist; would be created on first run");
     }
     println!("OK: PG replication-mode connection established");
     Ok(())
@@ -105,26 +111,10 @@ async fn connect_pg(cfg: &Config) -> Result<()> {
 async fn connect_iceberg(cfg: &Config) -> Result<()> {
     use pg2iceberg_iceberg::prod::IcebergRustCatalog;
     use std::sync::Arc;
-
-    match cfg.iceberg.clone() {
-        config::IcebergConfig::Memory { warehouse } => {
-            tracing::info!(%warehouse, "opening Iceberg memory catalog");
-            let inner = run::build_memory_catalog(&warehouse).await?;
-            let catalog = IcebergRustCatalog::new(Arc::new(inner));
-            ensure_namespaces(&catalog, &cfg.tables).await?;
-        }
-        config::IcebergConfig::Rest {
-            uri,
-            warehouse,
-            token,
-            props,
-        } => {
-            tracing::info!(%uri, %warehouse, "opening Iceberg REST catalog");
-            let inner = run::build_rest_catalog(&uri, &warehouse, token.as_deref(), &props).await?;
-            let catalog = IcebergRustCatalog::new(Arc::new(inner));
-            ensure_namespaces(&catalog, &cfg.tables).await?;
-        }
-    }
+    tracing::info!(uri = %cfg.sink.catalog_uri, warehouse = %cfg.sink.warehouse, "opening Iceberg REST catalog");
+    let inner = run::build_rest_catalog(cfg).await?;
+    let catalog = IcebergRustCatalog::new(Arc::new(inner));
+    ensure_namespaces(&catalog, &cfg.tables).await?;
     println!("OK: Iceberg catalog connection established");
     Ok(())
 }
@@ -133,14 +123,21 @@ async fn ensure_namespaces<C: iceberg::Catalog + Send + Sync + 'static>(
     catalog: &pg2iceberg_iceberg::prod::IcebergRustCatalog<C>,
     tables: &[config::TableConfig],
 ) -> Result<()> {
+    use pg2iceberg_core::Namespace;
     use pg2iceberg_iceberg::Catalog as _;
+    // `connect-iceberg` is a connectivity smoke test — we don't
+    // need full column metadata here, just the parsed
+    // (schema, table) so we know which namespaces to ensure.
     for t in tables {
-        let schema = t.to_table_schema()?;
+        let (ns, name) = t
+            .qualified()
+            .with_context(|| format!("parse table name {}", t.name))?;
+        let namespace = Namespace(vec![ns.clone()]);
         catalog
-            .ensure_namespace(&schema.ident.namespace)
+            .ensure_namespace(&namespace)
             .await
-            .with_context(|| format!("ensure namespace for {}", schema.ident))?;
-        tracing::info!(ident = %schema.ident, "namespace ready");
+            .with_context(|| format!("ensure namespace for {ns}.{name}"))?;
+        tracing::info!(table = %t.name, "namespace ready");
     }
     Ok(())
 }
@@ -152,12 +149,15 @@ async fn migrate_coord(cfg: &Config) -> Result<()> {
         prod::{connect_with, PostgresCoordinator, TlsMode},
         schema::CoordSchema,
     };
-    let tls = TlsMode::parse(&cfg.coord.tls).context("parse coord tls mode")?;
-    tracing::info!(schema = %cfg.coord.schema, ?tls, "connecting to coord PG");
-    let conn = connect_with(&cfg.coord.conn, tls)
+    let tls = match cfg.source.postgres.tls_label() {
+        "webpki" => TlsMode::Webpki,
+        _ => TlsMode::Disable,
+    };
+    tracing::info!(schema = %cfg.state.coordinator_schema, ?tls, "connecting to coord PG");
+    let conn = connect_with(&cfg.coord_dsn(), tls)
         .await
         .context("coord connect")?;
-    let schema = CoordSchema::sanitize(&cfg.coord.schema);
+    let schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
     let coord = PostgresCoordinator::new(conn, schema);
     coord.migrate().await.context("coord migrate")?;
     println!("OK: coordinator schema migrated");

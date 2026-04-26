@@ -46,6 +46,10 @@ impl RealIdGen {
     /// Construct with an operator-supplied worker id. Useful for
     /// distributed deployments that want stable identity across
     /// process restarts (e.g., the kubernetes pod name).
+    /// Currently unused; the YAML config shape doesn't expose a
+    /// worker-id field yet (Go's `MaterializerWorkerID` will map
+    /// here when distributed-mode lands).
+    #[allow(dead_code)]
     pub fn with_worker_id(worker: impl Into<String>) -> Self {
         Self {
             worker: WorkerId(worker.into()),

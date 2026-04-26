@@ -44,7 +44,10 @@ tokio = { version = "1", features = [
 ] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+# YAML to match the Go reference's config layout. Operators can drop
+# their existing pg2iceberg.yaml in unchanged (modulo TLS / gaps
+# documented in `config.rs`).
+serde_yaml = "0.9"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

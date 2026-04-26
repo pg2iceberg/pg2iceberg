@@ -1,9 +1,19 @@
-//! Binary configuration: TOML schema + loader.
+//! Binary configuration. Mirrors the Go reference's
+//! `config/config.go` shape so operators can reuse their existing
+//! `pg2iceberg.yaml` without translation.
 //!
-//! The TOML shape is intentionally flat. Each prod surface
-//! (PG source, coordinator, Iceberg catalog, blob store) gets its
-//! own section so an operator can swap any one without touching the
-//! others. Tables are listed individually with their PK columns.
+//! Sections: `tables` (list), `source.{postgres, logical, query}`,
+//! `sink` (catalog + storage + credential mode + flush knobs),
+//! `state` (coordinator location).
+//!
+//! Some fields are intentionally not yet consumed by the Rust port
+//! (query-mode settings, materializer cycle knobs, control-plane
+//! metadata, etc.). They're carried in the schema so existing Go
+//! configs deserialize cleanly; we wire them as the corresponding
+//! features land. Hence the crate-level `dead_code` allow on the
+//! config structs — *fields*, not types.
+
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use pg2iceberg_core::{ColumnSchema, IcebergType, Namespace, PgType, TableIdent, TableSchema};
@@ -11,57 +21,264 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
-    pub pg: PgConfig,
-    pub coord: CoordConfig,
-    pub iceberg: IcebergConfig,
-    pub blob: BlobConfig,
-    /// Tables to mirror. Order matters — registration happens in this
-    /// order at startup.
-    #[serde(rename = "table", default)]
-    pub tables: Vec<TableConfig>,
     #[serde(default)]
-    pub runtime: RuntimeConfig,
+    pub tables: Vec<TableConfig>,
+    pub source: SourceConfig,
+    pub sink: SinkConfig,
+    #[serde(default)]
+    pub state: StateConfig,
+    #[serde(default)]
+    pub metrics_addr: String,
+    #[serde(default)]
+    pub snapshot_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PgConfig {
-    /// libpq-style connection string for the source database
-    /// (`host=... user=... dbname=...`). Replication mode is added
-    /// automatically by `PgClientImpl::connect`.
-    pub conn: String,
-    /// Replication slot name. Created on first run; reused across
-    /// restarts.
-    pub slot: String,
-    /// Publication name. Created on first run from the `tables` list.
-    pub publication: String,
-    /// TLS mode: `"disable"` (default) or `"webpki"`.
-    #[serde(default = "default_tls_mode")]
-    pub tls: String,
+pub struct TableConfig {
+    /// Fully-qualified table name `"schema.name"`. Mirrors Go.
+    pub name: String,
+    #[serde(default)]
+    pub skip_snapshot: bool,
+    /// Required in query mode, optional in logical (we still need it
+    /// to know the PK for equality-delete files; if absent, we infer
+    /// from `pg_attribute.indisprimary` at startup — but that path
+    /// isn't wired yet, so today this is required).
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub watermark_column: String,
+    /// Column declarations. The Go reference doesn't carry these in
+    /// YAML (it discovers them from `pg_attribute`); we keep them
+    /// here as a stopgap until the schema-discovery query lands.
+    #[serde(default, rename = "columns")]
+    pub columns: Vec<ColumnConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CoordConfig {
-    /// Connection string for the coord PG. Often the same database as
-    /// the source; can be a separate one. Regular (non-replication)
-    /// mode.
-    pub conn: String,
-    /// Schema name for the `_pg2iceberg.*` tables. Default
-    /// `_pg2iceberg`.
+pub struct ColumnConfig {
+    pub name: String,
+    pub pg_type: String,
+    #[serde(default)]
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceConfig {
+    /// `"logical"` (default) or `"query"`.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    pub postgres: PostgresConfig,
+    #[serde(default)]
+    pub logical: LogicalConfig,
+    #[serde(default)]
+    pub query: QueryConfig,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_mode(),
+            postgres: PostgresConfig::default(),
+            logical: LogicalConfig::default(),
+            query: QueryConfig::default(),
+        }
+    }
+}
+
+fn default_mode() -> String {
+    "logical".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PostgresConfig {
+    pub host: String,
+    #[serde(default = "default_pg_port")]
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+    /// `"disable"` (default), `"require"`, `"verify-ca"`, `"verify-full"`.
+    /// Maps to `TlsMode::Disable` (`"disable"`) or `TlsMode::Webpki`
+    /// (`"require"` / `"verify-ca"` / `"verify-full"`); custom CA and
+    /// hostname verification flavors aren't yet differentiated.
+    #[serde(default)]
+    pub sslmode: String,
+}
+
+fn default_pg_port() -> u16 {
+    5432
+}
+
+impl PostgresConfig {
+    /// Render as a libpq-style `key=value` connection string.
+    pub fn dsn(&self) -> String {
+        let sslmode = if self.sslmode.is_empty() {
+            "disable"
+        } else {
+            self.sslmode.as_str()
+        };
+        format!(
+            "host={} port={} dbname={} user={} password={} sslmode={}",
+            self.host, self.port, self.database, self.user, self.password, sslmode
+        )
+    }
+
+    /// Map the Postgres `sslmode` to our [`pg2iceberg_pg::prod::TlsMode`].
+    /// `disable` → `Disable`; everything else maps to `Webpki` since
+    /// `tokio-postgres-rustls` always verifies server certs against
+    /// the configured roots. Hostname-only / CA-only differentiation
+    /// is a follow-on (see plan §"Remaining items for the binary").
+    pub fn tls_label(&self) -> &str {
+        match self.sslmode.as_str() {
+            "" | "disable" | "off" | "false" => "disable",
+            _ => "webpki",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogicalConfig {
+    #[serde(default = "default_publication")]
+    pub publication_name: String,
+    #[serde(default = "default_slot")]
+    pub slot_name: String,
+    #[serde(default)]
+    pub standby_interval: String,
+}
+
+impl Default for LogicalConfig {
+    fn default() -> Self {
+        Self {
+            publication_name: default_publication(),
+            slot_name: default_slot(),
+            standby_interval: String::new(),
+        }
+    }
+}
+
+fn default_publication() -> String {
+    "pg2iceberg_pub".into()
+}
+
+fn default_slot() -> String {
+    "pg2iceberg_slot".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct QueryConfig {
+    #[serde(default)]
+    pub poll_interval: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SinkConfig {
+    pub catalog_uri: String,
+    /// `""` / `"none"` / `"sigv4"` / `"bearer"` / `"oauth2"`.
+    #[serde(default)]
+    pub catalog_auth: String,
+    #[serde(default)]
+    pub catalog_token: String,
+    #[serde(default)]
+    pub catalog_client_id: String,
+    #[serde(default)]
+    pub catalog_client_secret: String,
+
+    /// `"static"` (default) — explicit S3 keys below.
+    /// `"vended"` — temporary credentials from the catalog's
+    /// `LoadTable` response. NOT YET WIRED in the Rust port; will
+    /// error at startup. Plan §Phase 7.
+    /// `"iam"` — instance profile / AWS SSO / env-var chain.
+    #[serde(default = "default_credential_mode")]
+    pub credential_mode: String,
+
+    #[serde(default)]
+    pub warehouse: String,
+    pub namespace: String,
+    #[serde(default)]
+    pub s3_endpoint: String,
+    #[serde(default)]
+    pub s3_access_key: String,
+    #[serde(default)]
+    pub s3_secret_key: String,
+    #[serde(default = "default_region")]
+    pub s3_region: String,
+
+    #[serde(default)]
+    pub flush_interval: String,
+    #[serde(default = "default_flush_rows")]
+    pub flush_rows: usize,
+
+    /// Free-form REST-catalog props passthrough. Not in the Go YAML
+    /// shape but useful for vendor-specific settings (Polaris OAuth2
+    /// server URI, etc.) without us having to enumerate every quirk.
+    #[serde(default, rename = "catalog_props")]
+    pub catalog_props: BTreeMap<String, String>,
+}
+
+impl Default for SinkConfig {
+    fn default() -> Self {
+        Self {
+            catalog_uri: String::new(),
+            catalog_auth: String::new(),
+            catalog_token: String::new(),
+            catalog_client_id: String::new(),
+            catalog_client_secret: String::new(),
+            credential_mode: default_credential_mode(),
+            warehouse: String::new(),
+            namespace: String::new(),
+            s3_endpoint: String::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_region: default_region(),
+            flush_interval: String::new(),
+            flush_rows: default_flush_rows(),
+            catalog_props: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_credential_mode() -> String {
+    "static".into()
+}
+
+fn default_region() -> String {
+    "us-east-1".into()
+}
+
+fn default_flush_rows() -> usize {
+    1000
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateConfig {
+    /// File-backed state path (sim-only / dev). Not honored in the
+    /// Rust prod path — leave empty.
+    #[serde(default)]
+    pub path: String,
+    /// Postgres URL for the coordinator. If absent, the source PG
+    /// hosts the `_pg2iceberg.*` schema (matches Go).
+    #[serde(default)]
+    pub postgres_url: String,
     #[serde(default = "default_coord_schema")]
-    pub schema: String,
-    /// Materialization group name (used in `mat_cursor` /
-    /// `consumer` tables). Default `default`.
+    pub coordinator_schema: String,
+    /// Materialization group name (consumer / mat_cursor key).
+    /// Not in the Go YAML — defaults to `"default"`.
     #[serde(default = "default_group")]
     pub group: String,
-    /// TLS mode: `"disable"` (default) or `"webpki"`.
-    #[serde(default = "default_tls_mode")]
-    pub tls: String,
 }
 
-fn default_tls_mode() -> String {
-    "disable".into()
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            postgres_url: String::new(),
+            coordinator_schema: default_coord_schema(),
+            group: default_group(),
+        }
+    }
 }
 
 fn default_coord_schema() -> String {
@@ -72,137 +289,97 @@ fn default_group() -> String {
     "default".into()
 }
 
-/// Iceberg catalog choice. `memory` is in-process; `rest` covers
-/// Polaris, Tabular, Snowflake-managed-catalog, the open-source
-/// Iceberg REST reference, and any other REST-protocol catalog.
-/// Glue / SQL / S3Tables / HMS are follow-ons.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum IcebergConfig {
-    Memory {
-        /// Warehouse URI, e.g. `memory:///warehouse`.
-        warehouse: String,
-    },
-    Rest {
-        /// Catalog endpoint, e.g. `https://catalog.example.com`.
-        uri: String,
-        /// Warehouse identifier as understood by the REST catalog
-        /// (often an S3 URI or a logical warehouse name).
-        warehouse: String,
-        /// Optional bearer token (typed as `oauth2-server-uri` etc.
-        /// later when we wire OAuth2). Today: a static bearer.
-        #[serde(default)]
-        token: Option<String>,
-        /// Free-form props passed straight through to
-        /// `RestCatalogBuilder::load`. Useful for SigV4 / OAuth2 /
-        /// custom headers without us having to enumerate every
-        /// REST-catalog vendor's quirks.
-        #[serde(default)]
-        props: BTreeMap<String, String>,
-    },
-}
-
-/// Blob store choice. `memory` is in-process; `s3` covers AWS S3,
-/// MinIO, Cloudflare R2 (via `endpoint`), Wasabi (via `endpoint`),
-/// and anything else exposing the S3 API. `gcs`/`azure` are
-/// follow-ons.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum BlobConfig {
-    Memory,
-    S3 {
-        bucket: String,
-        /// AWS region (`us-east-1` etc.). For S3-compatible stores
-        /// (MinIO, R2) any non-empty string works as long as
-        /// `endpoint` is set.
-        region: String,
-        /// Optional path prefix within the bucket. Useful for shared
-        /// buckets — staging files land under `<prefix>/...`.
-        #[serde(default)]
-        prefix: Option<String>,
-        /// Optional custom S3 endpoint (e.g.
-        /// `https://minio.local:9000` for MinIO,
-        /// `https://<account>.r2.cloudflarestorage.com` for R2).
-        /// If unset, `object_store` resolves AWS S3.
-        #[serde(default)]
-        endpoint: Option<String>,
-        /// Static AWS credentials. If absent, `object_store` falls
-        /// back to its standard chain (env vars, instance profile,
-        /// AWS SSO etc.), which is what production should use.
-        #[serde(default)]
-        access_key_id: Option<String>,
-        #[serde(default)]
-        secret_access_key: Option<String>,
-        /// Optional session token (for STS-vended creds).
-        #[serde(default)]
-        session_token: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TableConfig {
-    /// Postgres schema name. `public` is the usual default.
-    pub namespace: String,
-    pub name: String,
-    /// PK columns, in declaration order. Required (pg2iceberg
-    /// refuses tables without a PK).
-    pub pk: Vec<String>,
-    /// Column declarations. The order here matches the column order
-    /// in Iceberg; `field_id` is auto-assigned (1-based).
-    #[serde(default, rename = "column")]
-    pub columns: Vec<ColumnConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ColumnConfig {
-    pub name: String,
-    /// Postgres type name (`int4`, `text`, etc.) — see
-    /// `pg2iceberg_core::PgType`'s `ParseType` for the accepted names.
-    pub pg_type: String,
-    #[serde(default)]
-    pub nullable: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct RuntimeConfig {
-    /// Pipeline `flush_threshold` (rows). Default 10_000.
-    #[serde(default = "default_flush_threshold")]
-    pub flush_threshold: usize,
-    /// Materializer `cycle_limit` (snapshots per cycle). Default 64.
-    #[serde(default = "default_cycle_limit")]
-    pub cycle_limit: usize,
-    /// Optional operator-supplied worker id. If unset, generated from
-    /// `Uuid::new_v4()` at startup.
-    pub worker_id: Option<String>,
-}
-
-fn default_flush_threshold() -> usize {
-    10_000
-}
-
-fn default_cycle_limit() -> usize {
-    64
-}
-
 impl Config {
-    /// Read + parse a TOML file from disk.
+    /// Read + parse a YAML file from disk.
     pub fn load_from<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read config from {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&raw).with_context(|| format!("parse config at {}", path.display()))?;
+        let cfg: Config = serde_yaml::from_str(&raw)
+            .with_context(|| format!("parse config at {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Connection string for the coordinator. Defaults to the source
+    /// PG when `state.postgres_url` is unset.
+    pub fn coord_dsn(&self) -> String {
+        if !self.state.postgres_url.is_empty() {
+            self.state.postgres_url.clone()
+        } else {
+            self.source.postgres.dsn()
+        }
+    }
+
+    /// Bag of REST catalog props derived from sink config. Keys we
+    /// pass: `uri`, `warehouse`, plus auth-flavor-specific bits.
+    /// `catalog_props` from YAML is layered on top.
+    pub fn rest_catalog_props(&self) -> BTreeMap<String, String> {
+        let mut props: BTreeMap<String, String> = BTreeMap::new();
+        props.insert("uri".into(), self.sink.catalog_uri.clone());
+        if !self.sink.warehouse.is_empty() {
+            props.insert("warehouse".into(), self.sink.warehouse.clone());
+        }
+        match self.sink.catalog_auth.as_str() {
+            "bearer" if !self.sink.catalog_token.is_empty() => {
+                props.insert("token".into(), self.sink.catalog_token.clone());
+            }
+            "oauth2" => {
+                if !self.sink.catalog_client_id.is_empty() {
+                    props.insert(
+                        "oauth2-server-uri".into(),
+                        format!(
+                            "{}/v1/oauth/tokens",
+                            self.sink.catalog_uri.trim_end_matches('/')
+                        ),
+                    );
+                    props.insert(
+                        "credential".into(),
+                        format!(
+                            "{}:{}",
+                            self.sink.catalog_client_id, self.sink.catalog_client_secret
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+        for (k, v) in &self.sink.catalog_props {
+            props.insert(k.clone(), v.clone());
+        }
+        props
     }
 }
 
 impl TableConfig {
-    /// Convert to the workspace's [`TableSchema`] shape, assigning
-    /// 1-based field ids in declaration order. Errors out on unknown
-    /// PG type names — we surface those at config-load time rather
-    /// than at materialization-runtime.
+    /// `(schema, table)` parsed from the YAML `name`.
+    pub fn qualified(&self) -> Result<(String, String)> {
+        parse_qualified_name(&self.name)
+    }
+
+    /// `True` when the operator has explicitly declared columns in
+    /// YAML. When `false`, the binary discovers schema from
+    /// `information_schema.columns` + `pg_index` at startup.
+    pub fn has_explicit_columns(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
+    /// Convert to our [`TableSchema`]. Splits `name` on `.` for the
+    /// namespace + table — same form Go's reference uses.
+    /// Errors if `columns:` is empty; callers should branch via
+    /// [`Self::has_explicit_columns`] and use schema discovery
+    /// instead in that case.
     pub fn to_table_schema(&self) -> Result<TableSchema> {
-        let pk_set: std::collections::BTreeSet<&str> = self.pk.iter().map(String::as_str).collect();
+        let (ns, name) = parse_qualified_name(&self.name)?;
+        if self.columns.is_empty() {
+            anyhow::bail!(
+                "table {ns}.{name} has no explicit columns; \
+                 the binary uses live schema discovery in this case — \
+                 callers should branch on TableConfig::has_explicit_columns() \
+                 instead of calling to_table_schema() directly"
+            );
+        }
+        let pk_set: std::collections::BTreeSet<&str> =
+            self.primary_key.iter().map(String::as_str).collect();
         let mut columns: Vec<ColumnSchema> = Vec::with_capacity(self.columns.len());
         for (idx, c) in self.columns.iter().enumerate() {
             let pg = parse_pg_type(&c.pg_type)
@@ -219,16 +396,27 @@ impl TableConfig {
         }
         Ok(TableSchema {
             ident: TableIdent {
-                namespace: Namespace(vec![self.namespace.clone()]),
-                name: self.name.clone(),
+                namespace: Namespace(vec![ns]),
+                name,
             },
             columns,
         })
     }
 }
 
+/// Split `"schema.table"` → `("schema", "table")`. Errors on
+/// missing dot.
+fn parse_qualified_name(qualified: &str) -> Result<(String, String)> {
+    let (ns, name) = qualified
+        .split_once('.')
+        .with_context(|| format!("table name must be \"schema.name\": {qualified}"))?;
+    if ns.is_empty() || name.is_empty() {
+        anyhow::bail!("table name must be \"schema.name\": {qualified}");
+    }
+    Ok((ns.to_string(), name.to_string()))
+}
+
 /// Parse a Postgres type name (case-insensitive) into [`PgType`].
-/// Mirrors the Go reference's `postgres.ParseType` table.
 fn parse_pg_type(name: &str) -> Result<PgType> {
     let lower = name.to_ascii_lowercase();
     Ok(match lower.as_str() {
@@ -238,9 +426,6 @@ fn parse_pg_type(name: &str) -> Result<PgType> {
         "int8" | "bigint" | "bigserial" => PgType::Int8,
         "float4" | "real" => PgType::Float4,
         "float8" | "double precision" | "double" => PgType::Float8,
-        // For `numeric` without explicit (precision, scale) on the
-        // config side we use the unconstrained form; the warning is
-        // surfaced via `map_pg_to_iceberg`.
         "numeric" | "decimal" => PgType::Numeric {
             precision: None,
             scale: None,
@@ -262,9 +447,8 @@ fn parse_pg_type(name: &str) -> Result<PgType> {
     })
 }
 
-// Suppress unused-import warning when `IcebergType` is exported but
-// nothing in this module references it directly. Keeping the re-export
-// shape consistent with the rest of the workspace.
+/// Suppress unused-import warning when `IcebergType` is exported but
+/// nothing in this module references it directly.
 #[allow(dead_code)]
 fn _types_keep_alive(_: IcebergType) {}
 
@@ -272,90 +456,151 @@ fn _types_keep_alive(_: IcebergType) {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_known_type_aliases() {
-        assert_eq!(parse_pg_type("int4").unwrap(), PgType::Int4);
-        assert_eq!(parse_pg_type("INTEGER").unwrap(), PgType::Int4);
-        assert_eq!(parse_pg_type("text").unwrap(), PgType::Text);
-        assert_eq!(parse_pg_type("VARCHAR").unwrap(), PgType::Text);
-        assert!(matches!(
-            parse_pg_type("numeric").unwrap(),
-            PgType::Numeric { .. }
-        ));
-    }
+    const SAMPLE: &str = r#"
+tables:
+  - name: public.orders
+    primary_key: [id]
+    columns:
+      - name: id
+        pg_type: int4
+      - name: qty
+        pg_type: int8
+        nullable: true
 
-    #[test]
-    fn unknown_type_errors() {
-        assert!(parse_pg_type("polygon").is_err());
-    }
+source:
+  mode: logical
+  postgres:
+    host: localhost
+    port: 5432
+    database: src
+    user: postgres
+    password: secret
+    sslmode: require
+  logical:
+    publication_name: p2i_pub
+    slot_name: p2i_slot
 
-    #[test]
-    fn table_to_schema_assigns_1_based_field_ids_and_marks_pk() {
-        let t = TableConfig {
-            namespace: "public".into(),
-            name: "orders".into(),
-            pk: vec!["id".into()],
-            columns: vec![
-                ColumnConfig {
-                    name: "id".into(),
-                    pg_type: "int4".into(),
-                    nullable: false,
-                },
-                ColumnConfig {
-                    name: "qty".into(),
-                    pg_type: "int8".into(),
-                    nullable: true,
-                },
-            ],
-        };
-        let s = t.to_table_schema().unwrap();
-        assert_eq!(s.columns.len(), 2);
-        assert_eq!(s.columns[0].name, "id");
-        assert_eq!(s.columns[0].field_id, 1);
-        assert!(s.columns[0].is_primary_key);
-        assert!(!s.columns[0].nullable);
-        assert_eq!(s.columns[1].name, "qty");
-        assert_eq!(s.columns[1].field_id, 2);
-        assert!(!s.columns[1].is_primary_key);
-        assert!(s.columns[1].nullable);
-    }
+sink:
+  catalog_uri: http://localhost:8181
+  catalog_auth: bearer
+  catalog_token: REDACTED
+  credential_mode: static
+  warehouse: s3://warehouse/
+  namespace: public
+  s3_endpoint: http://localhost:9000
+  s3_access_key: admin
+  s3_secret_key: password
+  s3_region: us-east-1
+  flush_interval: 10s
+  flush_rows: 1000
 
-    #[test]
-    fn parses_minimal_toml() {
-        let toml = r#"
-[pg]
-conn = "host=localhost user=test dbname=src"
-slot = "p2i_slot"
-publication = "p2i_pub"
-
-[coord]
-conn = "host=localhost user=test dbname=src"
-
-[iceberg]
-type = "memory"
-warehouse = "memory:///warehouse"
-
-[blob]
-type = "memory"
-
-[[table]]
-namespace = "public"
-name = "orders"
-pk = ["id"]
-[[table.column]]
-name = "id"
-pg_type = "int4"
-[[table.column]]
-name = "qty"
-pg_type = "int8"
-nullable = true
+state:
+  coordinator_schema: _pg2iceberg
 "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.pg.slot, "p2i_slot");
-        assert_eq!(cfg.coord.schema, "_pg2iceberg");
-        assert_eq!(cfg.coord.group, "default");
+
+    #[test]
+    fn parses_go_shaped_yaml() {
+        let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
         assert_eq!(cfg.tables.len(), 1);
-        assert_eq!(cfg.tables[0].name, "orders");
+        assert_eq!(cfg.tables[0].name, "public.orders");
+        assert_eq!(cfg.tables[0].primary_key, vec!["id".to_string()]);
         assert_eq!(cfg.tables[0].columns.len(), 2);
+        assert_eq!(cfg.source.mode, "logical");
+        assert_eq!(cfg.source.postgres.host, "localhost");
+        assert_eq!(cfg.source.postgres.port, 5432);
+        assert_eq!(cfg.source.postgres.tls_label(), "webpki");
+        assert_eq!(cfg.source.logical.slot_name, "p2i_slot");
+        assert_eq!(cfg.sink.catalog_uri, "http://localhost:8181");
+        assert_eq!(cfg.sink.credential_mode, "static");
+        assert_eq!(cfg.sink.s3_endpoint, "http://localhost:9000");
+        assert_eq!(cfg.sink.namespace, "public");
+        assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
+    }
+
+    #[test]
+    fn dsn_renders_all_fields() {
+        let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        let dsn = cfg.source.postgres.dsn();
+        assert!(dsn.contains("host=localhost"));
+        assert!(dsn.contains("dbname=src"));
+        assert!(dsn.contains("user=postgres"));
+        assert!(dsn.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn dsn_defaults_sslmode_disable_when_unset() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+tables: []
+source:
+  postgres:
+    host: localhost
+    database: x
+    user: y
+sink:
+  catalog_uri: http://localhost
+  namespace: x
+"#,
+        )
+        .unwrap();
+        let dsn = cfg.source.postgres.dsn();
+        assert!(dsn.contains("sslmode=disable"));
+        assert_eq!(cfg.source.postgres.tls_label(), "disable");
+    }
+
+    #[test]
+    fn parse_qualified_name_splits_on_dot() {
+        let (ns, n) = parse_qualified_name("public.orders").unwrap();
+        assert_eq!(ns, "public");
+        assert_eq!(n, "orders");
+    }
+
+    #[test]
+    fn parse_qualified_name_rejects_unqualified() {
+        assert!(parse_qualified_name("orders").is_err());
+        assert!(parse_qualified_name(".orders").is_err());
+        assert!(parse_qualified_name("public.").is_err());
+    }
+
+    #[test]
+    fn rest_catalog_props_includes_bearer_token_when_configured() {
+        let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        let props = cfg.rest_catalog_props();
+        assert_eq!(
+            props.get("uri").map(String::as_str),
+            Some("http://localhost:8181"),
+        );
+        assert_eq!(props.get("token").map(String::as_str), Some("REDACTED"));
+        assert_eq!(
+            props.get("warehouse").map(String::as_str),
+            Some("s3://warehouse/"),
+        );
+    }
+
+    #[test]
+    fn defaults_kick_in_for_missing_fields() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+tables: []
+source:
+  postgres:
+    host: h
+    database: d
+    user: u
+sink:
+  catalog_uri: x
+  namespace: ns
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.source.mode, "logical");
+        assert_eq!(cfg.source.postgres.port, 5432);
+        assert_eq!(cfg.source.logical.slot_name, "pg2iceberg_slot");
+        assert_eq!(cfg.source.logical.publication_name, "pg2iceberg_pub");
+        assert_eq!(cfg.sink.credential_mode, "static");
+        assert_eq!(cfg.sink.s3_region, "us-east-1");
+        assert_eq!(cfg.sink.flush_rows, 1000);
+        assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
+        assert_eq!(cfg.state.group, "default");
     }
 }

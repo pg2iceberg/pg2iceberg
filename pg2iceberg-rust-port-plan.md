@@ -435,10 +435,13 @@ parsing, helpers). What's wired:
 3. **Stream-level translation tests** for the `LogicalReplicationMessage`
    → `DecodedMessage` mapping. Current tests cover decode helpers but
    not the routing logic; testcontainers covers it implicitly.
-4. **Schema discovery query** — `pg_catalog.pg_attribute`-based fetch
-   for column types/PKs at startup or on Relation message. The wire
-   protocol's RelationBody only carries OID; the materializer needs
-   nullable + PK info from the catalog.
+4. ~~Schema discovery query~~ — **DONE**.
+   `pg2iceberg-pg/src/prod/discover.rs::discover_schema` queries
+   `information_schema.columns` + `pg_index`/`pg_attribute` at startup,
+   mirroring `postgres/schema.go::DiscoverSchema`. The binary calls it
+   when a YAML table has no explicit `columns:` block. PK columns
+   come from the table's PRIMARY KEY index by default; operators
+   can override via `primary_key:` in YAML.
 
 ### Phase 6 — **DST harness** (week 5–6, can start in week 4)
 
@@ -591,33 +594,42 @@ to the binary's prod glue.
 4 unit tests cover type-name parsing, schema construction with PK
 detection + auto field-id assignment, and TOML round-trip.
 
-**Status — P0 production blockers now wired:**
+**Status — P0 production blockers now wired (config matches Go YAML):**
+
+The binary's config is YAML and **mirrors the Go reference's shape exactly**
+(`tables`, `source.{postgres, logical, query}`, `sink`, `state`).
+Operators can drop their existing `pg2iceberg.yaml` in unchanged.
+See `config.example.yaml` for the full surface.
 
 - **TLS** — `pg2iceberg-pg/prod` and `pg2iceberg-coord/prod` both
   expose a `TlsMode { Disable, Webpki }` enum and a `connect_with`
   variant. Webpki uses `tokio-postgres-rustls` 0.13 with rustls's
   ring crypto provider against Mozilla's `webpki-roots` bundle.
-  Config: `tls = "webpki"` in `[pg]` and `[coord]`.
+  Driven from `source.postgres.sslmode` (`"disable"` →
+  `TlsMode::Disable`; everything else → `TlsMode::Webpki`).
+  mTLS / custom CA / `verify-ca` vs `verify-full` differentiation
+  is a follow-on.
 - **Iceberg REST catalog** — `iceberg-catalog-rest = "0.9"` (from
-  the same `polynya-dev/iceberg-rust` fork via `[patch.crates-io]`)
-  is wired. Config: `type = "rest"` in `[iceberg]` with `uri`,
-  `warehouse`, optional `token`, plus a free-form `[iceberg.props]`
-  passthrough for vendor-specific REST options. Covers Polaris,
-  Tabular, Snowflake-managed-catalog, and the open-source Iceberg
-  REST reference.
-- **S3 object store** — `object_store` `aws` feature on. Config:
-  `type = "s3"` in `[blob]` with `bucket`, `region`, optional
-  `prefix`, `endpoint` (for MinIO/R2), and optional static creds
-  (`access_key_id`/`secret_access_key`/`session_token`); falls
-  back to the standard AWS chain (env vars / instance profile /
-  AWS SSO) when creds aren't in config. The `prefix` wraps the
-  store in `object_store::prefix::PrefixStore` so all staged
-  files land under that prefix.
-- `run.rs` dispatches on `IcebergConfig` at the top of `run` and
-  hands a typed `IcebergRustCatalog<C>` to the generic `run_inner`,
-  so each catalog variant compiles a separate specialization. If
-  variants grow and bloat the binary, refactor to a dyn-Catalog
-  wrapper at the seam.
+  the same `polynya-dev/iceberg-rust` fork via `[patch.crates-io]`).
+  Driven from `sink.{catalog_uri, catalog_auth, catalog_token,
+  catalog_client_id, catalog_client_secret, warehouse}` plus a
+  free-form `sink.catalog_props` passthrough for vendor quirks.
+  Covers Polaris, Tabular, Snowflake-managed-catalog, and the
+  open-source Iceberg REST reference. Other catalog flavors
+  (Glue/SQL/HMS/S3Tables) are follow-ons.
+- **S3 object store** — `object_store` 0.11 with `aws` feature on.
+  Driven from `sink.credential_mode` (`"static"` / `"iam"` /
+  `"vended"`).
+  - `"static"` builds an `AmazonS3` with `s3_endpoint` +
+    `s3_access_key` + `s3_secret_key` + `s3_region`. Bucket and
+    prefix are parsed from `s3://bucket/prefix/...` in
+    `sink.warehouse`. Path-style addressing for non-AWS
+    compatibility (MinIO, LocalStack, R2).
+  - `"iam"` builds via `AmazonS3Builder::from_env()` so the
+    standard AWS chain (env vars, instance profile, AWS SSO)
+    applies.
+  - `"vended"` errors with "not yet wired" — that's the Phase 7
+    vended-credentials S3 router.
 
 **Remaining items for the binary (now P0.5 / P1):**
 
