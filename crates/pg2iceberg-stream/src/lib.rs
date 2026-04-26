@@ -15,7 +15,7 @@ pub mod codec;
 pub mod prod;
 pub mod rolling;
 
-pub use blob::BlobStore;
+pub use blob::{BlobInfo, BlobStore};
 pub use prod::ObjectStoreBlobStore;
 
 #[derive(Clone, Debug, Error)]

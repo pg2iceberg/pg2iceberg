@@ -2570,6 +2570,7 @@ dependencies = [
  "arrow-schema 54.3.1",
  "async-trait",
  "bytes",
+ "futures",
  "object_store",
  "parquet 54.3.1",
  "pg2iceberg-core",

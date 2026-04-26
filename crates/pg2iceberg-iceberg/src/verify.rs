@@ -194,6 +194,29 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| pg2iceberg_stream::StreamError::Io(format!("missing: {path}")))
         }
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<pg2iceberg_stream::BlobInfo>, pg2iceberg_stream::StreamError>
+        {
+            let lock = self.inner.lock().unwrap();
+            Ok(lock
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| pg2iceberg_stream::BlobInfo {
+                    path: k.clone(),
+                    size: v.len() as u64,
+                    last_modified_ms: 0,
+                })
+                .collect())
+        }
+        async fn delete(
+            &self,
+            path: &str,
+        ) -> std::result::Result<(), pg2iceberg_stream::StreamError> {
+            self.inner.lock().unwrap().remove(path);
+            Ok(())
+        }
     }
 
     fn ident() -> TableIdent {

@@ -5,9 +5,10 @@
 //! for tests, etc.) and wraps it in `ObjectStoreBlobStore`. Everything
 //! downstream stays trait-bound.
 
-use crate::{BlobStore, Result, StreamError};
+use crate::{BlobInfo, BlobStore, Result, StreamError};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::StreamExt;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use std::sync::Arc;
@@ -56,6 +57,39 @@ impl BlobStore for ObjectStoreBlobStore {
             .await
             .map_err(|e| StreamError::Io(format!("object_store get bytes {path:?}: {e}")))?;
         Ok(bytes)
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<BlobInfo>> {
+        let prefix_path = if prefix.is_empty() {
+            None
+        } else {
+            Some(parse_path(prefix.trim_end_matches('/'))?)
+        };
+        let mut stream = self.inner.list(prefix_path.as_ref());
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta =
+                item.map_err(|e| StreamError::Io(format!("object_store list {prefix:?}: {e}")))?;
+            out.push(BlobInfo {
+                path: meta.location.to_string(),
+                size: meta.size as u64,
+                last_modified_ms: meta.last_modified.timestamp_millis(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        let p = parse_path(path)?;
+        match self.inner.delete(&p).await {
+            Ok(()) => Ok(()),
+            // Phantom delete (path doesn't exist) is a no-op per the
+            // BlobStore contract.
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(StreamError::Io(format!(
+                "object_store delete {path:?}: {e}"
+            ))),
+        }
     }
 }
 

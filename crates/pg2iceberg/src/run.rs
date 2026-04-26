@@ -463,36 +463,82 @@ pub async fn run_compact(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// One-shot: run snapshot expiry over every configured table, log
-/// counts, exit. Mirrors Go's `pg2iceberg maintain`. CLI `--retention`
-/// (e.g. `168h`) overrides `sink.maintenance_retention`. Errors if
-/// neither is set.
+/// One-shot: run maintenance over every configured table — snapshot
+/// expiry first, then orphan-file cleanup — and exit. Mirrors Go's
+/// `pg2iceberg maintain` (which does both phases in sequence).
+///
+/// Either retention or grace is required; the other is treated as a
+/// no-op for that phase if blank.
+///
+/// CLI `--retention` (e.g. `168h`) overrides
+/// `sink.maintenance_retention`. Cleanup grace and the materialized
+/// prefix come from `sink.maintenance_grace` /
+/// `sink.materialized_prefix`.
 pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Result<()> {
     let retention_str = retention_override
         .clone()
         .unwrap_or_else(|| cfg.sink.maintenance_retention.clone());
-    if retention_str.is_empty() {
+    let grace_str = cfg.sink.maintenance_grace.clone();
+    if retention_str.is_empty() && grace_str.is_empty() {
         anyhow::bail!(
-            "no retention configured: set `sink.maintenance_retention` in YAML \
-             or pass `--retention 168h`"
+            "no maintenance work configured: set at least one of \
+             `sink.maintenance_retention`, `sink.maintenance_grace`, or \
+             pass `--retention 168h`"
         );
     }
-    let dur = humantime::parse_duration(&retention_str)
-        .with_context(|| format!("parse retention `{retention_str}`"))?;
-    let retention_ms: i64 = dur.as_millis().try_into().unwrap_or(i64::MAX);
 
-    let mut materializer = build_one_shot_materializer(cfg).await?;
-    let outcomes = materializer
-        .expire_cycle(retention_ms)
-        .await
-        .context("expire_cycle")?;
-    if outcomes.is_empty() {
-        tracing::info!(retention = %retention_str, "maintain: no snapshots to expire");
-    } else {
-        for (ident, n) in &outcomes {
-            tracing::info!(table = %ident, expired = n, "expired snapshots");
+    let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+
+    // Phase 1: snapshot expiry.
+    if !retention_str.is_empty() {
+        let dur = humantime::parse_duration(&retention_str)
+            .with_context(|| format!("parse retention `{retention_str}`"))?;
+        let retention_ms: i64 = dur.as_millis().try_into().unwrap_or(i64::MAX);
+        let outcomes = materializer
+            .expire_cycle(retention_ms)
+            .await
+            .context("expire_cycle")?;
+        if outcomes.is_empty() {
+            tracing::info!(retention = %retention_str, "maintain: no snapshots to expire");
+        } else {
+            for (ident, n) in &outcomes {
+                tracing::info!(table = %ident, expired = n, "expired snapshots");
+            }
         }
     }
+
+    // Phase 2: orphan-file cleanup.
+    if !grace_str.is_empty() {
+        let dur = humantime::parse_duration(&grace_str)
+            .with_context(|| format!("parse maintenance_grace `{grace_str}`"))?;
+        let grace_ms: i64 = dur.as_millis().try_into().unwrap_or(i64::MAX);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().try_into().unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX);
+        let outcomes = materializer
+            .cleanup_orphans_cycle(&cfg.sink.materialized_prefix, now_ms, grace_ms)
+            .await
+            .context("cleanup_orphans_cycle")?;
+        if outcomes.is_empty() {
+            tracing::info!(
+                grace = %grace_str,
+                prefix = %cfg.sink.materialized_prefix,
+                "maintain: no orphan files found"
+            );
+        } else {
+            for (ident, o) in &outcomes {
+                tracing::info!(
+                    table = %ident,
+                    deleted = o.deleted,
+                    bytes_freed = o.bytes_freed,
+                    grace_protected = o.grace_protected,
+                    "cleanup orphans"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

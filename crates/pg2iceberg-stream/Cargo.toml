@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# Stream extensions for `object_store::list`, used by the orphan-cleanup
+# path. Pure futures, no executor dep.
+futures = "0.3"
 pg2iceberg-core.workspace = true
 serde.workspace = true
 serde_json = "1"

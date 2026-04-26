@@ -52,6 +52,8 @@ pub enum MaterializerError {
     UnknownTable(TableIdent),
     #[error("compaction: {0}")]
     Compact(String),
+    #[error("orphan cleanup: {0}")]
+    Cleanup(String),
 }
 
 pub type Result<T> = std::result::Result<T, MaterializerError>;
@@ -216,6 +218,48 @@ impl<C: Catalog> Materializer<C> {
         let mut out = Vec::new();
         for ident in idents {
             if let Some(outcome) = self.compact_table(&ident, config).await? {
+                out.push((ident, outcome));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Run an orphan-file-cleanup pass over every registered table.
+    /// Returns `(ident, outcome)` for tables where at least one orphan
+    /// was deleted or grace-protected.
+    ///
+    /// `prefix` is the materializer's data-blob root (e.g. "materialized/").
+    /// Each table's blobs land under `{prefix}{table_name}/`; we list
+    /// per-table to avoid scanning the entire prefix on every cycle.
+    /// `now_ms` is the current wall-clock time (or test clock); orphans
+    /// younger than `now_ms - grace_period_ms` are protected.
+    pub async fn cleanup_orphans_cycle(
+        &self,
+        prefix: &str,
+        now_ms: i64,
+        grace_period_ms: i64,
+    ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CleanupOutcome)>> {
+        let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
+        let mut out = Vec::new();
+        for ident in idents {
+            let table_prefix = format!(
+                "{}{}/",
+                prefix.trim_end_matches('/').to_string() + "/",
+                ident.name
+            );
+            // The leading `prefix.trim_end_matches('/').to_string() + "/"`
+            // normalizes any trailing slash so `format!` doesn't double-up.
+            let outcome = pg2iceberg_iceberg::cleanup_orphans(
+                self.catalog.as_ref(),
+                self.blob_store.as_ref(),
+                &ident,
+                &table_prefix,
+                now_ms,
+                grace_period_ms,
+            )
+            .await
+            .map_err(|e| MaterializerError::Cleanup(e.to_string()))?;
+            if outcome.deleted > 0 || outcome.grace_protected > 0 {
                 out.push((ident, outcome));
             }
         }

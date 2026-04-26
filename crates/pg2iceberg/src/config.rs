@@ -245,6 +245,20 @@ pub struct SinkConfig {
     #[serde(default)]
     pub maintenance_retention: String,
 
+    /// Grace period for orphan-file cleanup (e.g. `"30m"`). Files
+    /// younger than this are protected from deletion even if
+    /// unreferenced — it gives in-flight commits a window before
+    /// cleanup races them. Default `30m` matches Go.
+    #[serde(default = "default_maintenance_grace")]
+    pub maintenance_grace: String,
+
+    /// Blob-store prefix where the materializer writes data files.
+    /// Orphan cleanup operates only under this prefix. Should match
+    /// the path scheme `CounterMaterializerNamer` produces in
+    /// `run.rs`. Default `materialized/` mirrors what the binary uses.
+    #[serde(default = "default_materialized_prefix")]
+    pub materialized_prefix: String,
+
     /// Free-form REST-catalog props passthrough. Not in the Go YAML
     /// shape but useful for vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
@@ -273,6 +287,8 @@ impl Default for SinkConfig {
             compaction_delete_files: default_compaction_delete_files(),
             target_file_size: default_target_file_size(),
             maintenance_retention: String::new(),
+            maintenance_grace: default_maintenance_grace(),
+            materialized_prefix: default_materialized_prefix(),
             catalog_props: BTreeMap::new(),
         }
     }
@@ -327,6 +343,14 @@ fn default_compaction_delete_files() -> usize {
 
 fn default_target_file_size() -> u64 {
     128 * 1024 * 1024
+}
+
+fn default_maintenance_grace() -> String {
+    "30m".into()
+}
+
+fn default_materialized_prefix() -> String {
+    "materialized/".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]

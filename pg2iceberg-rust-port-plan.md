@@ -620,14 +620,96 @@ warning is logged and replication keeps progressing. Set
   snapshot or none of it. Tested via the `RewriteFilesAction`
   fork-side tests.
 
-**Maintenance items still deferred:**
+#### Phase 14 status — maintenance ops wired (snapshot expiry + orphan cleanup)
 
-- Snapshot expiry / orphan-file cleanup (`iceberg/maintain.go`).
+Maintenance covers two ops beyond compaction. Both run via `pg2iceberg
+maintain` (one-shot subcommand, mirrors Go), with operators triggering
+on their own cadence (cron, k8s CronJob, etc.). Each phase is
+independently gated by its YAML field — empty knob = phase no-ops.
+
+**Snapshot expiry:**
+
+- `Catalog::expire_snapshots(ident, retention_ms)` trait method.
+  Drops snapshots older than `now - retention`, never touches the
+  current snapshot (Iceberg invariant).
+- Sim (`MemoryCatalog`) filters `Vec<Snapshot>` directly using a
+  monotonic `id * 1000` clock surrogate so tests stay deterministic.
+- Prod (`IcebergRustCatalog`) walks `metadata.snapshots()`,
+  computes the to-remove set against the latest snapshot's
+  `timestamp_ms()`, and applies via an inline `ExpireSnapshotsAction`
+  emitting `TableUpdate::RemoveSnapshots`. No new fork patch — the
+  `TableUpdate` enum and `ActionCommit::new` are already public.
+- `Snapshot.timestamp_ms` field added to our shape so the sim and
+  prod paths report a consistent age signal.
+- `Materializer::expire_cycle(retention_ms)` iterates registered
+  tables.
+
+**Orphan-file cleanup:**
+
+- `BlobStore` extended with `list(prefix) -> Vec<BlobInfo>` and
+  `delete(path)`. `BlobInfo { path, size, last_modified_ms }`
+  normalizes per-backend last-modified to ms-since-epoch.
+- `MemoryBlobStore` (sim) tracks `last_modified_ms` per put via an
+  atomic counter (`set_clock_ms` for tests). `ObjectStoreBlobStore`
+  (prod) uses `object_store::list` + `delete`. Phantom-deletes on
+  missing paths are no-ops (compaction races).
+- `cleanup_orphans(catalog, blob_store, ident, prefix, now_ms,
+  grace_period_ms)` in `pg2iceberg-iceberg/src/orphan.rs`. Lists
+  blobs under `prefix`, builds the referenced set from snapshot
+  history (excluding `removed_paths`), deletes paths older than
+  `now_ms - grace_period_ms`. Returns
+  `CleanupOutcome { deleted, bytes_freed, grace_protected }`.
+- Scope deliberately limited to data + delete files under the
+  materializer's prefix. Metadata-side files (manifest lists,
+  manifests, metadata.json) live under iceberg's separate table
+  location and are managed by iceberg-rust itself.
+- `Materializer::cleanup_orphans_cycle(prefix, now_ms,
+  grace_period_ms)` per-table walk.
+
+**`pg2iceberg maintain`** (one-shot subcommand) runs both phases in
+sequence: expiry first, then orphan cleanup. Either phase no-ops if
+its knob is blank. CLI `--retention 168h` overrides
+`sink.maintenance_retention`.
+
+**`pg2iceberg compact`** (one-shot subcommand) runs a single
+compaction pass and exits.
+
+**YAML alignment with Go (all under `sink:`):**
+- `maintenance_retention: 168h` — drop snapshots older than this.
+- `maintenance_grace: 30m` — orphan-file grace window.
+- `materialized_prefix: materialized/` — Rust-port-specific. Go
+  reads files under iceberg's `table.location`; we use a separate
+  configurable prefix because the materializer's `MaterializerNamer`
+  writes outside iceberg's metadata-side location. Operators must
+  set both consistently with what `CounterMaterializerNamer` (or
+  whichever namer they pick) produces in `run.rs`.
+
+**Sim semantics gap (documented):** the sim's `Snapshot.data_files` is
+"files added in this snapshot" rather than "all live files," so
+expiring an old snapshot drops its added files from the verifier's
+view. Real iceberg's manifest lists carry forward live files into
+every snapshot, so the prod path preserves visibility correctly. Tests
+against the sim don't assert post-expiry row visibility; the
+prod-side test against `IcebergRustCatalog` does.
+
+**Test counts (Phase D + E + F):**
+- Compaction comprehensive: 4 e2e (multi-table, stress with deletes,
+  partitioned-with-deletes, repeated cycles).
+- Snapshot expiry: 5 sim e2e + 2 prod-feature against
+  `IcebergRustCatalog` + `RewriteFilesAction` round-trip.
+- Orphan cleanup: 3 unit + 5 BlobStore + 6 e2e (grace protection,
+  reference preservation, prefix scoping, compaction-replaced files,
+  no-op).
+
+**Items still deferred:**
 - Concurrency: parallel parquet reads during compaction. Tokio's
   `JoinSet` is the analog; not worth doing for compactions ≤ 10
   files.
-- A separate `pg2iceberg compact` CLI subcommand for one-shot
-  out-of-band compactions.
+- Multi-table parallelism in `compact_cycle`/`expire_cycle`/`cleanup_orphans_cycle`
+  (currently sequential per ident).
+- Metadata-side orphan cleanup (manifest lists, manifests,
+  metadata.json under iceberg's table location). iceberg-rust
+  manages these; if they leak, that's an upstream bug.
 
 ---
 
