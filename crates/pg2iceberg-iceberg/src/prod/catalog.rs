@@ -55,6 +55,14 @@ impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
     }
 }
 
+impl<C: IcebergCatalogTrait> Clone for IcebergRustCatalog<C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<C: IcebergCatalogTrait> std::fmt::Debug for IcebergRustCatalog<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergRustCatalog").finish()
@@ -795,6 +803,17 @@ fn partition_literal_to_iceberg(lit: &PartitionLiteral) -> Option<Literal> {
 
 fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Result<TableMetadata> {
     let part_spec = table.metadata().default_partition_spec();
+    // `Table::properties()` is the polynya-patches addition that
+    // surfaces the REST `loadTable` response config (vended creds,
+    // table-scoped storage props). Empty for non-REST catalogs and
+    // for catalogs that don't return per-table config — callers
+    // distinguish "no creds vended" from "creds present" by checking
+    // whether `s3.access-key-id` is in the map.
+    let config: BTreeMap<String, String> = table
+        .properties()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     Ok(TableMetadata {
         ident: ident.clone(),
         schema: from_iceberg_schema(ident, table.metadata().current_schema(), part_spec.as_ref())?,
@@ -805,10 +824,7 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
             .metadata()
             .current_snapshot()
             .map(|s| s.sequence_number()),
-        // `iceberg-rust` does not yet vend per-table credential config back
-        // through the Catalog trait surface; populate empty for now. The
-        // vended-credentials S3 router runs separately for now.
-        config: BTreeMap::new(),
+        config,
     })
 }
 

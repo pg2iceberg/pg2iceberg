@@ -35,6 +35,27 @@ impl MemoryCatalog {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Test hook: stamp a config map onto a table's metadata. The
+    /// vended-credentials router consumes
+    /// [`TableMetadata::config`] to extract S3 creds, but
+    /// `commit_snapshot` doesn't write to that map (it only mutates
+    /// `current_snapshot_id`). Tests that exercise the router path
+    /// use this to plant fake creds without standing up a real
+    /// REST catalog. Overwrites any existing config.
+    pub fn set_table_config(
+        &self,
+        ident: &TableIdent,
+        config: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
+        table.metadata.config = config;
+        Ok(())
+    }
 }
 
 #[async_trait]

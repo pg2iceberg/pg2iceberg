@@ -467,6 +467,19 @@ impl Config {
             }
             _ => {}
         }
+        // Vended-credentials mode requires the
+        // `X-Iceberg-Access-Delegation: vended-credentials` header on
+        // every catalog request. iceberg-rust's REST client already
+        // forwards `header.<name>: <value>` props through to outgoing
+        // requests, so we set it here when credential_mode=vended.
+        // Operators can override via explicit `catalog_props` if they
+        // need a different delegation type (e.g. `remote-signing`).
+        if self.sink.credential_mode == "vended" {
+            props.insert(
+                "header.x-iceberg-access-delegation".into(),
+                "vended-credentials".into(),
+            );
+        }
         // S3 props for iceberg-rust's StorageFactory. Only set
         // credentials when credential_mode=static — for `iam` we let
         // OpenDAL pick them up from env/IMDS/EC2 metadata. Endpoint
@@ -735,6 +748,47 @@ sink:
         assert_eq!(
             props.get("warehouse").map(String::as_str),
             Some("s3://warehouse/"),
+        );
+    }
+
+    #[test]
+    fn rest_catalog_props_sets_access_delegation_header_in_vended_mode() {
+        // Polaris/Tabular/Snowflake only return per-table vended creds
+        // when the request carries this header. Without it, the
+        // catalog returns metadata-only and the vended router would
+        // see empty `s3.access-key-id` props.
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+tables: []
+source:
+  postgres:
+    host: h
+    database: d
+    user: u
+sink:
+  catalog_uri: http://polaris
+  namespace: ns
+  warehouse: s3://wh/
+  credential_mode: vended
+"#,
+        )
+        .unwrap();
+        let props = cfg.rest_catalog_props();
+        assert_eq!(
+            props.get("header.x-iceberg-access-delegation").map(String::as_str),
+            Some("vended-credentials"),
+            "vended mode must set the access-delegation header"
+        );
+    }
+
+    #[test]
+    fn rest_catalog_props_omits_access_delegation_header_in_static_mode() {
+        let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        // SAMPLE uses credential_mode=static.
+        let props = cfg.rest_catalog_props();
+        assert!(
+            props.get("header.x-iceberg-access-delegation").is_none(),
+            "static mode must not request vended creds"
         );
     }
 

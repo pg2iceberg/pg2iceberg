@@ -64,12 +64,14 @@ impl<I: IdGen + 'static> BlobNamer for UuidBlobNamer<I> {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let blob = build_blob(&cfg).context("build blob store")?;
     if cfg.sink.catalog_uri.is_empty() {
         anyhow::bail!("sink.catalog_uri is required");
     }
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
+    let blob = build_blob_for_run(&cfg, &catalog)
+        .await
+        .context("build blob store")?;
     match cfg.source.mode.as_str() {
         "" | "logical" => run_inner(cfg, catalog, blob).await,
         "query" => run_query(cfg, catalog, blob).await,
@@ -111,13 +113,66 @@ fn build_blob(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
         "static" => build_s3_static(cfg),
         "iam" => build_s3_iam(cfg),
         "vended" => Err(anyhow::anyhow!(
-            "credential_mode=vended is not yet wired in the Rust port; \
-             see plan §Phase 7 vended-credentials S3 router"
+            "credential_mode=vended requires async catalog access — call \
+             build_blob_for_run instead. (Static/iam paths are sync because \
+             they don't need the catalog.)"
         )),
         other => Err(anyhow::anyhow!(
             "unknown credential_mode {other:?}; expected one of: static, vended, iam"
         )),
     }
+}
+
+/// Async blob-store builder used by [`run`] (logical + query modes).
+/// Routes to [`build_blob`] for `static` / `iam` modes, and to the
+/// vended-credentials path for `vended`. The latter requires the
+/// catalog because it has to load each registered table to obtain
+/// per-table S3 credentials.
+async fn build_blob_for_run<C>(
+    cfg: &Config,
+    catalog: &IcebergRustCatalog<C>,
+) -> Result<Arc<dyn BlobStore>>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
+    if cfg.sink.credential_mode != "vended" {
+        return build_blob(cfg);
+    }
+    use pg2iceberg_iceberg::prod::{VendedBlobStoreRouter, VendedRouterConfig};
+    use pg2iceberg_iceberg::Catalog;
+
+    // Resolve table idents from YAML — we need each table's
+    // namespace/name to call `load_table` and extract per-table
+    // creds. Discovery isn't required at this level; only the
+    // operator-supplied identity matters.
+    let mut idents: Vec<pg2iceberg_core::TableIdent> = Vec::with_capacity(cfg.tables.len());
+    for t in &cfg.tables {
+        let (ns, name) = t.qualified()?;
+        idents.push(pg2iceberg_core::TableIdent {
+            namespace: pg2iceberg_core::Namespace(vec![ns]),
+            name,
+        });
+    }
+    if idents.is_empty() {
+        anyhow::bail!(
+            "credential_mode=vended requires at least one configured table; \
+             tables: [] in YAML"
+        );
+    }
+
+    let mut router_cfg = VendedRouterConfig::default();
+    if !cfg.sink.s3_region.is_empty() {
+        router_cfg.default_region = cfg.sink.s3_region.clone();
+    }
+    let arc_catalog: Arc<dyn Catalog> = Arc::new(catalog.clone());
+    let router = VendedBlobStoreRouter::build(arc_catalog, &idents, router_cfg)
+        .await
+        .context("build vended-credentials S3 router")?;
+    tracing::info!(
+        tables = idents.len(),
+        "vended-credentials S3 router built (per-table object stores)"
+    );
+    Ok(Arc::new(router))
 }
 
 fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {

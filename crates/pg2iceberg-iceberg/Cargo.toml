@@ -25,12 +25,24 @@ thiserror.workspace = true
 # iceberg-rust prod-impl wrap. Heavy transitive deps (reqwest, opendal,
 # arrow) but most of those are already in our graph from parquet.
 iceberg = { version = "0.9", optional = true }
+# Used by the vended-credentials S3 router (`prod::vended`) to construct
+# per-table object stores from catalog-vended creds.
+object_store = { version = "0.11", optional = true, default-features = false, features = ["aws"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["sync"] }
+tracing = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
 
 [features]
 default = []
 # Enables the prod-impl module that wraps iceberg-rust. Off by default so
 # sim-only consumers don't pull the heavier dep graph (reqwest, opendal).
-prod = ["dep:iceberg"]
+prod = [
+    "dep:iceberg",
+    "dep:object_store",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:futures",
+]
 
 [dev-dependencies]
 pollster = "0.4"
