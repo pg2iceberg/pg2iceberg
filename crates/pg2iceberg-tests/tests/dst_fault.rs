@@ -801,6 +801,8 @@ fn binary_watcher_tick_returns_violation_when_pipeline_ahead_of_slot() {
         /* slot_confirmed_flush_lsn */ pg2iceberg_core::Lsn(100),
         /* slot_wal_status */ None,
         /* slot_safe_wal_size */ None,
+        /* slot_restart_lsn */ pg2iceberg_core::Lsn::ZERO,
+        /* slot_conflicting */ false,
         /* slot_name */ "test-slot",
         "default",
         &[ident()],

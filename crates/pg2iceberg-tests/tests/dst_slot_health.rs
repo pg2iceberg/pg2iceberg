@@ -205,6 +205,8 @@ fn unreserved_slot_does_not_fail_startup_but_emits_watcher_warning() {
         health.confirmed_flush_lsn,
         health.wal_status,
         health.safe_wal_size,
+        health.restart_lsn,
+        health.conflicting,
         SLOT,
         "default",
         &[],
@@ -260,6 +262,8 @@ fn reserved_slot_passes_both_startup_and_watcher() {
         health.confirmed_flush_lsn,
         health.wal_status,
         health.safe_wal_size,
+        health.restart_lsn,
+        health.conflicting,
         SLOT,
         "default",
         &[],
@@ -270,5 +274,143 @@ fn reserved_slot_passes_both_startup_and_watcher() {
             .any(|v| matches!(v, InvariantViolation::SlotWalUnreserved { .. })),
         "Reserved slot must NOT trip SlotWalUnreserved; got {:?}",
         violations
+    );
+}
+
+/// Tiny helper: build a watcher + clock + coord triple shared by the
+/// mid-run watcher tests below.
+fn fresh_watcher() -> InvariantWatcher {
+    let clock = TestClock::at(0);
+    let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock);
+    let coord = Arc::new(MemoryCoordinator::new(
+        pg2iceberg_coord::schema::CoordSchema::default_name(),
+        arc_clock,
+    ));
+    let metrics: Arc<dyn pg2iceberg_core::Metrics> =
+        Arc::new(pg2iceberg_core::InMemoryMetrics::new());
+    InvariantWatcher::new(
+        coord as Arc<dyn pg2iceberg_coord::Coordinator>,
+        metrics,
+    )
+}
+
+#[test]
+fn lost_slot_emits_fatal_watcher_violation_during_runtime() {
+    // Mid-run scenario: slot transitions Reserved → Unreserved → Lost
+    // while the pipeline is still running. The watcher's per-tick
+    // probe must surface `SlotWalLost` so the main loop bounces with
+    // the actionable `LifecycleError::SlotHealth` instead of waiting
+    // for the next `recv()` to return a confusing protocol error.
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    db.create_publication(PUB, &[ident()]).unwrap();
+    db.create_slot(SLOT, PUB).unwrap();
+    db.set_slot_wal_status(SLOT, SimWalStatus::Lost).unwrap();
+
+    let pg: Arc<dyn pg2iceberg_pg::SlotMonitor> = Arc::new(SimPgClient::new(db.clone()));
+    let health = block_on(pg.slot_health_for_watcher(SLOT))
+        .unwrap()
+        .expect("slot exists");
+
+    let watcher = fresh_watcher();
+    let violations = block_on(run_watcher_tick(
+        &watcher,
+        Lsn(100),
+        health.confirmed_flush_lsn,
+        health.wal_status,
+        health.safe_wal_size,
+        health.restart_lsn,
+        health.conflicting,
+        SLOT,
+        "default",
+        &[],
+    ));
+
+    let lost = violations
+        .iter()
+        .find(|v| matches!(v, InvariantViolation::SlotWalLost { .. }))
+        .expect("expected SlotWalLost in violations");
+    assert!(
+        lost.is_fatal(),
+        "SlotWalLost must classify as fatal so the main loop bounces"
+    );
+}
+
+#[test]
+fn conflicting_slot_emits_fatal_watcher_violation_during_runtime() {
+    // Same shape as the lost test: `conflicting=true` mid-run is
+    // unrecoverable and the watcher must surface a fatal violation.
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    db.create_publication(PUB, &[ident()]).unwrap();
+    db.create_slot(SLOT, PUB).unwrap();
+    db.set_slot_conflicting(SLOT, true).unwrap();
+
+    let pg: Arc<dyn pg2iceberg_pg::SlotMonitor> = Arc::new(SimPgClient::new(db.clone()));
+    let health = block_on(pg.slot_health_for_watcher(SLOT))
+        .unwrap()
+        .expect("slot exists");
+
+    let watcher = fresh_watcher();
+    let violations = block_on(run_watcher_tick(
+        &watcher,
+        Lsn(100),
+        health.confirmed_flush_lsn,
+        health.wal_status,
+        health.safe_wal_size,
+        health.restart_lsn,
+        health.conflicting,
+        SLOT,
+        "default",
+        &[],
+    ));
+
+    let conflicting = violations
+        .iter()
+        .find(|v| matches!(v, InvariantViolation::SlotConflicting { .. }))
+        .expect("expected SlotConflicting in violations");
+    assert!(
+        conflicting.is_fatal(),
+        "SlotConflicting must classify as fatal"
+    );
+}
+
+#[test]
+fn unreserved_violation_is_not_fatal() {
+    // Locks the policy: `Unreserved` is a warning, not a hard fail.
+    // The main loop keeps running so the operator has time to fix
+    // consumer lag before WAL is recycled.
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    db.create_publication(PUB, &[ident()]).unwrap();
+    db.create_slot(SLOT, PUB).unwrap();
+    db.set_slot_wal_status(SLOT, SimWalStatus::Unreserved).unwrap();
+
+    let pg: Arc<dyn pg2iceberg_pg::SlotMonitor> = Arc::new(SimPgClient::new(db.clone()));
+    let health = block_on(pg.slot_health_for_watcher(SLOT))
+        .unwrap()
+        .expect("slot exists");
+
+    let watcher = fresh_watcher();
+    let violations = block_on(run_watcher_tick(
+        &watcher,
+        Lsn(100),
+        health.confirmed_flush_lsn,
+        health.wal_status,
+        health.safe_wal_size,
+        health.restart_lsn,
+        health.conflicting,
+        SLOT,
+        "default",
+        &[],
+    ));
+
+    let unreserved = violations
+        .iter()
+        .find(|v| matches!(v, InvariantViolation::SlotWalUnreserved { .. }))
+        .expect("expected SlotWalUnreserved in violations");
+    assert!(
+        !unreserved.is_fatal(),
+        "SlotWalUnreserved must remain non-fatal"
     );
 }

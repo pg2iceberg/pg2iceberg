@@ -67,6 +67,47 @@ pub enum InvariantViolation {
         slot_name: String,
         safe_wal_size: Option<i64>,
     },
+
+    /// Slot transitioned to `wal_status = lost` mid-run. Unrecoverable.
+    /// The main loop classifies this as fatal via [`is_fatal`] and
+    /// returns `LifecycleError::SlotHealth` rather than wait for the
+    /// next `recv()` to return a confusing protocol error.
+    #[error(
+        "invariant 5: replication slot {slot_name:?} transitioned to `lost` \
+         (restart_lsn={restart_lsn}); WAL has been recycled and the slot \
+         cannot be resumed. drop the slot and the Iceberg tables, then \
+         re-snapshot from scratch — there is no safe way to skip ahead"
+    )]
+    SlotWalLost {
+        slot_name: String,
+        restart_lsn: Lsn,
+    },
+
+    /// Slot's `conflicting` flipped to `true` mid-run. Same fatal
+    /// classification as `SlotWalLost` — the slot is killed by a
+    /// physical-replication conflict and can't be resumed.
+    #[error(
+        "invariant 6: replication slot {slot_name:?} is conflicting (killed \
+         by physical-replication conflict during recovery); the slot cannot \
+         be resumed safely. drop the slot and the Iceberg tables, then \
+         re-snapshot from scratch"
+    )]
+    SlotConflicting { slot_name: String },
+}
+
+impl InvariantViolation {
+    /// `true` for violations the main loop should treat as fatal —
+    /// i.e. propagate as [`LifecycleError::SlotHealth`] rather than
+    /// log-and-continue. Currently: `SlotWalLost` and
+    /// `SlotConflicting` (both signal an unrecoverable upstream
+    /// state). The other variants are healthy-pipeline alerts that
+    /// don't warrant tearing the loop down.
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            InvariantViolation::SlotWalLost { .. } | InvariantViolation::SlotConflicting { .. }
+        )
+    }
 }
 
 /// Snapshot of state the watcher needs from one tick. The binary populates
@@ -91,8 +132,15 @@ pub struct WatcherInputs {
     /// crosses into `unreserved`. Surfaced verbatim in the warning
     /// for operator triage; no invariant logic uses it directly.
     pub slot_safe_wal_size: Option<i64>,
-    /// Slot name — purely for the warning message body.
+    /// Slot name — surfaced in warning/fatal message bodies.
     pub slot_name: String,
+    /// Slot's `restart_lsn`, surfaced in the `SlotWalLost` fatal
+    /// message so the operator can correlate against PG's WAL
+    /// retention.
+    pub slot_restart_lsn: Lsn,
+    /// Slot's `conflicting` flag (PG 14+). `true` triggers the
+    /// `SlotConflicting` fatal violation.
+    pub slot_conflicting: bool,
 }
 
 pub struct InvariantWatcher {
@@ -165,17 +213,30 @@ impl InvariantWatcher {
         self.last_flushed_lsn.store(current, Ordering::SeqCst);
 
         // 4. Slot wal_status == Unreserved → warn (last chance before lost).
-        //    `Lost` is fatal and caught by startup validation; mid-run
-        //    transitions to `Lost` would also surface here on the next
-        //    tick — same pattern, but the lifecycle would have already
-        //    bounced on a `START_REPLICATION` error.
-        if matches!(
-            inputs.slot_wal_status,
-            Some(pg2iceberg_pg::WalStatus::Unreserved)
-        ) {
-            violations.push(InvariantViolation::SlotWalUnreserved {
+        //    `Lost` is invariant 5 below; surfacing it from the watcher
+        //    means the lifecycle bounces with the actionable
+        //    `SlotHealth` error rather than waiting for the next
+        //    `recv()` to return a confusing protocol-level message.
+        match inputs.slot_wal_status {
+            Some(pg2iceberg_pg::WalStatus::Unreserved) => {
+                violations.push(InvariantViolation::SlotWalUnreserved {
+                    slot_name: inputs.slot_name.clone(),
+                    safe_wal_size: inputs.slot_safe_wal_size,
+                });
+            }
+            Some(pg2iceberg_pg::WalStatus::Lost) => {
+                violations.push(InvariantViolation::SlotWalLost {
+                    slot_name: inputs.slot_name.clone(),
+                    restart_lsn: inputs.slot_restart_lsn,
+                });
+            }
+            _ => {}
+        }
+
+        // 6. Slot conflicting → fatal. Same reasoning as `Lost`.
+        if inputs.slot_conflicting {
+            violations.push(InvariantViolation::SlotConflicting {
                 slot_name: inputs.slot_name.clone(),
-                safe_wal_size: inputs.slot_safe_wal_size,
             });
         }
 
@@ -187,6 +248,8 @@ impl InvariantWatcher {
                 InvariantViolation::CursorAheadOfLogIndex { .. } => "cursor_ahead_of_log_index",
                 InvariantViolation::FlushedLsnRegressed { .. } => "flushed_lsn_regressed",
                 InvariantViolation::SlotWalUnreserved { .. } => "slot_wal_unreserved",
+                InvariantViolation::SlotWalLost { .. } => "slot_wal_lost",
+                InvariantViolation::SlotConflicting { .. } => "slot_conflicting",
             };
             labels.insert("invariant".into(), invariant_id.into());
             self.metrics

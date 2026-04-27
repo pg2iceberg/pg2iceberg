@@ -99,6 +99,8 @@ pub async fn run_watcher_tick(
     slot_confirmed_flush_lsn: Lsn,
     slot_wal_status: Option<pg2iceberg_pg::WalStatus>,
     slot_safe_wal_size: Option<i64>,
+    slot_restart_lsn: Lsn,
+    slot_conflicting: bool,
     slot_name: &str,
     group: &str,
     watched_tables: &[TableIdent],
@@ -111,6 +113,8 @@ pub async fn run_watcher_tick(
         slot_wal_status,
         slot_safe_wal_size,
         slot_name: slot_name.to_string(),
+        slot_restart_lsn,
+        slot_conflicting,
     };
     watcher.check(&inputs).await
 }
@@ -139,6 +143,14 @@ pub enum LifecycleError {
     Catalog(String),
     #[error("config: {0}")]
     Config(String),
+    /// Mid-run slot health regression that's unrecoverable from the
+    /// pipeline's perspective. Distinct from `Validation` (startup)
+    /// so operators can tell "I started cleanly but the slot got
+    /// killed under me" from "I refused to start." The watcher
+    /// surfaces this when `wal_status` transitions to `Lost` or
+    /// `conflicting` flips to true; the main loop propagates it.
+    #[error("slot health regressed: {0}")]
+    SlotHealth(String),
 }
 
 /// Type alias for backwards-compat — the previous loop-only error
@@ -663,12 +675,16 @@ where
             }
         }
         Handler::Watcher => {
-            // One combined slot probe per tick covers
-            // confirmed_flush_lsn (invariant 1) + wal_status
-            // (invariant 4: SlotWalUnreserved warning before the
-            // slot transitions to `lost`). Falling back to
-            // `confirmed_flush_lsn`-only if the health probe
-            // errors (transient — same drop-tick policy as before).
+            // One combined slot probe per tick covers every health
+            // field the watcher needs:
+            //   - confirmed_flush_lsn → invariant 1 (PipelineAheadOfSlot)
+            //   - wal_status=Unreserved → invariant 4 (warn-only)
+            //   - wal_status=Lost → invariant 5 (fatal)
+            //   - conflicting=true → invariant 6 (fatal)
+            // Fatal violations break the loop with
+            // `LifecycleError::SlotHealth` so the operator gets the
+            // actionable message instead of a confusing
+            // `recv()` error a few ticks later.
             let health = loop_state
                 .slot_monitor
                 .slot_health_for_watcher(&loop_state.slot_name)
@@ -681,19 +697,30 @@ where
                 .unwrap_or(Lsn::ZERO);
             let wal_status = health.as_ref().and_then(|h| h.wal_status);
             let safe_wal_size = health.as_ref().and_then(|h| h.safe_wal_size);
+            let restart_lsn = health
+                .as_ref()
+                .map(|h| h.restart_lsn)
+                .unwrap_or(Lsn::ZERO);
+            let conflicting = health.as_ref().map(|h| h.conflicting).unwrap_or(false);
             let violations = run_watcher_tick(
                 &loop_state.watcher,
                 loop_state.pipeline.flushed_lsn(),
                 confirmed,
                 wal_status,
                 safe_wal_size,
+                restart_lsn,
+                conflicting,
                 &loop_state.slot_name,
                 &loop_state.group,
                 &loop_state.watched_tables,
             )
             .await;
+            // Log all, then fail fast on the first fatal one.
             for v in &violations {
                 tracing::warn!(violation = %v, "invariant violation");
+            }
+            if let Some(fatal) = violations.iter().find(|v| v.is_fatal()) {
+                return Err(MainLoopError::SlotHealth(fatal.to_string()));
             }
         }
     }
