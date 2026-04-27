@@ -128,6 +128,44 @@ pub enum SchemaChange {
     },
     /// Soft-drop: column is retained as nullable in Iceberg.
     DropColumn { name: String },
+    /// Widen a column's type. Limited to Iceberg-spec-legal promotions:
+    /// `int → long`, `float → double`, and `decimal(P,S) → decimal(P',S)`
+    /// with `P' >= P`. Anything else (narrowing, cross-family conversion)
+    /// is rejected at apply time so we don't silently corrupt downstream
+    /// readers.
+    PromoteColumnType {
+        name: String,
+        new_ty: pg2iceberg_core::IcebergType,
+    },
+}
+
+/// True if `to` is a spec-legal Iceberg promotion of `from`. Reference:
+/// Iceberg spec §"Schema Evolution / Type Promotion". Returns `true`
+/// for the no-op `from == to` case so callers can use this as a
+/// "compatible?" predicate.
+pub fn is_legal_type_promotion(
+    from: pg2iceberg_core::IcebergType,
+    to: pg2iceberg_core::IcebergType,
+) -> bool {
+    use pg2iceberg_core::IcebergType as T;
+    if from == to {
+        return true;
+    }
+    match (from, to) {
+        (T::Int, T::Long) => true,
+        (T::Float, T::Double) => true,
+        (
+            T::Decimal {
+                precision: p1,
+                scale: s1,
+            },
+            T::Decimal {
+                precision: p2,
+                scale: s2,
+            },
+        ) => s1 == s2 && p2 >= p1,
+        _ => false,
+    }
 }
 
 /// Apply [`SchemaChange`] variants in-place to a [`TableSchema`]. Shared
@@ -140,9 +178,14 @@ pub enum SchemaChange {
 /// - `DropColumn` is a soft drop — the column stays in the schema but
 ///   becomes nullable. Preserves read compatibility for older data files
 ///   that still carry the column.
+/// - `PromoteColumnType` widens the column's type in place. Field id and
+///   nullability are preserved (Iceberg requires the field id to stay
+///   stable across promotions so older data files keep resolving). A
+///   non-promotion (e.g. `long → int`) is rejected with `IcebergError::Other`.
 ///
-/// Errors on duplicate adds and drops of unknown columns so the caller
-/// doesn't silently no-op.
+/// Errors on duplicate adds, drops of unknown columns, promotions of
+/// unknown columns, and illegal promotions so the caller doesn't silently
+/// no-op or corrupt the schema.
 pub fn apply_schema_changes(
     schema: &mut pg2iceberg_core::TableSchema,
     changes: &[SchemaChange],
@@ -173,6 +216,26 @@ pub fn apply_schema_changes(
                         IcebergError::NotFound(format!("DropColumn: column {name} not in schema"))
                     })?;
                 col.nullable = true;
+            }
+            SchemaChange::PromoteColumnType { name, new_ty } => {
+                let col = schema
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name == *name)
+                    .ok_or_else(|| {
+                        IcebergError::NotFound(format!(
+                            "PromoteColumnType: column {name} not in schema"
+                        ))
+                    })?;
+                if !is_legal_type_promotion(col.ty, *new_ty) {
+                    return Err(IcebergError::Other(format!(
+                        "PromoteColumnType: {name} {:?} → {:?} is not a legal Iceberg \
+                         promotion (allowed: int→long, float→double, decimal precision \
+                         increase). Refusing to silently truncate or coerce data.",
+                        col.ty, new_ty
+                    )));
+                }
+                col.ty = *new_ty;
             }
         }
     }
@@ -219,4 +282,215 @@ pub trait Catalog: Send + Sync {
     /// reads) and by materializer restart code (FileIndex rebuild). Ordered
     /// by snapshot id ascending.
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>>;
+}
+
+#[cfg(test)]
+mod schema_change_tests {
+    use super::*;
+    use pg2iceberg_core::{ColumnSchema, IcebergType, TableSchema};
+
+    fn schema_with_int_qty() -> TableSchema {
+        TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "t".into(),
+            },
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "qty".into(),
+                    field_id: 2,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+            partition_spec: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn legal_promotions_match_iceberg_spec() {
+        assert!(is_legal_type_promotion(IcebergType::Int, IcebergType::Long));
+        assert!(is_legal_type_promotion(
+            IcebergType::Float,
+            IcebergType::Double
+        ));
+        assert!(is_legal_type_promotion(
+            IcebergType::Decimal {
+                precision: 10,
+                scale: 2
+            },
+            IcebergType::Decimal {
+                precision: 18,
+                scale: 2
+            }
+        ));
+        // Same type is always "compatible" — caller decides whether to
+        // emit a SchemaChange.
+        assert!(is_legal_type_promotion(IcebergType::Int, IcebergType::Int));
+    }
+
+    #[test]
+    fn illegal_promotions_rejected() {
+        // Narrowing
+        assert!(!is_legal_type_promotion(IcebergType::Long, IcebergType::Int));
+        assert!(!is_legal_type_promotion(
+            IcebergType::Double,
+            IcebergType::Float
+        ));
+        // Cross-family
+        assert!(!is_legal_type_promotion(
+            IcebergType::String,
+            IcebergType::Int
+        ));
+        assert!(!is_legal_type_promotion(
+            IcebergType::Date,
+            IcebergType::Timestamp
+        ));
+        // Decimal with different scale (Iceberg requires same scale)
+        assert!(!is_legal_type_promotion(
+            IcebergType::Decimal {
+                precision: 10,
+                scale: 2
+            },
+            IcebergType::Decimal {
+                precision: 18,
+                scale: 4
+            }
+        ));
+        // Decimal precision decrease
+        assert!(!is_legal_type_promotion(
+            IcebergType::Decimal {
+                precision: 18,
+                scale: 2
+            },
+            IcebergType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn apply_promote_column_type_widens_in_place_preserving_field_id() {
+        let mut s = schema_with_int_qty();
+        apply_schema_changes(
+            &mut s,
+            &[SchemaChange::PromoteColumnType {
+                name: "qty".into(),
+                new_ty: IcebergType::Long,
+            }],
+        )
+        .unwrap();
+        let qty = s.columns.iter().find(|c| c.name == "qty").unwrap();
+        assert_eq!(qty.ty, IcebergType::Long);
+        assert_eq!(qty.field_id, 2, "field id preserved");
+        assert!(!qty.nullable, "nullability preserved");
+    }
+
+    #[test]
+    fn apply_promote_column_type_rejects_illegal_change() {
+        let mut s = schema_with_int_qty();
+        let err = apply_schema_changes(
+            &mut s,
+            &[SchemaChange::PromoteColumnType {
+                name: "qty".into(),
+                new_ty: IcebergType::String,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, IcebergError::Other(_)));
+        // State unchanged on rejection.
+        let qty = s.columns.iter().find(|c| c.name == "qty").unwrap();
+        assert_eq!(qty.ty, IcebergType::Int);
+    }
+
+    #[test]
+    fn apply_promote_column_type_unknown_column_errors() {
+        let mut s = schema_with_int_qty();
+        let err = apply_schema_changes(
+            &mut s,
+            &[SchemaChange::PromoteColumnType {
+                name: "ghost".into(),
+                new_ty: IcebergType::Long,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, IcebergError::NotFound(_)));
+    }
+
+    #[test]
+    fn apply_mixed_changes_in_order() {
+        // ADD a new column, DROP an existing column, PROMOTE another.
+        // All should apply in the order given. The PROMOTE happens
+        // before the DROP soft-flips the column to nullable, so the
+        // promotion's "preserve nullability" semantics matter.
+        let mut s = TableSchema {
+            ident: TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "t".into(),
+            },
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "old_col".into(),
+                    field_id: 2,
+                    ty: IcebergType::String,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+                ColumnSchema {
+                    name: "amount".into(),
+                    field_id: 3,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+            partition_spec: Vec::new(),
+        };
+        apply_schema_changes(
+            &mut s,
+            &[
+                SchemaChange::AddColumn {
+                    name: "new_col".into(),
+                    ty: IcebergType::String,
+                    nullable: true,
+                },
+                SchemaChange::DropColumn {
+                    name: "old_col".into(),
+                },
+                SchemaChange::PromoteColumnType {
+                    name: "amount".into(),
+                    new_ty: IcebergType::Long,
+                },
+            ],
+        )
+        .unwrap();
+
+        let new_col = s.columns.iter().find(|c| c.name == "new_col").unwrap();
+        assert_eq!(new_col.field_id, 4, "next id after current max (3) + 1");
+        assert!(new_col.nullable);
+
+        let old_col = s.columns.iter().find(|c| c.name == "old_col").unwrap();
+        assert!(old_col.nullable, "soft-dropped");
+        assert_eq!(old_col.field_id, 2, "id preserved");
+
+        let amount = s.columns.iter().find(|c| c.name == "amount").unwrap();
+        assert_eq!(amount.ty, IcebergType::Long);
+        assert_eq!(amount.field_id, 3);
+    }
 }

@@ -285,6 +285,22 @@ impl<C: Catalog> Materializer<C> {
     /// rebuilt from the post-evolution schema so subsequent
     /// materialize cycles encode rows with the new shape.
     ///
+    /// Detects three kinds of evolution:
+    ///
+    /// - **AddColumn**: a name in `incoming` that's not in our
+    ///   schema. Field id is allocated by `apply_schema_changes`
+    ///   from the schema's current high-water mark.
+    /// - **DropColumn**: a non-PK name in our schema that's not in
+    ///   `incoming`. Soft-drop — column stays as nullable so older
+    ///   data files keep resolving.
+    /// - **PromoteColumnType**: a name present in both, but
+    ///   `incoming.ty != current.ty` *and* the change is a legal
+    ///   Iceberg promotion (int→long, float→double, decimal
+    ///   precision increase). Illegal type changes (e.g. long→int,
+    ///   text→int) are rejected with `MaterializerError::Catalog`
+    ///   so the lifecycle fails loudly rather than silently
+    ///   truncate or coerce downstream readers.
+    ///
     /// **No-op when the table isn't registered** (the lifecycle
     /// only registers tables in YAML — incoming Relations for
     /// untracked tables, e.g. `_pg2iceberg.markers`, are silently
@@ -310,15 +326,53 @@ impl<C: Catalog> Materializer<C> {
             .iter()
             .map(|c| c.name.clone())
             .collect();
+        let current_by_name: std::collections::BTreeMap<String, &ColumnSchema> = entry
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
 
         let mut changes: Vec<pg2iceberg_iceberg::SchemaChange> = Vec::new();
         for c in incoming_columns {
-            if !current_names.contains(&c.name) {
-                changes.push(pg2iceberg_iceberg::SchemaChange::AddColumn {
-                    name: c.name.clone(),
-                    ty: c.ty,
-                    nullable: c.nullable,
-                });
+            match current_by_name.get(&c.name) {
+                None => {
+                    changes.push(pg2iceberg_iceberg::SchemaChange::AddColumn {
+                        name: c.name.clone(),
+                        ty: c.ty,
+                        nullable: c.nullable,
+                    });
+                }
+                Some(existing) => {
+                    if existing.ty != c.ty {
+                        // PK columns are part of the equality-delete
+                        // predicate; promoting a PK type would
+                        // invalidate every prior delete file's pk_key
+                        // hash. Refuse — operators must re-snapshot
+                        // for that case.
+                        if existing.is_primary_key {
+                            return Err(MaterializerError::Catalog(IcebergError::Other(format!(
+                                "cannot promote primary-key column {}: {:?} → {:?} \
+                                 (PK type is part of the equality-delete contract; \
+                                 changing it requires a full re-snapshot)",
+                                c.name, existing.ty, c.ty
+                            ))));
+                        }
+                        if !pg2iceberg_iceberg::is_legal_type_promotion(existing.ty, c.ty) {
+                            return Err(MaterializerError::Catalog(IcebergError::Other(format!(
+                                "column {} type change {:?} → {:?} is not a legal Iceberg \
+                                 promotion. Allowed: int→long, float→double, decimal \
+                                 precision increase. Other changes (narrowing, cross-family) \
+                                 require a full re-snapshot.",
+                                c.name, existing.ty, c.ty
+                            ))));
+                        }
+                        changes.push(pg2iceberg_iceberg::SchemaChange::PromoteColumnType {
+                            name: c.name.clone(),
+                            new_ty: c.ty,
+                        });
+                    }
+                }
             }
         }
         for c in &entry.schema.columns {

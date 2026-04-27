@@ -330,6 +330,45 @@ impl SimPostgres {
         Ok(())
     }
 
+    /// Test hook: `ALTER TABLE … ALTER COLUMN … TYPE …`. Mutates the
+    /// named column's `IcebergType` in place (preserving field id and
+    /// nullability) and emits a fresh Relation event so the
+    /// materializer's `apply_relation` diff sees the type change. Used
+    /// by DST to drive the legal-promotion + illegal-narrowing paths.
+    /// The sim doesn't validate the change itself (real PG would do its
+    /// own type-cast checks); validation happens downstream in
+    /// `apply_relation` / `apply_schema_changes`.
+    pub fn alter_column_type(
+        &self,
+        ident: &TableIdent,
+        col_name: &str,
+        new_ty: pg2iceberg_core::IcebergType,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
+        let col = table
+            .schema
+            .columns
+            .iter_mut()
+            .find(|c| c.name == col_name)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
+        col.ty = new_ty;
+        let columns = relation_columns_from_schema(&table.schema);
+        let lsn = s.alloc_lsn();
+        s.wal.push(WalEntry {
+            lsn,
+            xid: None,
+            kind: WalKind::Relation {
+                ident: ident.clone(),
+                columns,
+            },
+        });
+        Ok(())
+    }
+
     /// Test hook: drop a table and (optionally) recreate it under
     /// the same identifier. Models PG's `DROP TABLE` + recreate
     /// flow that yields a fresh `pg_class.oid`. Used by DST to
