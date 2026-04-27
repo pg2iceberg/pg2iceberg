@@ -857,6 +857,15 @@ impl PgClient for SimPgClient {
         Ok(SnapshotId("sim-placeholder".into()))
     }
 
+    async fn identify_system_id(&self) -> std::result::Result<u64, PgError> {
+        // Sim doesn't model multiple PG clusters, so the system_id
+        // surface is effectively a no-op. Return `0` so the
+        // lifecycle's sysid stamp/verify logic skips the cluster
+        // fingerprint check (matching `connected_system_id == 0`
+        // in `Checkpoint::verify`).
+        Ok(0)
+    }
+
     async fn start_replication(
         &self,
         slot: &str,

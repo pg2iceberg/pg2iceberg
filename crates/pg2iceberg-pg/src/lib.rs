@@ -101,6 +101,16 @@ pub trait PgClient: Send + Sync {
 
     async fn export_snapshot(&self) -> Result<SnapshotId>;
 
+    /// PostgreSQL cluster system identifier — unique per `initdb`,
+    /// survives replication/clone, differs between blue and green
+    /// even when green was bootstrapped from blue's snapshot. Used
+    /// by the lifecycle to fingerprint the source cluster and
+    /// stamp/verify it in the checkpoint, so an accidental DSN swap
+    /// or stale-LSN-on-different-cluster resume can't silently
+    /// corrupt downstream Iceberg state. Sourced from the
+    /// `IDENTIFY_SYSTEM` replication command.
+    async fn identify_system_id(&self) -> Result<u64>;
+
     async fn start_replication(
         &self,
         slot: &str,

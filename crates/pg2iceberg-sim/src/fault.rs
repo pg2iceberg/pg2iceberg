@@ -326,11 +326,14 @@ impl Coordinator for FaultyCoordinator {
         self.inner.release_lock(table, worker).await
     }
 
-    async fn load_checkpoint(&self) -> CoordResult<Option<Checkpoint>> {
-        self.inner.load_checkpoint().await
+    async fn load_checkpoint(
+        &self,
+        connected_system_id: u64,
+    ) -> CoordResult<Option<Checkpoint>> {
+        self.inner.load_checkpoint(connected_system_id).await
     }
 
-    async fn save_checkpoint(&self, cp: &Checkpoint) -> CoordResult<()> {
+    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> CoordResult<()> {
         if self.plan.tick(ops::COORD_SAVE_CP) {
             return Err(CoordError::Pg("injected fault: save_checkpoint".into()));
         }

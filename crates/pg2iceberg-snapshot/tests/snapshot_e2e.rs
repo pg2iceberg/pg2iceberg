@@ -341,7 +341,7 @@ fn snapshotter_clears_progress_when_table_completes() {
     let s = Snapshotter::new(h.coord.clone() as Arc<dyn Coordinator>);
     block_on(s.run(&h.db, &[schema()], &mut h.pipeline)).unwrap();
 
-    let cp = block_on(h.coord.load_checkpoint()).unwrap().unwrap();
+    let cp = block_on(h.coord.load_checkpoint(0)).unwrap().unwrap();
     assert!(
         cp.snapshot_progress.is_empty(),
         "completed snapshot must clear its progress entry; got {:?}",
@@ -358,9 +358,9 @@ fn snapshotter_persists_progress_after_partial_run() {
     // Process only 2 chunks (10 rows) then return.
     block_on(s.run_chunks(&h.db, &[schema()], &mut h.pipeline, Some(2))).unwrap();
 
-    let cp = block_on(h.coord.load_checkpoint()).unwrap().unwrap();
+    let cp = block_on(h.coord.load_checkpoint(0)).unwrap().unwrap();
     assert!(
-        cp.snapshot_progress.contains_key(&ident()),
+        cp.snapshot_progress.contains_key(&ident().to_string()),
         "partial run must record progress; got {:?}",
         cp.snapshot_progress
     );
@@ -435,9 +435,9 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
     };
     let _ = snap_lsn;
 
-    let cp = block_on(coord.load_checkpoint()).unwrap().unwrap();
+    let cp = block_on(coord.load_checkpoint(0)).unwrap().unwrap();
     assert!(
-        cp.snapshot_progress.contains_key(&ident()),
+        cp.snapshot_progress.contains_key(&ident().to_string()),
         "after partial run, progress must be persisted"
     );
 
@@ -466,7 +466,7 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
     assert_eq!(iceberg, pg);
 
     // Final checkpoint progress should be cleared (snapshot complete).
-    let cp = block_on(coord.load_checkpoint()).unwrap().unwrap();
+    let cp = block_on(coord.load_checkpoint(0)).unwrap().unwrap();
     assert!(
         cp.snapshot_progress.is_empty(),
         "completed resume must clear progress"

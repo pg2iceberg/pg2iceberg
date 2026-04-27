@@ -543,15 +543,13 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     assert!(format!("{err:?}").contains("blob.put"), "got: {err:?}");
     assert_eq!(h.injected(), 1);
 
-    // Checkpoint must reflect partial progress: snapshot_state ==
-    // InProgress AND snapshot_progress is non-empty (the last
+    // Checkpoint must reflect partial progress: snapshot_complete
+    // is still false AND snapshot_progress is non-empty (the last
     // successfully-staged chunk's last PK key is recorded).
-    let cp = block_on(h.coord_inner.load_checkpoint()).unwrap().unwrap();
-    assert_eq!(
-        cp.snapshot_state,
-        pg2iceberg_core::SnapshotState::InProgress,
-        "expected InProgress, got {:?}",
-        cp.snapshot_state
+    let cp = block_on(h.coord_inner.load_checkpoint(0)).unwrap().unwrap();
+    assert!(
+        !cp.snapshot_complete,
+        "expected snapshot_complete=false mid-snapshot, got true"
     );
     assert!(
         !cp.snapshot_progress.is_empty(),
@@ -591,11 +589,10 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     sort_by_pk(&mut pg);
     assert_eq!(iceberg, pg, "all 10 rows visible in Iceberg after resume");
 
-    let cp_done = block_on(h.coord_inner.load_checkpoint()).unwrap().unwrap();
-    assert_eq!(
-        cp_done.snapshot_state,
-        pg2iceberg_core::SnapshotState::Complete,
-        "checkpoint must be Complete after resume"
+    let cp_done = block_on(h.coord_inner.load_checkpoint(0)).unwrap().unwrap();
+    assert!(
+        cp_done.snapshot_complete,
+        "checkpoint must have snapshot_complete=true after resume"
     );
     assert!(
         cp_done.snapshot_progress.is_empty(),
@@ -1220,8 +1217,8 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         db.slot_state("lifecycle-slot").is_ok(),
         "slot should exist after lifecycle creates it"
     );
-    let cp = block_on(coord_inner.load_checkpoint()).unwrap().unwrap();
-    assert_eq!(cp.snapshot_state, pg2iceberg_core::SnapshotState::Complete);
+    let cp = block_on(coord_inner.load_checkpoint(0)).unwrap().unwrap();
+    assert!(cp.snapshot_complete);
 }
 
 #[test]
@@ -1269,10 +1266,10 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
     }))
     .unwrap();
     let mut cp = pg2iceberg_core::Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_state = pg2iceberg_core::SnapshotState::Complete;
-    cp.tracked_tables = vec![ident()];
+    cp.snapshot_complete = true;
+    cp.snapshoted_tables.insert(ident().to_string(), true);
     cp.flushed_lsn = pg2iceberg_core::Lsn(1);
-    block_on(coord_inner.save_checkpoint(&cp)).unwrap();
+    block_on(coord_inner.save_checkpoint(&mut cp)).unwrap();
 
     let pg_client = Arc::new(SimPgClient::new(db.clone()));
     let pg: Arc<dyn pg2iceberg_pg::PgClient> = pg_client.clone();

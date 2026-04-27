@@ -4,7 +4,7 @@
 //! Each test constructs a `StartupValidation` that *should* trip exactly
 //! one violation, then asserts the violation list contains it.
 
-use pg2iceberg_core::{Checkpoint, Lsn, Mode, Namespace, SnapshotState, TableIdent};
+use pg2iceberg_core::{Checkpoint, Lsn, Mode, Namespace, TableIdent};
 use pg2iceberg_validate::{
     validate_startup, SlotState, StartupValidation, TableExistence, ValidationError, Violation,
 };
@@ -31,14 +31,10 @@ fn fresh_logical() -> StartupValidation {
 }
 
 fn cp_logical(flushed_lsn: u64) -> Checkpoint {
-    Checkpoint {
-        mode: Mode::Logical,
-        flushed_lsn: Lsn(flushed_lsn),
-        snapshot_state: SnapshotState::Complete,
-        query_watermarks: Default::default(),
-        snapshot_progress: Default::default(),
-        tracked_tables: vec![],
-    }
+    let mut cp = Checkpoint::fresh(Mode::Logical);
+    cp.flushed_lsn = Lsn(flushed_lsn);
+    cp.snapshot_complete = true;
+    cp
 }
 
 fn assert_one_violation(err: &ValidationError, expected: &Violation) {
@@ -116,10 +112,9 @@ fn orphaned_slot_violation() {
 #[test]
 fn missing_tables_violation() {
     let mut v = fresh_logical();
-    v.checkpoint = Some(Checkpoint {
-        tracked_tables: vec![ident("orders")],
-        ..cp_logical(100)
-    });
+    let mut cp = cp_logical(100);
+    cp.snapshoted_tables.insert("public.orders".into(), true);
+    v.checkpoint = Some(cp);
     v.tables.push(TableExistence {
         pg_table: ident("orders"),
         iceberg_name: "orders".into(),
@@ -185,12 +180,9 @@ fn slot_ahead_of_checkpoint_violation() {
 #[test]
 fn snapshot_complete_but_lsn_zero_violation() {
     let mut v = fresh_logical();
-    v.checkpoint = Some(Checkpoint {
-        mode: Mode::Logical,
-        flushed_lsn: Lsn::ZERO,
-        snapshot_state: SnapshotState::Complete,
-        ..cp_logical(0)
-    });
+    let mut cp = cp_logical(0);
+    cp.snapshot_complete = true;
+    v.checkpoint = Some(cp);
     v.slot = Some(SlotState {
         exists: true,
         restart_lsn: Lsn::ZERO,
@@ -205,12 +197,9 @@ fn snapshot_complete_but_lsn_zero_violation() {
 fn snapshot_complete_lsn_zero_in_query_mode_is_ok() {
     let mut v = fresh_logical();
     v.config_mode = Mode::Query;
-    v.checkpoint = Some(Checkpoint {
-        mode: Mode::Query,
-        flushed_lsn: Lsn::ZERO,
-        snapshot_state: SnapshotState::Complete,
-        ..cp_logical(0)
-    });
+    let mut cp = Checkpoint::fresh(Mode::Query);
+    cp.snapshot_complete = true;
+    v.checkpoint = Some(cp);
     v.slot = None;
     assert!(validate_startup(&v).is_ok());
 }
@@ -219,10 +208,9 @@ fn snapshot_complete_lsn_zero_in_query_mode_is_ok() {
 #[test]
 fn snapshot_complete_but_table_has_no_snapshot_violation() {
     let mut v = fresh_logical();
-    v.checkpoint = Some(Checkpoint {
-        snapshot_state: SnapshotState::Complete,
-        ..cp_logical(100)
-    });
+    let mut cp = cp_logical(100);
+    cp.snapshot_complete = true;
+    v.checkpoint = Some(cp);
     v.slot = Some(SlotState {
         exists: true,
         restart_lsn: Lsn(100),

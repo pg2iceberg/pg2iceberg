@@ -317,12 +317,30 @@ impl Coordinator for MemoryCoordinator {
         Ok(())
     }
 
-    async fn load_checkpoint(&self) -> Result<Option<Checkpoint>> {
-        Ok(self.state.lock().unwrap().checkpoint.clone())
+    async fn load_checkpoint(
+        &self,
+        connected_system_id: u64,
+    ) -> Result<Option<Checkpoint>> {
+        let cp = self.state.lock().unwrap().checkpoint.clone();
+        if let Some(ref cp) = cp {
+            cp.verify(connected_system_id)?;
+        }
+        Ok(cp)
     }
 
-    async fn save_checkpoint(&self, cp: &Checkpoint) -> Result<()> {
-        self.state.lock().unwrap().checkpoint = Some(cp.clone());
+    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> Result<()> {
+        let expected = cp.revision;
+        let now_micros = self.clock.now().0;
+        cp.seal(now_micros);
+
+        let mut state = self.state.lock().unwrap();
+        let stored_revision = state.checkpoint.as_ref().map(|c| c.revision).unwrap_or(0);
+        if stored_revision != expected {
+            // OCC mismatch — roll back the in-memory bump.
+            cp.revision = expected;
+            return Err(CoordError::ConcurrentUpdate);
+        }
+        state.checkpoint = Some(cp.clone());
         Ok(())
     }
 

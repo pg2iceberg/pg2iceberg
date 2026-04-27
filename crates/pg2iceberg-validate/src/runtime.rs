@@ -239,15 +239,37 @@ pub type SnapshotSourceFactoryFut = std::pin::Pin<
 /// publication, advancing the slot before the snapshot is durable)
 /// surface in fault tests automatically.
 pub async fn run_logical_lifecycle<Cat, F>(
-    lc: LogicalLifecycle<Cat>,
+    mut lc: LogicalLifecycle<Cat>,
     shutdown: F,
 ) -> Result<(), LifecycleError>
 where
     Cat: Catalog + 'static,
     F: Future<Output = ()> + Unpin + Send,
 {
-    // 1. Startup validation. Refuses to start on any of the 8
-    //    invariants Go's `pipeline/validate.go` enforces.
+    // 1. Fingerprint the source cluster. `IDENTIFY_SYSTEM`'s systemid
+    //    is unique per `initdb` and survives clone/replication, so a
+    //    stale checkpoint pointed at the wrong cluster (accidental
+    //    DSN swap, or blue/green mid-cutover) gets caught by
+    //    `Checkpoint::verify` instead of silently re-using a
+    //    cluster's LSN against a different cluster's WAL. Sim's
+    //    `identify_system_id` returns 0, which makes
+    //    `verify`/load_checkpoint skip the cluster check.
+    let connected_system_id = lc.pg.identify_system_id().await?;
+    if connected_system_id != 0 {
+        tracing::info!(system_id = connected_system_id, "source cluster fingerprinted");
+        // Wrap the coord so every subsequent `save_checkpoint` stamps
+        // the connected cluster's fingerprint into the payload.
+        // Mirrors Go's `pipeline.WithSystemIdentifier`.
+        lc.coord = Arc::new(pg2iceberg_coord::StampingCoordinator::new(
+            Arc::clone(&lc.coord),
+            connected_system_id,
+        ));
+    }
+
+    // 2. Startup validation. Refuses to start on any of the 8
+    //    invariants Go's `pipeline/validate.go` enforces. Loads the
+    //    checkpoint with the connected systemid so a cluster
+    //    fingerprint mismatch fails fast here.
     run_startup_validation(
         lc.pg.as_ref(),
         lc.coord.as_ref(),
@@ -255,6 +277,7 @@ where
         &lc.schemas,
         &lc.slot_name,
         lc.mode,
+        connected_system_id,
     )
     .await?;
 
@@ -447,9 +470,10 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
     schemas: &[TableSchema],
     slot_name: &str,
     mode: Mode,
+    connected_system_id: u64,
 ) -> Result<(), LifecycleError> {
     let checkpoint = coord
-        .load_checkpoint()
+        .load_checkpoint(connected_system_id)
         .await
         .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     let mut tables: Vec<TableExistence> = Vec::with_capacity(schemas.len());

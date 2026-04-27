@@ -399,7 +399,10 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
-    async fn load_checkpoint(&self) -> Result<Option<Checkpoint>> {
+    async fn load_checkpoint(
+        &self,
+        connected_system_id: u64,
+    ) -> Result<Option<Checkpoint>> {
         let client = self.client.lock().await;
         let rows = client
             .query(&sql::load_checkpoint(&self.schema), &[])
@@ -407,23 +410,52 @@ impl Coordinator for PostgresCoordinator {
             .map_err(pg)?;
         match rows.first() {
             Some(r) => {
-                let payload: serde_json::Value = r.get(0);
-                let cp: Checkpoint = serde_json::from_value(payload)
+                let payload: serde_json::Value = r.get("payload");
+                let stored_revision: i64 = r.get("revision");
+                let mut cp: Checkpoint = serde_json::from_value(payload)
                     .map_err(|e| CoordError::Other(format!("checkpoint deserialize: {e}")))?;
+                // The on-disk `revision` is authoritative — it
+                // increments under the OCC predicate even when the
+                // JSONB payload's `revision` agrees, but if the
+                // JSONB ever drifts (e.g. someone hand-edited it)
+                // we still trust the column.
+                cp.revision = stored_revision;
+                cp.verify(connected_system_id)?;
                 Ok(Some(cp))
             }
             None => Ok(None),
         }
     }
 
-    async fn save_checkpoint(&self, cp: &Checkpoint) -> Result<()> {
-        let payload = serde_json::to_value(cp)
+    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> Result<()> {
+        let expected_revision = cp.revision;
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        cp.seal(now_micros);
+
+        let payload = serde_json::to_value(&*cp)
             .map_err(|e| CoordError::Other(format!("checkpoint serialize: {e}")))?;
+        let new_revision = cp.revision;
+
         let client = self.client.lock().await;
-        client
-            .execute(&sql::upsert_checkpoint(&self.schema), &[&payload])
+        let q = if expected_revision == 0 {
+            sql::insert_checkpoint_first(&self.schema)
+        } else {
+            sql::update_checkpoint_with_occ(&self.schema)
+        };
+        let n = client
+            .execute(&q, &[&payload, &new_revision, &expected_revision])
             .await
             .map_err(pg)?;
+        if n == 0 {
+            // Roll back the in-memory bump so the caller can
+            // reload + retry without inheriting our skipped
+            // revision number.
+            cp.revision = expected_revision;
+            return Err(CoordError::ConcurrentUpdate);
+        }
         Ok(())
     }
 

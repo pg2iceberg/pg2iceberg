@@ -77,14 +77,24 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             schema.qualify("consumer")
         ),
         // Single-row table holding the serialized `Checkpoint` blob.
-        // `id` is hardcoded to 1 so the upsert is unambiguous and
-        // multi-writer races resolve to last-write-wins.
+        // `id` is hardcoded to 1 so the upsert is unambiguous.
+        // `revision` is broken out of the JSONB so the OCC UPDATE
+        // can bind it as a WHERE clause without a JSON cast — that
+        // way two concurrent pg2iceberg instances racing to save
+        // see one win and the other return ConcurrentUpdate.
         format!(
             "CREATE TABLE IF NOT EXISTS {} (
                 id         INT  PRIMARY KEY,
+                revision   BIGINT NOT NULL DEFAULT 0,
                 payload    JSONB NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )",
+            schema.qualify("checkpoints")
+        ),
+        // Idempotent `revision` column add for older deployments
+        // (pre-OCC). `IF NOT EXISTS` makes this safe to re-run.
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0",
             schema.qualify("checkpoints")
         ),
         // Blue-green marker bookkeeping. Populated by
@@ -306,19 +316,43 @@ pub fn release_lock(schema: &CoordSchema) -> String {
     )
 }
 
-/// Upsert the single-row checkpoint blob (`id = 1`).
-pub fn upsert_checkpoint(schema: &CoordSchema) -> String {
+/// Insert the very first checkpoint row (`id = 1`). Uses
+/// ON CONFLICT … WHERE revision = 0 so a real concurrent writer
+/// who's already past their first save can't be silently overwritten
+/// by a fresh process — its UPDATE leaves zero rows touched and the
+/// caller falls through to ConcurrentUpdate.
+///
+/// Three positional args: `(payload, new_revision, expected_revision)`.
+/// `expected_revision` is `0` for the first save.
+pub fn insert_checkpoint_first(schema: &CoordSchema) -> String {
     format!(
-        "INSERT INTO {} (id, payload, updated_at) VALUES (1, $1, now()) \
-         ON CONFLICT (id) DO UPDATE SET payload = $1, updated_at = now()",
+        "INSERT INTO {} (id, revision, payload, updated_at) \
+         VALUES (1, $2, $1, now()) \
+         ON CONFLICT (id) DO UPDATE \
+            SET revision = $2, payload = $1, updated_at = now() \
+            WHERE {tbl}.revision = $3",
+        schema.qualify("checkpoints"),
+        tbl = schema.qualify("checkpoints"),
+    )
+}
+
+/// OCC update for subsequent saves. Three positional args:
+/// `(payload, new_revision, expected_revision)`. The UPDATE only
+/// touches the row when stored `revision = expected_revision`; if
+/// not, RowsAffected = 0 and the caller returns ConcurrentUpdate.
+pub fn update_checkpoint_with_occ(schema: &CoordSchema) -> String {
+    format!(
+        "UPDATE {} SET revision = $2, payload = $1, updated_at = now() \
+         WHERE id = 1 AND revision = $3",
         schema.qualify("checkpoints")
     )
 }
 
-/// Read the single-row checkpoint blob. Returns 0 or 1 row.
+/// Read the single-row checkpoint blob. Returns 0 or 1 row,
+/// payload + revision.
 pub fn load_checkpoint(schema: &CoordSchema) -> String {
     format!(
-        "SELECT payload FROM {} WHERE id = 1",
+        "SELECT payload, revision FROM {} WHERE id = 1",
         schema.qualify("checkpoints")
     )
 }
@@ -331,11 +365,11 @@ mod tests {
     fn migrate_returns_idempotent_statements() {
         let s = CoordSchema::default_name();
         let stmts = migrate(&s);
-        // 6 base CREATE TABLEs + 1 ALTER TABLE (flushable_lsn add)
-        // + 2 marker tables (pending_markers, marker_emissions) =
-        // 9. The ALTER TABLE is idempotent via `IF NOT EXISTS`; the
-        // others via `CREATE TABLE IF NOT EXISTS`.
-        assert_eq!(stmts.len(), 9);
+        // 6 base CREATE TABLEs + 1 ALTER TABLE (log_index.flushable_lsn)
+        // + 1 ALTER TABLE (checkpoints.revision) + 2 marker tables
+        // (pending_markers, marker_emissions) = 10. Each statement is
+        // idempotent: CREATE TABLE IF NOT EXISTS or ADD COLUMN IF NOT EXISTS.
+        assert_eq!(stmts.len(), 10);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS"),
@@ -346,7 +380,7 @@ mod tests {
         // The `checkpoints` table uses JSONB for the payload.
         let cp_stmt = stmts
             .iter()
-            .find(|s| s.contains("checkpoints"))
+            .find(|s| s.contains("checkpoints") && s.contains("JSONB"))
             .expect("checkpoints DDL present");
         assert!(cp_stmt.contains("JSONB"));
         // Marker tables present.
@@ -355,14 +389,22 @@ mod tests {
         // log_index has flushable_lsn either in the CREATE TABLE
         // body or via the idempotent ALTER TABLE.
         assert!(stmts.iter().any(|s| s.contains("flushable_lsn")));
+        // checkpoints has the revision column either in the CREATE
+        // TABLE body or via the idempotent ALTER TABLE.
+        assert!(stmts
+            .iter()
+            .any(|s| s.contains("checkpoints") && s.contains("revision")));
     }
 
     #[test]
-    fn upsert_checkpoint_uses_id_1_pk() {
+    fn checkpoint_save_sql_carries_occ_predicate() {
         let s = CoordSchema::default_name();
-        let q = upsert_checkpoint(&s);
-        assert!(q.contains("VALUES (1,"));
+        let q = update_checkpoint_with_occ(&s);
+        assert!(q.contains("WHERE id = 1 AND revision = $3"));
+
+        let q = insert_checkpoint_first(&s);
         assert!(q.contains("ON CONFLICT (id) DO UPDATE"));
+        assert!(q.contains("revision = $3"));
     }
 
     #[test]

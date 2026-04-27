@@ -276,6 +276,34 @@ impl PgClient for PgClientImpl {
         ))
     }
 
+    async fn identify_system_id(&self) -> Result<u64> {
+        // `IDENTIFY_SYSTEM` is a replication-mode command that
+        // returns four columns: systemid (text), timeline (int),
+        // xlogpos (text), dbname (text or NULL). systemid is the
+        // 19-digit cluster fingerprint we want.
+        let rows = self
+            .client
+            .simple_query("IDENTIFY_SYSTEM")
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let id = row
+                    .try_get("systemid")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| {
+                        PgError::Protocol("IDENTIFY_SYSTEM returned NULL systemid".into())
+                    })?;
+                return id.parse::<u64>().map_err(|e| {
+                    PgError::Protocol(format!("parse systemid {id:?}: {e}"))
+                });
+            }
+        }
+        Err(PgError::Protocol(
+            "IDENTIFY_SYSTEM returned no rows".into(),
+        ))
+    }
+
     async fn start_replication(
         &self,
         slot: &str,

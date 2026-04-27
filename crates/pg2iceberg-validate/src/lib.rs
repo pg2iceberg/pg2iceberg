@@ -166,12 +166,15 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     }
 
     // 4. Checkpoint exists but previously-tracked tables missing.
+    //    "Tracked" is derived from `snapshoted_tables` keys — anything
+    //    we've ever snapshotted is a table we expect to find again.
     if let Some(cp) = &v.checkpoint {
-        let tracked: std::collections::BTreeSet<&TableIdent> = cp.tracked_tables.iter().collect();
+        let tracked: std::collections::BTreeSet<String> =
+            cp.snapshoted_tables.keys().cloned().collect();
         let missing: Vec<String> = v
             .tables
             .iter()
-            .filter(|t| !t.existed && tracked.contains(&t.pg_table))
+            .filter(|t| !t.existed && tracked.contains(&t.pg_table.to_string()))
             .map(|t| t.iceberg_name.clone())
             .collect();
         if !missing.is_empty() {
@@ -211,7 +214,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     // 7. Snapshot complete but LSN = 0 (crashed after snapshot, before first CDC flush).
     //    Only applies to logical mode. Query mode doesn't track LSN.
     if let Some(cp) = &v.checkpoint {
-        if cp.snapshot_state == pg2iceberg_core::SnapshotState::Complete
+        if cp.snapshot_complete
             && cp.flushed_lsn == Lsn::ZERO
             && v.config_mode == Mode::Logical
         {
@@ -221,7 +224,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
 
     // 8. Snapshot complete but a tracked table has no snapshots in the catalog.
     if let Some(cp) = &v.checkpoint {
-        if cp.snapshot_state == pg2iceberg_core::SnapshotState::Complete {
+        if cp.snapshot_complete {
             for t in &v.tables {
                 if t.existed && t.current_snapshot_id.is_none() {
                     violations.push(Violation::SnapshotCompleteButTableNoSnapshot {

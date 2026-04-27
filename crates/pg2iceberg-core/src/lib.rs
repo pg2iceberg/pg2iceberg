@@ -15,7 +15,7 @@ pub mod value;
 
 pub use metrics::{InMemoryMetrics, Labels, Metrics, NoopMetrics};
 
-pub use checkpoint::{Checkpoint, Mode, SnapshotState};
+pub use checkpoint::{Checkpoint, CheckpointError, Mode, CHECKPOINT_VERSION};
 pub use event::{ChangeEvent, ColumnName, Op, Row};
 pub use io::{Clock, IdGen, Spawner, Timestamp, WorkerId};
 pub use lsn::Lsn;

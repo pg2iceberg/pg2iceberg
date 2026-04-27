@@ -295,20 +295,42 @@ async fn lock_try_renew_release_round_trip() {
 #[tokio::test]
 async fn checkpoint_round_trip() {
     let coord = fresh_coord().await;
-    assert!(coord.load_checkpoint().await.unwrap().is_none());
+    // Pass `0` for connected_system_id so the cluster fingerprint
+    // check is skipped (see Checkpoint::verify contract).
+    assert!(coord.load_checkpoint(0).await.unwrap().is_none());
 
     let mut cp = Checkpoint::fresh(Mode::Logical);
     cp.flushed_lsn = Lsn(0xDEAD_BEEF);
-    coord.save_checkpoint(&cp).await.unwrap();
-    let loaded = coord.load_checkpoint().await.unwrap().expect("checkpoint");
+    coord.save_checkpoint(&mut cp).await.unwrap();
+    let loaded = coord.load_checkpoint(0).await.unwrap().expect("checkpoint");
     assert_eq!(loaded.flushed_lsn, Lsn(0xDEAD_BEEF));
     assert!(matches!(loaded.mode, Mode::Logical));
+    // First save bumps revision 0 → 1.
+    assert_eq!(loaded.revision, 1);
+    assert!(loaded.checksum.is_some());
 
-    // Upsert: second save overwrites first.
+    // Subsequent save with the loaded cp's revision succeeds; OCC
+    // predicate matches.
     cp.flushed_lsn = Lsn(0xCAFE);
-    coord.save_checkpoint(&cp).await.unwrap();
-    let loaded = coord.load_checkpoint().await.unwrap().unwrap();
+    coord.save_checkpoint(&mut cp).await.unwrap();
+    let loaded = coord.load_checkpoint(0).await.unwrap().unwrap();
     assert_eq!(loaded.flushed_lsn, Lsn(0xCAFE));
+    assert_eq!(loaded.revision, 2);
+}
+
+#[tokio::test]
+async fn checkpoint_concurrent_update_returns_error() {
+    // Two writers, both with stale revision = 0, race on the first
+    // save. One wins; the other gets ConcurrentUpdate.
+    let coord = fresh_coord().await;
+    let mut cp_a = Checkpoint::fresh(Mode::Logical);
+    cp_a.flushed_lsn = Lsn(1);
+    let mut cp_b = Checkpoint::fresh(Mode::Logical);
+    cp_b.flushed_lsn = Lsn(2);
+
+    coord.save_checkpoint(&mut cp_a).await.unwrap();
+    let err = coord.save_checkpoint(&mut cp_b).await.unwrap_err();
+    assert!(matches!(err, pg2iceberg_coord::CoordError::ConcurrentUpdate));
 }
 
 #[tokio::test]

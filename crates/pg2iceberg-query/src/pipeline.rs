@@ -22,7 +22,7 @@ use crate::{watermark_compare, QueryError, WatermarkSource};
 use bytes::Bytes;
 use pg2iceberg_coord::{CoordError, Coordinator};
 use pg2iceberg_core::{
-    Checkpoint, ColumnName, Lsn, Mode, PgValue, SnapshotState, TableIdent, TableSchema,
+    Checkpoint, ColumnName, Mode, PgValue, TableIdent, TableSchema,
 };
 use pg2iceberg_iceberg::{
     promote_re_inserts, rebuild_from_catalog, Catalog, DataFile, FileIndex, IcebergError,
@@ -127,11 +127,12 @@ impl<C: Catalog> QueryPipeline<C> {
         let buffer = Buffer::new(pk_cols.clone());
 
         // Restore watermark from prior checkpoint if it exists.
+        let key = ident.to_string();
         let restored_watermark = self
             .coord
-            .load_checkpoint()
+            .load_checkpoint(0)
             .await?
-            .and_then(|cp| cp.query_watermarks.get(&ident).cloned());
+            .and_then(|cp| cp.query_watermarks.get(&key).cloned());
 
         // Rebuild FileIndex from catalog so re-insert promotion works
         // across restarts. For a fresh catalog this is a no-op.
@@ -323,29 +324,23 @@ impl<C: Catalog> QueryPipeline<C> {
     pub async fn save_checkpoint(&self) -> Result<()> {
         // Preserve any non-query-mode fields already present (e.g. an
         // in-progress snapshot from a different controller). We're only
-        // authoritative over `query_watermarks` and `tracked_tables`.
-        let existing = self.coord.load_checkpoint().await?;
+        // authoritative over `query_watermarks`.
+        let existing = self.coord.load_checkpoint(0).await?;
 
-        let mut watermarks: BTreeMap<TableIdent, PgValue> = BTreeMap::new();
-        let mut tracked = Vec::with_capacity(self.tables.len());
+        let mut watermarks: BTreeMap<String, PgValue> = BTreeMap::new();
         for (ident, table) in &self.tables {
             if let Some(wm) = &table.watermark {
-                watermarks.insert(ident.clone(), wm.clone());
+                watermarks.insert(ident.to_string(), wm.clone());
             }
-            tracked.push(ident.clone());
         }
 
-        let cp = Checkpoint {
-            mode: Mode::Query,
-            // Query mode doesn't use these — kept at defaults so logical
-            // mode running against the same coord doesn't see stale data.
-            flushed_lsn: Lsn::ZERO,
-            snapshot_state: SnapshotState::NotStarted,
-            query_watermarks: watermarks,
-            snapshot_progress: existing.map(|c| c.snapshot_progress).unwrap_or_default(),
-            tracked_tables: tracked,
-        };
-        self.coord.save_checkpoint(&cp).await?;
+        // Inherit the existing checkpoint's revision + snapshot
+        // bookkeeping; just stomp the query-mode authoritative
+        // fields.
+        let mut cp = existing.unwrap_or_else(|| Checkpoint::fresh(Mode::Query));
+        cp.mode = Mode::Query;
+        cp.query_watermarks = watermarks;
+        self.coord.save_checkpoint(&mut cp).await?;
         Ok(())
     }
 }
