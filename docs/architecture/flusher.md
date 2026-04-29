@@ -62,7 +62,7 @@ The materializer reads `log_index` entries with offsets greater than its cursor,
 
 ## Restart record
 
-Replication state is split across several narrow tables (no single "checkpoint" blob — see [the checkpoint refactor note](https://github.com/polynya-dev/pg2iceberg/blob/main/pg2iceberg-rust/.claude-memory/project_checkpoint_refactor.md) if you're curious why):
+Replication state is split across several narrow tables — no single "checkpoint" blob. Each concern that needs durability gets its own row, so updates from different code paths don't contend on a shared OCC token:
 
 - **Confirmed flush LSN** — recorded in `_pg2iceberg.flushed_lsn` *before* every standby ack to the slot. This durable record is compared to the slot's `confirmed_flush_lsn` at startup to catch external slot tampering (`pg_replication_slot_advance`, drop+recreate, stray `pg_recvlogical`).
 - **Per-table snapshot status** — `_pg2iceberg.tables` rows store `snapshot_complete`, `pg_oid`, and `snapshot_lsn` per table. The `pg_oid` field drives the `TableIdentityChanged` invariant (DROP+recreate detection).
