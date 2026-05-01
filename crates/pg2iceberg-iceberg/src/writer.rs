@@ -8,8 +8,9 @@
 use crate::file_index::FileIndex;
 use crate::fold::{pk_key, MaterializedRow};
 use arrow_array::builder::{
-    BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
-    Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder,
+    Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -365,10 +366,12 @@ fn arrow_data_type(ty: IcebergType) -> DataType {
         IcebergType::Decimal { precision, scale } => {
             DataType::Decimal128(precision as u8, scale as i8)
         }
-        // Phase 7.5 wires these.
-        IcebergType::Binary | IcebergType::Uuid => {
-            DataType::Null // placeholder; we error before constructing arrays
-        }
+        IcebergType::Binary => DataType::Binary,
+        // Iceberg's `uuid` is a 16-byte fixed-size binary on the
+        // Parquet wire (per the Iceberg → Parquet mapping in the
+        // spec). Encoding as `FixedSizeBinary(16)` keeps round-trip
+        // exact and lets readers decode without ambiguity.
+        IcebergType::Uuid => DataType::FixedSizeBinary(16),
     }
 }
 
@@ -615,7 +618,73 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
             }
             Arc::new(b.finish()) as Arc<dyn Array>
         }
-        IcebergType::Time | IcebergType::Binary | IcebergType::Uuid => {
+        IcebergType::Binary => {
+            let mut b = BinaryBuilder::with_capacity(n, n * 32);
+            for r in rows {
+                match r.get(&key) {
+                    None => {
+                        if !col.nullable {
+                            return Err(WriterError::MissingColumn {
+                                col: col.name.clone(),
+                            });
+                        }
+                        b.append_null();
+                    }
+                    Some(PgValue::Null) => {
+                        if !col.nullable {
+                            return Err(WriterError::NullInNonNullable {
+                                col: col.name.clone(),
+                            });
+                        }
+                        b.append_null();
+                    }
+                    Some(PgValue::Bytea(bytes)) => b.append_value(bytes.as_slice()),
+                    Some(other) => {
+                        return Err(WriterError::UnsupportedValue {
+                            ty: col.ty,
+                            value: other.clone(),
+                        });
+                    }
+                }
+            }
+            Arc::new(b.finish()) as Arc<dyn Array>
+        }
+        IcebergType::Uuid => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(n, 16);
+            for r in rows {
+                match r.get(&key) {
+                    None => {
+                        if !col.nullable {
+                            return Err(WriterError::MissingColumn {
+                                col: col.name.clone(),
+                            });
+                        }
+                        b.append_null();
+                    }
+                    Some(PgValue::Null) => {
+                        if !col.nullable {
+                            return Err(WriterError::NullInNonNullable {
+                                col: col.name.clone(),
+                            });
+                        }
+                        b.append_null();
+                    }
+                    Some(PgValue::Uuid(bytes)) => {
+                        b.append_value(bytes).map_err(|e| {
+                            WriterError::Encode(format!("FixedSizeBinary append uuid: {e}"))
+                        })?;
+                    }
+                    Some(other) => {
+                        return Err(WriterError::UnsupportedValue {
+                            ty: col.ty,
+                            value: other.clone(),
+                        });
+                    }
+                }
+            }
+            Arc::new(b.finish()) as Arc<dyn Array>
+        }
+        IcebergType::Time => {
             return Err(WriterError::TypeNotYetSupported(col.ty));
         }
     };

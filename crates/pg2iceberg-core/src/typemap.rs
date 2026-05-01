@@ -93,6 +93,18 @@ pub fn map_pg_to_iceberg(pg: PgType) -> Result<Mapped, MapError> {
         PgType::Float8 => IcebergType::Double,
         PgType::Numeric { precision, scale } => return map_numeric(precision, scale),
         PgType::Text | PgType::Json | PgType::Jsonb => IcebergType::String,
+        // PG `bytea` → Iceberg `binary` (Parquet `BYTE_ARRAY`).
+        // PG `uuid`  → Iceberg `uuid`   (Parquet
+        // `FIXED_LEN_BYTE_ARRAY(16)` with `UUID` logical-type
+        // annotation, network-order bytes).
+        //
+        // Note for ClickHouse readers: ClickHouse decodes the
+        // Parquet `UUID` logical type using Microsoft-GUID byte
+        // order (the first three groups are byte-reversed) — the
+        // bytes round-trip exactly through Iceberg, but the
+        // displayed canonical form differs. Wrap with `toString()`
+        // or use `hex()` for `bytea` if you need a representation
+        // that's identical across engines.
         PgType::Bytea => IcebergType::Binary,
         PgType::Date => IcebergType::Date,
         PgType::Time | PgType::TimeTz => IcebergType::Time,

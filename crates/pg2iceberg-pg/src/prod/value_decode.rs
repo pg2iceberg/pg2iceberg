@@ -10,8 +10,6 @@ use pg2iceberg_core::typemap::PgType;
 use pg2iceberg_core::value::{
     DaysSinceEpoch, Decimal as CoreDecimal, PgValue, TimeMicros, TimestampMicros,
 };
-use rust_decimal::Decimal as RDecimal;
-use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -149,13 +147,73 @@ fn decode_bytea(raw: &str) -> Option<Vec<u8>> {
 }
 
 /// Parse `123.45` → our wire `Decimal { unscaled_be_bytes, scale }`.
-/// Uses `rust_decimal` to extract the unscaled mantissa + scale; the
-/// 16-byte big-endian representation is fixed-width (we don't trim
-/// leading zeros — the Iceberg writer can do that if needed).
+///
+/// We parse the digit string directly into an `i128` rather than
+/// going through `rust_decimal` because `rust_decimal`'s mantissa is
+/// 96-bit (precision ~28-29 digits), which can't represent
+/// Iceberg-max `numeric(38, _)` values. PG itself can carry far more
+/// (~131k digits), but Iceberg caps at precision 38, so the i128
+/// budget — ~3.4 × 10^38, comfortably above 10^38 — is sufficient
+/// for any value our pipeline can legally store.
 fn decode_numeric(raw: &str) -> Option<CoreDecimal> {
-    let d = RDecimal::from_str(raw).ok()?;
-    let mantissa: i128 = d.mantissa();
-    let scale: u8 = u8::try_from(d.scale()).ok()?;
+    // Reject NaN / Inf / empty — PG can emit `NaN` for `numeric`,
+    // but Iceberg has no representation for it. Drop the row
+    // explicitly rather than silently round to 0.
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("NaN") {
+        return None;
+    }
+    let (sign, body) = match raw.as_bytes().first() {
+        Some(b'-') => (-1i128, &raw[1..]),
+        Some(b'+') => (1i128, &raw[1..]),
+        _ => (1i128, raw),
+    };
+    // Optional exponent (PG's text form for `numeric` doesn't emit
+    // one in practice, but we accept it for robustness against
+    // user-supplied input that flowed through `to_char` / similar).
+    let (digits_part, exponent) = match body.find(['e', 'E']) {
+        Some(idx) => {
+            let exp: i32 = body[idx + 1..].parse().ok()?;
+            (&body[..idx], exp)
+        }
+        None => (body, 0),
+    };
+    // Split mantissa on the decimal point.
+    let (int_part, frac_part) = match digits_part.find('.') {
+        Some(i) => (&digits_part[..i], &digits_part[i + 1..]),
+        None => (digits_part, ""),
+    };
+    // Strip leading zeros on int part for cleaner overflow checks
+    // (the `i128::checked_mul` below would catch overflow anyway,
+    // but losing leading zeros early keeps small values fast).
+    let int_part = int_part.trim_start_matches('0');
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let combined = format!("{int_part}{frac_part}");
+    let mantissa = if combined.is_empty() {
+        0i128
+    } else {
+        combined.parse::<i128>().ok()? * sign
+    };
+    let raw_scale = frac_part.len() as i32;
+    // Apply the exponent: a positive exponent shifts the decimal
+    // point right (reduces scale), a negative one shifts left.
+    let final_scale = raw_scale - exponent;
+    if final_scale < 0 {
+        // Negative scale ≡ trailing zeros on an integer mantissa.
+        // Multiply mantissa to absorb it, scale becomes 0.
+        let extra = (-final_scale) as u32;
+        let factor = 10i128.checked_pow(extra)?;
+        let m = mantissa.checked_mul(factor)?;
+        return Some(CoreDecimal {
+            unscaled_be_bytes: m.to_be_bytes().to_vec(),
+            scale: 0,
+        });
+    }
+    let scale: u8 = u8::try_from(final_scale).ok()?;
     Some(CoreDecimal {
         unscaled_be_bytes: mantissa.to_be_bytes().to_vec(),
         scale,

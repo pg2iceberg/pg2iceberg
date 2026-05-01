@@ -6,8 +6,8 @@
 
 use crate::writer::WriterError;
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, StringArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -113,7 +113,24 @@ fn decode_value(ty: IcebergType, arr: &dyn Array, i: usize) -> Result<PgValue> {
                 scale,
             })
         }
-        IcebergType::Time | IcebergType::Binary | IcebergType::Uuid => {
+        IcebergType::Binary => {
+            let arr = cast!(BinaryArray)?;
+            PgValue::Bytea(arr.value(i).to_vec())
+        }
+        IcebergType::Uuid => {
+            let arr = cast!(FixedSizeBinaryArray)?;
+            let bytes = arr.value(i);
+            if bytes.len() != 16 {
+                return Err(WriterError::Encode(format!(
+                    "expected 16-byte fixed-size binary for Uuid column, got {} bytes",
+                    bytes.len()
+                )));
+            }
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(bytes);
+            PgValue::Uuid(buf)
+        }
+        IcebergType::Time => {
             return Err(WriterError::TypeNotYetSupported(ty));
         }
     })

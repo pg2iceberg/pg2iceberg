@@ -59,10 +59,21 @@ pub fn pg_type_from_oid(oid: u32, type_modifier: i32) -> Option<PgType> {
         // Go reference (postgres/schema.go:120). Iceberg has no
         // fixed-length character type and the distinction doesn't
         // survive replication anyway.
+        //
+        // Network-address types (`inet`, `cidr`, `macaddr`,
+        // `macaddr8`) are also collapsed to Text here. PG's wire
+        // format for these is the canonical text form (e.g.
+        // `192.168.1.1/24`), so passing them through as strings is
+        // lossless and matches the documented "fall back to string"
+        // contract in `tests/cases/00005_column_types`.
         x if x == Type::TEXT.oid()
             || x == Type::VARCHAR.oid()
             || x == Type::BPCHAR.oid()
-            || x == Type::NAME.oid() =>
+            || x == Type::NAME.oid()
+            || x == Type::INET.oid()
+            || x == Type::CIDR.oid()
+            || x == Type::MACADDR.oid()
+            || x == Type::MACADDR8.oid() =>
         {
             PgType::Text
         }
