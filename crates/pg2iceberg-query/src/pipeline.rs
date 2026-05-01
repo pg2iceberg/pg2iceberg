@@ -58,6 +58,10 @@ struct QueryTable {
     buffer: Buffer,
     file_index: FileIndex,
     writer: TableWriter,
+    /// Partition spec, copied at register time so `flush_table` can
+    /// render the Hive-style partition path segment without going
+    /// through the writer.
+    partition_spec: Vec<pg2iceberg_core::PartitionField>,
 }
 
 /// Default per-poll-call row cap. ~1k rows keeps peak memory bounded on
@@ -148,6 +152,7 @@ impl<C: Catalog> QueryPipeline<C> {
                 buffer,
                 file_index,
                 writer,
+                partition_spec: schema.partition_spec.clone(),
             },
         );
         Ok(())
@@ -249,7 +254,14 @@ impl<C: Catalog> QueryPipeline<C> {
         let mut deleted_pks: Vec<String> = Vec::new();
 
         for chunk in prepared.data {
-            let path = self.namer.next_path(ident, "query-data").await;
+            let segment = pg2iceberg_logical::materializer::render_partition_segment(
+                &entry.partition_spec,
+                &chunk.partition_values,
+            );
+            let path = self
+                .namer
+                .next_path(ident, "query-data", &segment)
+                .await;
             let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
                 .put(&path, Bytes::clone(&chunk.chunk.bytes))
@@ -266,7 +278,14 @@ impl<C: Catalog> QueryPipeline<C> {
 
         let mut delete_files: Vec<DataFile> = Vec::with_capacity(prepared.equality_deletes.len());
         for chunk in prepared.equality_deletes {
-            let path = self.namer.next_path(ident, "query-eq-delete").await;
+            let segment = pg2iceberg_logical::materializer::render_partition_segment(
+                &entry.partition_spec,
+                &chunk.partition_values,
+            );
+            let path = self
+                .namer
+                .next_path(ident, "query-eq-delete", &segment)
+                .await;
             let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
                 .put(&path, Bytes::clone(&chunk.chunk.bytes))

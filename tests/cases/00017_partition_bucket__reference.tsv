@@ -1,5 +1,5 @@
-1	alice	id_bucket=2
-2	bob	id_bucket=3
-3	charlie	id_bucket=1
-4	dave	id_bucket=3
-5	eve	id_bucket=2
+1	alice	id_bucket=0
+2	bob	id_bucket=0
+3	charlie	id_bucket=3
+4	dave	id_bucket=2
+5	eve	id_bucket=3

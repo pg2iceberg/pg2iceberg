@@ -695,18 +695,35 @@ fn to_iceberg_transform(t: pg2iceberg_core::Transform) -> iceberg::spec::Transfo
 fn to_iceberg_unbound_partition_spec(
     schema: &TableSchema,
 ) -> Result<iceberg::spec::UnboundPartitionSpec> {
-    let mut builder = iceberg::spec::UnboundPartitionSpec::builder();
-    for f in &schema.partition_spec {
+    // Explicit `spec_id = 0` and explicit per-field `field_id` are
+    // required because `UnboundPartitionSpec`'s `Option<i32>` fields
+    // serialise as JSON `null` when unset, and the Iceberg REST
+    // server's strict Jackson deserialisation rejects null integers
+    // (HTTP 500: `Cannot parse to an integer value: spec-id: null`
+    // / `field-id: null`). The convention is that partition field
+    // ids start at `PARTITION_FIELD_ID_START` (1000) and increment
+    // per field, which matches what the catalog would assign during
+    // binding anyway.
+    const PARTITION_FIELD_ID_START: i32 = 1000;
+    let mut fields = Vec::with_capacity(schema.partition_spec.len());
+    for (i, f) in schema.partition_spec.iter().enumerate() {
         let source_id = schema.field_id_for(&f.source_column).ok_or_else(|| {
             IcebergError::Other(format!(
                 "partition source column {} not in schema",
                 f.source_column
             ))
         })?;
-        builder = builder
-            .add_partition_field(source_id, f.name.clone(), to_iceberg_transform(f.transform))
-            .map_err(|e| IcebergError::Other(format!("add partition field {}: {e}", f.name)))?;
+        fields.push(iceberg::spec::UnboundPartitionField {
+            source_id,
+            field_id: Some(PARTITION_FIELD_ID_START + i as i32),
+            name: f.name.clone(),
+            transform: to_iceberg_transform(f.transform),
+        });
     }
+    let builder = iceberg::spec::UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_fields(fields)
+        .map_err(|e| IcebergError::Other(format!("add partition fields: {e}")))?;
     Ok(builder.build())
 }
 

@@ -110,9 +110,21 @@ pub type Result<T> = std::result::Result<T, MaterializerError>;
 
 #[async_trait]
 pub trait MaterializerNamer: Send + Sync {
-    /// Generate a unique blob path for a materialized data file or
-    /// equality-delete file. `kind` is `"data"` or `"eq-delete"`.
-    async fn next_path(&self, table: &TableIdent, kind: &str) -> String;
+    /// Generate a unique blob path for a materialized file. `kind`
+    /// is one of `"data"`, `"eq-delete"`, `"compact"`, `"meta"`,
+    /// `"meta-marker"`. `partition_segment` is the Hive-style
+    /// `col=val/col2=val2` path component for partitioned data /
+    /// delete files; empty for unpartitioned tables and for
+    /// non-data file kinds (meta, marker, etc.).
+    ///
+    /// Iceberg readers track file location explicitly in the
+    /// manifest, so the layout below is convention rather than
+    /// requirement — but every mainstream Iceberg writer (Spark,
+    /// Trino, Flink, the Go pg2iceberg reference) uses it, and
+    /// some readers (older Spark, ClickHouse's `_path` virtual
+    /// column) lean on it for partition pruning. Sticking to it
+    /// keeps cross-engine debugging painless.
+    async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String;
 }
 
 /// Deterministic counter-based namer. Production uses an `IdGen`-backed UUID
@@ -133,12 +145,116 @@ impl CounterMaterializerNamer {
 
 #[async_trait]
 impl MaterializerNamer for CounterMaterializerNamer {
-    async fn next_path(&self, table: &TableIdent, kind: &str) -> String {
+    async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String {
         let n = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        format!("{}/{}/{kind}-{n:010}.parquet", self.base, table.name)
+        // Layout: `<base>/<table>/data/[<col=val>/...]/<kind>-<n>.parquet`.
+        // Data and eq-delete files share the `data/` subdirectory
+        // (Iceberg writers always co-locate them); meta / compact /
+        // marker outputs go in their own per-kind subdir.
+        let kind_dir = match kind {
+            "data" | "eq-delete" => "data",
+            other => other,
+        };
+        if partition_segment.is_empty() {
+            format!(
+                "{}/{}/{}/{kind}-{n:010}.parquet",
+                self.base, table.name, kind_dir
+            )
+        } else {
+            format!(
+                "{}/{}/{}/{}/{kind}-{n:010}.parquet",
+                self.base, table.name, kind_dir, partition_segment
+            )
+        }
     }
+}
+
+/// Render the Hive-style `col1=val1/col2=val2` path segment for a
+/// chunk's partition values. Empty when the table is unpartitioned
+/// or the chunk has no partition values. Field names are taken from
+/// `partition_spec` in declaration order; values are URL-encoded so
+/// path-unsafe characters (`/`, `=`, spaces, `%`) survive a
+/// round-trip through S3 + filesystem listings.
+pub fn render_partition_segment(
+    partition_spec: &[pg2iceberg_core::PartitionField],
+    partition_values: &[pg2iceberg_core::PartitionLiteral],
+) -> String {
+    if partition_spec.is_empty() || partition_values.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (i, (field, value)) in partition_spec
+        .iter()
+        .zip(partition_values.iter())
+        .enumerate()
+    {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&hive_escape(&field.name));
+        out.push('=');
+        out.push_str(&hive_escape(&format_partition_literal(value)));
+    }
+    out
+}
+
+/// Format a `PartitionLiteral` as the string PG/Spark/Trino use in
+/// Hive partition paths. Mirrors what the Iceberg spec calls
+/// "partition transform string representation":
+/// integers/booleans render as their literal text; null becomes
+/// `__HIVE_DEFAULT_PARTITION__`; binary becomes lowercase hex.
+fn format_partition_literal(v: &pg2iceberg_core::PartitionLiteral) -> String {
+    use pg2iceberg_core::PartitionLiteral;
+    match v {
+        PartitionLiteral::Null => "__HIVE_DEFAULT_PARTITION__".to_string(),
+        PartitionLiteral::Int(x) => x.to_string(),
+        PartitionLiteral::Long(x) => x.to_string(),
+        PartitionLiteral::Float(x) => format!("{}", x.0),
+        PartitionLiteral::Double(x) => format!("{}", x.0),
+        PartitionLiteral::String(s) => s.clone(),
+        PartitionLiteral::Boolean(b) => b.to_string(),
+        PartitionLiteral::Binary(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        PartitionLiteral::Decimal { unscaled, scale } => {
+            // Render as decimal-with-point so reads can round-trip
+            // back without ambiguity. Scale=0 → integer literal.
+            if *scale == 0 {
+                unscaled.to_string()
+            } else {
+                let abs = unscaled.unsigned_abs();
+                let s = abs.to_string();
+                let scale_usize = *scale as usize;
+                let sign = if *unscaled < 0 { "-" } else { "" };
+                if s.len() > scale_usize {
+                    let split = s.len() - scale_usize;
+                    format!("{sign}{}.{}", &s[..split], &s[split..])
+                } else {
+                    let pad = scale_usize - s.len();
+                    format!("{sign}0.{}{}", "0".repeat(pad), s)
+                }
+            }
+        }
+    }
+}
+
+/// Percent-encode characters that aren't safe in S3 / filesystem
+/// path segments. Mirrors what Spark / Trino / Hive use for
+/// partition path encoding so paths are interchangeable.
+fn hive_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '/' | '=' | '%' | '\\' | '"' | '\'' | ' ' | ':' | '?' | '#' | '[' | ']' => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 struct TableEntry {
@@ -481,7 +597,17 @@ impl<C: Catalog> Materializer<C> {
             let prepared = state.writer.prepare(&rows, &state.file_index)?;
             let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
             for chunk in prepared.data {
-                let path = self.namer.next_path(&state.schema.ident, "meta").await;
+                // Meta tables are partitioned by `day(ts)` per
+                // `pg2iceberg-iceberg::meta`; render the partition
+                // segment so files land under the right directory.
+                let segment = render_partition_segment(
+                    &state.schema.partition_spec,
+                    &chunk.partition_values,
+                );
+                let path = self
+                    .namer
+                    .next_path(&state.schema.ident, "meta", &segment)
+                    .await;
                 let byte_size = chunk.chunk.bytes.len() as u64;
                 self.blob_store
                     .put(&path, Bytes::clone(&chunk.chunk.bytes))
@@ -956,7 +1082,12 @@ impl<C: Catalog> Materializer<C> {
             move |t, _idx| {
                 let n = namer.clone();
                 let t = t.clone();
-                async move { n.next_path(&t, "compact").await }
+                // Compaction always rewrites whole partitions, so
+                // we don't yet thread per-partition compaction
+                // outputs into separate dirs. The empty segment
+                // groups all compaction outputs under
+                // `<table>/compact/`.
+                async move { n.next_path(&t, "compact", "").await }
             },
             ident,
             &schema,
@@ -1125,7 +1256,9 @@ impl<C: Catalog> Materializer<C> {
         let mut deleted_pks: Vec<String> = Vec::new();
 
         for chunk in prepared_files.data {
-            let path = self.namer.next_path(ident, "data").await;
+            let segment =
+                render_partition_segment(&entry.schema.partition_spec, &chunk.partition_values);
+            let path = self.namer.next_path(ident, "data", &segment).await;
             let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
                 .put(&path, Bytes::clone(&chunk.chunk.bytes))
@@ -1143,7 +1276,9 @@ impl<C: Catalog> Materializer<C> {
         let mut delete_files: Vec<DataFile> =
             Vec::with_capacity(prepared_files.equality_deletes.len());
         for chunk in prepared_files.equality_deletes {
-            let path = self.namer.next_path(ident, "eq-delete").await;
+            let segment =
+                render_partition_segment(&entry.schema.partition_spec, &chunk.partition_values);
+            let path = self.namer.next_path(ident, "eq-delete", &segment).await;
             let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
                 .put(&path, Bytes::clone(&chunk.chunk.bytes))
@@ -1301,9 +1436,11 @@ impl<C: Catalog> Materializer<C> {
         let prepared = meta.writer.prepare(&rows, &meta.file_index)?;
         let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
         for chunk in prepared.data {
+            // Marker meta-table is unpartitioned (the schema has no
+            // partition spec), so the segment is always empty.
             let path = self
                 .namer
-                .next_path(&meta.schema.ident, "meta-marker")
+                .next_path(&meta.schema.ident, "meta-marker", "")
                 .await;
             let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
