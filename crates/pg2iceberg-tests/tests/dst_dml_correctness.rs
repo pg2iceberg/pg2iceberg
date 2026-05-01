@@ -61,6 +61,7 @@ fn schema() -> TableSchema {
             },
         ],
         partition_spec: vec![],
+        pg_schema: None,
     }
 }
 
@@ -337,6 +338,7 @@ fn alter_table_add_column_mid_stream_propagates_to_iceberg() {
             },
         ],
         partition_spec: vec![],
+        pg_schema: None,
     };
     let mut visible = block_on(read_materialized_state(
         h.catalog.as_ref(),

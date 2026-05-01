@@ -309,6 +309,9 @@ where
     //    marker row — same correctness guarantee, simpler wire
     //    format.
     let slot_was_fresh = !lc.pg.slot_exists(&lc.slot_name).await?;
+    // Iceberg-side identifiers — used for coord state, watcher,
+    // catalog ops. The PG-side counterpart is `s.pg_ident()` and is
+    // built only at the publication / table-OID call sites below.
     let table_idents: Vec<TableIdent> = lc.schemas.iter().map(|s| s.ident.clone()).collect();
     // Auto-include `_pg2iceberg.markers` in the publication when
     // marker mode is enabled. The bluegreen replication
@@ -319,7 +322,10 @@ where
         namespace: pg2iceberg_core::Namespace(vec!["_pg2iceberg".into()]),
         name: "markers".into(),
     };
-    let mut pub_table_idents = table_idents.clone();
+    // PG-side idents for the publication — namespace = source PG
+    // schema, not Iceberg `sink.namespace`.
+    let mut pub_table_idents: Vec<TableIdent> =
+        lc.schemas.iter().map(|s| s.pg_ident()).collect();
     if lc.meta_namespace.is_some() {
         pub_table_idents.push(markers_table_ident.clone());
     }
@@ -365,6 +371,15 @@ where
             .collect();
         if !pk_cols.is_empty() {
             pipeline.register_primary_keys(s.ident.clone(), pk_cols);
+        }
+        // Register the PG → Iceberg ident translation so pgoutput
+        // ChangeEvents (keyed by PG schema) get retagged to the
+        // Iceberg-side ident before staging. No-op when the two
+        // idents are equal (legacy `sink.namespace = pg_schema`
+        // configs).
+        let pg_ident = s.pg_ident();
+        if pg_ident != s.ident {
+            pipeline.register_table_translation(pg_ident, s.ident.clone());
         }
     }
     if lc.meta_namespace.is_some() {
@@ -454,7 +469,7 @@ where
             for s in &lc.schemas {
                 let oid = lc
                     .pg
-                    .table_oid(&s.ident.namespace.0.join("."), &s.ident.name)
+                    .table_oid(s.pg_schema(), &s.ident.name)
                     .await?;
                 if let Some(v) = oid {
                     table_oids.insert(s.ident.clone(), v);
@@ -567,9 +582,8 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             .await
             .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
         let iceberg_name = format!("{}.{}", schema.ident.namespace, schema.ident.name);
-        let pg_oid = pg
-            .table_oid(&schema.ident.namespace.0.join("."), &schema.ident.name)
-            .await?;
+        let pg_ident = schema.pg_ident();
+        let pg_oid = pg.table_oid(schema.pg_schema(), &schema.ident.name).await?;
         // Per-table snapshot state from `_pg2iceberg.tables`. Cheap
         // single-row reads — one per registered table at startup.
         let stored_state = coord
@@ -577,12 +591,12 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             .await
             .map_err(|e| LifecycleError::Coord(e.to_string()))?;
         tables.push(TableExistence {
-            pg_table: schema.ident.clone(),
+            pg_table: pg_ident.clone(),
             iceberg_name,
             existed: meta.is_some(),
             current_snapshot_id: meta.and_then(|m| m.current_snapshot_id),
             current_pg_oid: pg_oid,
-            in_publication: pub_members.contains(&schema.ident),
+            in_publication: pub_members.contains(&pg_ident),
             stored_state,
         });
     }
@@ -850,6 +864,16 @@ where
 {
     if let Err(e) = loop_state.pipeline.flush().await {
         tracing::warn!(error = %e, "final flush failed");
+    }
+    // Run a final materializer cycle so everything that was just
+    // staged makes it into Iceberg before we exit. Without this,
+    // operators see a "shutdown looks fine, log_index has entries,
+    // but Iceberg is empty" situation — and the next start would
+    // re-process the same staged events. Errors here are logged but
+    // not fatal: the staged parquet is durable, so a subsequent
+    // start picks up where we left off.
+    if let Err(e) = loop_state.materializer.cycle().await {
+        tracing::warn!(error = %e, "final materializer cycle failed");
     }
     let final_lsn = loop_state.pipeline.flushed_lsn();
     // Stamp the final acked LSN before the standby ack — same write-

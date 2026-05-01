@@ -71,6 +71,7 @@ fn schema_with(table: &str, non_pk_name: &str, non_pk_ty: IcebergType) -> TableS
             },
         ],
         partition_spec: vec![],
+        pg_schema: None,
     }
 }
 

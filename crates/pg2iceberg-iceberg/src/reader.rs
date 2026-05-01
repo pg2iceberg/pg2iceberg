@@ -129,6 +129,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 
@@ -187,6 +188,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         };
         let w = TableWriter::new(schema.clone());
         let mut r = BTreeMap::new();

@@ -70,6 +70,7 @@ fn accounts_schema() -> TableSchema {
             },
         ],
         partition_spec: Vec::new(),
+        pg_schema: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn markers_schema() -> TableSchema {
             is_primary_key: true,
         }],
         partition_spec: Vec::new(),
+        pg_schema: None,
     }
 }
 

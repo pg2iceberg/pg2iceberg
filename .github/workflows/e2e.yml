@@ -1,0 +1,63 @@
+name: E2E
+
+# End-to-end suite: drives the real binary against PG + iceberg-rest +
+# MinIO + ClickHouse via docker-compose, runs every fixture under
+# `tests/cases/`, and diffs each test's ClickHouse output against its
+# `__reference.tsv`. Slow (~10–20s per case × 39 cases), so this is
+# manual / weekly only — not on every PR.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday 06:00 UTC.
+    - cron: "0 6 * * 0"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  e2e:
+    name: tests/run.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache from the build-test / integration jobs so
+          # this prod-feature release build doesn't evict their caches.
+          key: e2e
+
+      - name: Bring up the test stack
+        working-directory: tests
+        run: |
+          docker compose up -d --wait
+          # Extra wait: iceberg-rest can answer /v1/config before its
+          # JDBC pool is fully primed, which races the first table
+          # create. ClickHouse's initdb runs async too.
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8181/v1/config >/dev/null 2>&1 \
+              && curl -sf http://localhost:8123 --data-binary "SELECT 1" >/dev/null 2>&1 \
+              && break
+            sleep 2
+          done
+
+      - name: Build pg2iceberg (release, --features prod)
+        run: cargo build --release --features prod --bin pg2iceberg
+
+      - name: Run e2e suite
+        env:
+          # Run 4 cases in parallel: the docker-compose PG is
+          # configured with max_replication_slots=20 so 4 concurrent
+          # tests stay well under the cap.
+          PARALLEL: "4"
+        run: ./tests/run.sh
+
+      - name: Show stack logs on failure
+        if: failure()
+        working-directory: tests
+        run: docker compose logs --tail=100

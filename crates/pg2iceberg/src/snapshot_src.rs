@@ -141,8 +141,12 @@ impl PgSnapshotSource {
                     s.ident
                 );
             }
+            // Key by PG-side ident — `read_chunk` is called with the
+            // PG identifier (the snapshotter passes `s.pg_ident()`),
+            // and our SELECT issues against PG. The Iceberg-side
+            // `s.ident` is irrelevant here.
             by_ident.insert(
-                s.ident.clone(),
+                s.pg_ident(),
                 CachedSchema {
                     schema: s.clone(),
                     pk_cols,

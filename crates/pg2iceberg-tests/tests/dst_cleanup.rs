@@ -35,6 +35,7 @@ fn fresh_client() -> SimPgClient {
             is_primary_key: true,
         }],
         partition_spec: vec![],
+        pg_schema: None,
     })
     .unwrap();
     db.create_publication(PUB, &[ident()]).unwrap();

@@ -73,7 +73,7 @@ where
     let slot_monitor: Arc<dyn SlotMonitor> = pg_concrete.clone();
 
     // ── schema discovery (PG-specific) ─────────────────────────────
-    let schemas = discover_schemas(&cfg.tables, pg_concrete.as_ref()).await?;
+    let schemas = discover_schemas(&cfg.tables, pg_concrete.as_ref(), &cfg.sink.namespace).await?;
 
     // ── skip-snapshot opt-out ──────────────────────────────────────
     let skip_snapshot_idents: std::collections::BTreeSet<TableIdent> = cfg
@@ -132,7 +132,10 @@ where
         mat_cycle_limit: 64,
         consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory,
-        materializer_namer: Arc::new(CounterMaterializerNamer::new("materialized")),
+        materializer_namer: Arc::new(CounterMaterializerNamer::new(format!(
+            "{}/materialized",
+            cfg.sink.warehouse.trim_end_matches('/')
+        ))),
         blob_namer,
         metrics: Arc::new(InMemoryMetrics::new()),
         mode: Mode::Logical,
@@ -264,7 +267,10 @@ where
         coord,
         catalog: Arc::new(catalog),
         blob,
-        materializer_namer: Arc::new(CounterMaterializerNamer::new("materialized")),
+        materializer_namer: Arc::new(CounterMaterializerNamer::new(format!(
+            "{}/materialized",
+            cfg.sink.warehouse.trim_end_matches('/')
+        ))),
         tables,
         source_factory,
         poll_interval,
@@ -277,11 +283,16 @@ where
 pub(crate) async fn __discover_schemas_for_snapshot(
     tables: &[TableConfig],
     pg: &PgClientImpl,
+    sink_namespace: &str,
 ) -> Result<Vec<TableSchema>> {
-    discover_schemas(tables, pg).await
+    discover_schemas(tables, pg, sink_namespace).await
 }
 
-async fn discover_schemas(tables: &[TableConfig], pg: &PgClientImpl) -> Result<Vec<TableSchema>> {
+async fn discover_schemas(
+    tables: &[TableConfig],
+    pg: &PgClientImpl,
+    sink_namespace: &str,
+) -> Result<Vec<TableSchema>> {
     let mut resolved: Vec<TableSchema> = Vec::with_capacity(tables.len());
     for t in tables {
         let schema = if t.has_explicit_columns() {
@@ -293,6 +304,16 @@ async fn discover_schemas(tables: &[TableConfig], pg: &PgClientImpl) -> Result<V
                 .discover_schema(&ns, &name)
                 .await
                 .with_context(|| format!("discover schema for {}", t.name))?;
+            // The Iceberg namespace comes from `sink.namespace`. The
+            // PG schema is preserved separately on `s.pg_schema`,
+            // which `pg.discover_schema` populated above. When
+            // `sink.namespace` is empty, leave `ident.namespace` as
+            // the PG schema (legacy behaviour: PG schema doubles as
+            // Iceberg namespace).
+            if !sink_namespace.is_empty() {
+                s.ident.namespace =
+                    pg2iceberg_core::Namespace(vec![sink_namespace.to_string()]);
+            }
             // Operator-supplied PK overrides discovery.
             if !t.primary_key.is_empty() {
                 let pk_set: std::collections::BTreeSet<&str> =

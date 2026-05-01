@@ -99,6 +99,15 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// wrong for PK changes but matches the prior shape for tests
     /// that haven't registered PKs.
     primary_keys: BTreeMap<TableIdent, Vec<ColumnName>>,
+    /// PG → Iceberg ident translation, keyed by the source-side ident
+    /// the pgoutput stream emits in `ChangeEvent.table`. The lifecycle
+    /// registers one entry per replicated table so the pipeline's
+    /// internal state (staging blobs, log_index keys, coord cursors)
+    /// uses the Iceberg-side ident the materializer expects.
+    /// Tables with no entry pass through unchanged (legacy tests +
+    /// the meta-marker `_pg2iceberg.markers` table both rely on the
+    /// fall-through).
+    table_translation: BTreeMap<TableIdent, TableIdent>,
 }
 
 impl<C: Coordinator + ?Sized> Pipeline<C> {
@@ -136,6 +145,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             pending_markers_by_xid: BTreeMap::new(),
             ready_markers: Vec::new(),
             primary_keys: BTreeMap::new(),
+            table_translation: BTreeMap::new(),
         }
     }
 
@@ -145,6 +155,17 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// the old row stays orphaned in Iceberg.
     pub fn register_primary_keys(&mut self, table: TableIdent, pk_cols: Vec<ColumnName>) {
         self.primary_keys.insert(table, pk_cols);
+    }
+
+    /// Register a translation from the PG-side ident (as it appears
+    /// in `ChangeEvent.table` from the pgoutput stream) to the
+    /// Iceberg-side ident (where the table lives in the catalog).
+    /// When `sink.namespace` differs from the PG schema, every
+    /// incoming change must be retagged so the pipeline's staging
+    /// blobs / log_index entries are keyed by the Iceberg ident the
+    /// materializer reads.
+    pub fn register_table_translation(&mut self, pg_ident: TableIdent, iceberg_ident: TableIdent) {
+        self.table_translation.insert(pg_ident, iceberg_ident);
     }
 
     /// Enable blue-green marker detection. INSERTs to `table` are
@@ -191,7 +212,16 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 }
                 self.sink.commit_tx(xid, commit_lsn);
             }
-            DecodedMessage::Change(evt) => {
+            DecodedMessage::Change(mut evt) => {
+                // Translate the PG-side ident from the pgoutput stream
+                // into the Iceberg-side ident the rest of the
+                // pipeline (staging path, log_index keys, coord
+                // cursors) expects. Fall through unchanged when no
+                // mapping is registered — keeps test fixtures and
+                // the meta-marker table working.
+                if let Some(iceberg_ident) = self.table_translation.get(&evt.table) {
+                    evt.table = iceberg_ident.clone();
+                }
                 if let Some(marker_table) = &self.markers_table {
                     if evt.table == *marker_table && evt.op == Op::Insert {
                         // Intercept: extract uuid, don't stage as

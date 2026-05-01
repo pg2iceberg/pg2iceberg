@@ -313,6 +313,7 @@ mod schema_change_tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 
@@ -465,6 +466,7 @@ mod schema_change_tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         };
         apply_schema_changes(
             &mut s,

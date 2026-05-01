@@ -250,6 +250,7 @@ mod tests {
                 is_primary_key: true,
             }],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 
@@ -362,6 +363,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         };
         block_on(c.create_table(&s)).unwrap();
         let meta = block_on(c.evolve_schema(

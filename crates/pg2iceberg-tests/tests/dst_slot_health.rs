@@ -62,6 +62,7 @@ fn schema() -> TableSchema {
             is_primary_key: true,
         }],
         partition_spec: vec![],
+        pg_schema: None,
     }
 }
 

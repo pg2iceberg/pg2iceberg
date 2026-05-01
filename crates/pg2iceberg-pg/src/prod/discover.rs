@@ -60,6 +60,10 @@ pub(crate) async fn discover_schema(
     }
     Ok(TableSchema {
         ident: TableIdent {
+            // Initialised to the PG schema as a sensible default;
+            // the binary's `discover_schemas` overrides this with
+            // `sink.namespace` when configured (the Iceberg namespace
+            // and the PG schema are separate concepts).
             namespace: Namespace(vec![schema.to_string()]),
             name: table.to_string(),
         },
@@ -68,6 +72,7 @@ pub(crate) async fn discover_schema(
         // declared in YAML (`tables[].iceberg.partition`) and merged
         // by the binary before handing the schema to the catalog.
         partition_spec: Vec::new(),
+        pg_schema: Some(schema.to_string()),
     })
 }
 

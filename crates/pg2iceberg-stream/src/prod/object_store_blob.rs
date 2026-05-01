@@ -31,7 +31,20 @@ impl ObjectStoreBlobStore {
 }
 
 fn parse_path(input: &str) -> Result<Path> {
-    Path::parse(input).map_err(|e| StreamError::Io(format!("invalid object path {input:?}: {e}")))
+    // Accept full `s3://bucket/key` URIs as well as bucket-relative
+    // keys. Iceberg manifests carry full URIs so the materializer's
+    // `MaterializerNamer` outputs them; the put path here must
+    // tolerate the same form. We strip the `s3[a]://<bucket>/`
+    // prefix and let the underlying `object_store` (already bound to
+    // a bucket) handle the rest.
+    let stripped = input
+        .strip_prefix("s3://")
+        .or_else(|| input.strip_prefix("s3a://"))
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_bucket, key)| key)
+        .unwrap_or(input);
+    Path::parse(stripped)
+        .map_err(|e| StreamError::Io(format!("invalid object path {input:?}: {e}")))
 }
 
 #[async_trait]

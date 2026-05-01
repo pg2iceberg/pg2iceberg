@@ -317,8 +317,12 @@ impl Snapshotter {
                     }
                 }
 
+                // PG-side ident — `read_chunk` issues a SELECT against
+                // the source PG table, so namespace must be the PG
+                // schema (not the Iceberg `sink.namespace`).
+                let pg_ident = schema.pg_ident();
                 let chunk = source
-                    .read_chunk(&schema.ident, self.chunk_size, last_pk_key.as_deref())
+                    .read_chunk(&pg_ident, self.chunk_size, last_pk_key.as_deref())
                     .await?;
                 if chunk.is_empty() {
                     // Table done — drop the resume cursor and stamp

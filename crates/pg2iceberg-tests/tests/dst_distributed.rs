@@ -79,6 +79,7 @@ fn schema(name: &str) -> TableSchema {
             },
         ],
         partition_spec: vec![],
+        pg_schema: None,
     }
 }
 

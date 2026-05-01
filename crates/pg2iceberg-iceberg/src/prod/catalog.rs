@@ -650,6 +650,7 @@ fn from_iceberg_schema(
         ident: ident.clone(),
         columns,
         partition_spec: partition_fields,
+        pg_schema: None,
     })
 }
 
@@ -896,6 +897,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 
@@ -921,6 +923,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 

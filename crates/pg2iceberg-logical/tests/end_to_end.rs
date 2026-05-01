@@ -54,6 +54,7 @@ fn orders_schema() -> TableSchema {
             },
         ],
         partition_spec: Vec::new(),
+        pg_schema: None,
     }
 }
 

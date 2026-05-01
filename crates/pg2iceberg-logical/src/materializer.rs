@@ -84,6 +84,7 @@ pub fn meta_marker_table_schema(meta_namespace: &str, table_name: &str) -> Table
             },
         ],
         partition_spec: Vec::new(),
+        pg_schema: None,
     }
 }
 

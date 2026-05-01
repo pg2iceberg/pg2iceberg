@@ -58,6 +58,7 @@ fn schema_id_qty() -> TableSchema {
             },
         ],
         partition_spec: Vec::new(),
+        pg_schema: None,
     }
 }
 
@@ -85,6 +86,7 @@ fn schema_partitioned_by_region() -> TableSchema {
             name: "region".into(),
             transform: Transform::Identity,
         }],
+        pg_schema: None,
     }
 }
 
@@ -458,6 +460,7 @@ fn schema_named(name: &str) -> TableSchema {
             },
         ],
         partition_spec: Vec::new(),
+        pg_schema: None,
     }
 }
 

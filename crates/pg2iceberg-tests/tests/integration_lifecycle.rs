@@ -365,6 +365,7 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
             },
         ],
         partition_spec: vec![],
+        pg_schema: None,
     };
     let pk_cols = vec![ColumnName("id".into())];
 

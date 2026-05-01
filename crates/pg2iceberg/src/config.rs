@@ -576,6 +576,7 @@ impl TableConfig {
             },
             columns,
             partition_spec,
+            pg_schema: None,
         })
     }
 }

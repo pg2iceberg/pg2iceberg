@@ -550,6 +550,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 
@@ -794,6 +795,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         };
         let w = TableWriter::new(schema);
         let mut r = BTreeMap::new();
@@ -875,6 +877,7 @@ mod tests {
                 is_primary_key: true,
             }],
             partition_spec: Vec::new(),
+            pg_schema: None,
         };
         let w = TableWriter::new(schema);
         let mut r = BTreeMap::new();
@@ -924,6 +927,7 @@ mod tests {
                 name: "region".into(),
                 transform: Transform::Identity,
             }],
+            pg_schema: None,
         }
     }
 
@@ -1004,6 +1008,7 @@ mod tests {
                 name: "created_at_day".into(),
                 transform: Transform::Day,
             }],
+            pg_schema: None,
         }
     }
 
@@ -1249,6 +1254,7 @@ mod tests {
                 name: "id_bucket".into(),
                 transform: Transform::Bucket(4),
             }],
+            pg_schema: None,
         };
         let w = TableWriter::new(schema);
         let rows: Vec<MaterializedRow> = (1..=20)
@@ -1309,6 +1315,7 @@ mod tests {
                 name: "name_trunc".into(),
                 transform: Transform::Truncate(2),
             }],
+            pg_schema: None,
         };
         let w = TableWriter::new(schema);
         let row = |id: i32, name: &str| {
@@ -1372,6 +1379,7 @@ mod tests {
                 name: "d_day".into(),
                 transform: Transform::Day,
             }],
+            pg_schema: None,
         };
         let w = TableWriter::new(schema);
         let mut r = BTreeMap::new();

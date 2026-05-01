@@ -110,6 +110,7 @@ pub fn meta_commits_schema(meta_namespace: &str) -> TableSchema {
             col("pg2iceberg_commit_sha", 16, IcebergType::String, true),
         ],
         partition_spec: day_partition_spec(),
+        pg_schema: None,
     }
 }
 
@@ -128,6 +129,7 @@ pub fn meta_checkpoints_schema(meta_namespace: &str) -> TableSchema {
             col("pg2iceberg_commit_sha", 5, IcebergType::String, true),
         ],
         partition_spec: day_partition_spec(),
+        pg_schema: None,
     }
 }
 
@@ -156,6 +158,7 @@ pub fn meta_compactions_schema(meta_namespace: &str) -> TableSchema {
             col("pg2iceberg_commit_sha", 15, IcebergType::String, true),
         ],
         partition_spec: day_partition_spec(),
+        pg_schema: None,
     }
 }
 
@@ -177,6 +180,7 @@ pub fn meta_maintenance_schema(meta_namespace: &str) -> TableSchema {
             col("pg2iceberg_commit_sha", 8, IcebergType::String, true),
         ],
         partition_spec: day_partition_spec(),
+        pg_schema: None,
     }
 }
 

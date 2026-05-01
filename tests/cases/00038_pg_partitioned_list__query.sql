@@ -1,0 +1,1 @@
+SELECT id, region, name FROM iceberg.`default.e2e_pg_part_list` ORDER BY id

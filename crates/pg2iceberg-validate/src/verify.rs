@@ -206,6 +206,7 @@ mod tests {
                 },
             ],
             partition_spec: Vec::new(),
+            pg_schema: None,
         }
     }
 

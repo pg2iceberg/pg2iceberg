@@ -182,12 +182,20 @@ fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
     }
     let bucket = bucket_from_warehouse(&cfg.sink.warehouse)?;
     let prefix = prefix_from_warehouse(&cfg.sink.warehouse);
+    // object_store defaults `allow_http=false`. With the default,
+    // reqwest is built with `https_only(true)` and refuses `http://`
+    // requests at send time with "builder error for url (...)" — no
+    // network call is made. We allow plain HTTP when the operator
+    // configured an `http://` endpoint (MinIO, LocalStack, on-prem
+    // S3-compatible setups). HTTPS endpoints retain the strict default.
+    let allow_http = cfg.sink.s3_endpoint.starts_with("http://");
     let inner = object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(&bucket)
         .with_region(&cfg.sink.s3_region)
         .with_endpoint(&cfg.sink.s3_endpoint)
         .with_access_key_id(&cfg.sink.s3_access_key)
         .with_secret_access_key(&cfg.sink.s3_secret_key)
+        .with_allow_http(allow_http)
         // Path-style is the safe default for non-AWS S3 (MinIO, LocalStack).
         // AWS itself accepts both; it's only newer endpoints that are
         // virtual-hosted-only, and we'd flip this when we hit one.
@@ -212,7 +220,12 @@ fn build_s3_iam(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
         .with_bucket_name(&bucket)
         .with_region(&cfg.sink.s3_region);
     if !cfg.sink.s3_endpoint.is_empty() {
-        builder = builder.with_endpoint(&cfg.sink.s3_endpoint);
+        // See the matching comment in `build_s3_static` for why
+        // `allow_http` flips with the endpoint scheme.
+        let allow_http = cfg.sink.s3_endpoint.starts_with("http://");
+        builder = builder
+            .with_endpoint(&cfg.sink.s3_endpoint)
+            .with_allow_http(allow_http);
     }
     let inner = builder.build().context("AmazonS3Builder build")?;
     let store: Arc<dyn object_store::ObjectStore> = if let Some(p) = prefix {
@@ -396,8 +409,9 @@ where
     // helper with sim plumbing, so any change to lifecycle behavior
     // gets fault-tested.
     let id_gen = Arc::new(crate::realio::RealIdGen::new());
+    let staged_base = format!("{}/staged", cfg.sink.warehouse.trim_end_matches('/'));
     let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
-        Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
+        Arc::new(UuidBlobNamer::new(id_gen.clone(), staged_base));
     let mut lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
         .await
         .context("build logical lifecycle")?;
@@ -656,7 +670,8 @@ async fn build_one_shot_materializer(
         resolved_schemas.push(schema);
     }
 
-    let mat_namer = Arc::new(CounterMaterializerNamer::new("materialized"));
+    let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
+    let mat_namer = Arc::new(CounterMaterializerNamer::new(mat_base));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(coord, blob, catalog, mat_namer, &cfg.state.group, 64);
     for s in &resolved_schemas {
@@ -900,9 +915,10 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
             .await
             .context("source PG connect")?,
     );
-    let schemas = crate::setup::__discover_schemas_for_snapshot(&cfg.tables, pg.as_ref())
-        .await
-        .context("discover schemas")?;
+    let schemas =
+        crate::setup::__discover_schemas_for_snapshot(&cfg.tables, pg.as_ref(), &cfg.sink.namespace)
+            .await
+            .context("discover schemas")?;
 
     // ── early exit: every configured table already snapshotted ─────
     // Per-table state in `_pg2iceberg.tables` replaces the old
@@ -963,8 +979,9 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     }
 
     // ── pipeline + materializer ────────────────────────────────────
+    let staged_base = format!("{}/staged", cfg.sink.warehouse.trim_end_matches('/'));
     let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
-        Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
+        Arc::new(UuidBlobNamer::new(id_gen.clone(), staged_base));
     let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::new(
         Arc::clone(&coord),
         Arc::clone(&blob),
@@ -979,10 +996,18 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
         if !pk_cols.is_empty() {
             pipeline.register_primary_keys(s.ident.clone(), pk_cols);
         }
+        // PG → Iceberg ident translation. Mirrors the same call in
+        // `run_logical_lifecycle`; needed because this path drives
+        // its own pipeline + materializer outside the lifecycle.
+        let pg_ident = s.pg_ident();
+        if pg_ident != s.ident {
+            pipeline.register_table_translation(pg_ident, s.ident.clone());
+        }
     }
 
+    let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
     let mat_namer =
-        Arc::new(pg2iceberg_logical::materializer::CounterMaterializerNamer::new("materialized"));
+        Arc::new(pg2iceberg_logical::materializer::CounterMaterializerNamer::new(mat_base));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(
             Arc::clone(&coord),
@@ -1015,7 +1040,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
         std::collections::BTreeMap::new();
     for s in &schemas {
         if let Some(v) = pg
-            .table_oid(&s.ident.namespace.0.join("."), &s.ident.name)
+            .table_oid(s.pg_schema(), &s.ident.name)
             .await
             .with_context(|| format!("table_oid for {}", s.ident))?
         {

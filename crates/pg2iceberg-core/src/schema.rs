@@ -44,17 +44,55 @@ pub struct ColumnSchema {
 
 #[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub struct TableSchema {
+    /// Iceberg-side identifier — where this table lives in the
+    /// catalog. The `namespace` here is the operator's
+    /// `sink.namespace`, **not** the PG schema.
     pub ident: TableIdent,
     pub columns: Vec<ColumnSchema>,
     /// Iceberg partition spec. Empty = unpartitioned.
     /// Source columns must reference names that exist in `columns`.
     #[serde(default)]
     pub partition_spec: Vec<PartitionField>,
+    /// Source-side PG schema name, e.g. `"public"`. Set by
+    /// `pg.discover_schema` and used by replication / snapshot SELECT
+    /// / table-OID lookups. `None` means "fall back to
+    /// `ident.namespace.0[0]`" — the legacy behaviour from before
+    /// PG schema and Iceberg namespace were decoupled, retained so
+    /// hand-built fixtures keep working.
+    #[serde(default)]
+    pub pg_schema: Option<String>,
 }
 
 impl TableSchema {
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &ColumnSchema> {
         self.columns.iter().filter(|c| c.is_primary_key)
+    }
+
+    /// Source-side PG schema name. Reads `pg_schema` if set,
+    /// otherwise falls back to the first segment of `ident.namespace`
+    /// (the legacy "PG schema and Iceberg namespace are the same"
+    /// invariant).
+    pub fn pg_schema(&self) -> &str {
+        if let Some(s) = self.pg_schema.as_deref() {
+            return s;
+        }
+        self.ident
+            .namespace
+            .0
+            .first()
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Source-side `TableIdent` (namespace = PG schema, name =
+    /// table name). Used wherever pg2iceberg has to address the
+    /// source table by its real PG location: publication FOR TABLE,
+    /// snapshot SELECT, `pg_class.oid` lookup.
+    pub fn pg_ident(&self) -> TableIdent {
+        TableIdent {
+            namespace: Namespace(vec![self.pg_schema().to_string()]),
+            name: self.ident.name.clone(),
+        }
     }
 
     pub fn is_partitioned(&self) -> bool {
