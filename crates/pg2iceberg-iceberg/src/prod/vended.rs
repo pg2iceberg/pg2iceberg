@@ -269,7 +269,7 @@ impl VendedBlobStoreRouter {
         // Sort longest base_path first so longest-prefix-match works
         // with a simple linear scan. Two tables can't share a base
         // path, so stable order doesn't matter.
-        entries.sort_by(|a, b| b.base_path.len().cmp(&a.base_path.len()));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.base_path.len()));
         Ok(Self {
             entries,
             catalog,

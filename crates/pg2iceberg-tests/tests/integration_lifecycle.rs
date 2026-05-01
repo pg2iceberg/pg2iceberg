@@ -71,6 +71,7 @@ fn uniq() -> String {
 /// Bring up the full container stack on a fresh per-test network.
 /// Returns the source-PG DSN, REST-catalog URL, MinIO host:port,
 /// and live container handles (kept alive by the caller).
+#[allow(dead_code)]
 struct Stack {
     network: String,
     pg_dsn: String,
