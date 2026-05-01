@@ -50,12 +50,31 @@ pub fn fold_events(events: Vec<MatEvent>, pk_cols: &[ColumnName]) -> Vec<Materia
     let mut by_pk: BTreeMap<String, MaterializedRow> = BTreeMap::new();
     for evt in events {
         let key = pk_key(&evt.row, pk_cols);
+        let mut new_row = evt.row;
+        let mut unchanged = evt.unchanged_cols;
+        // Inherit unchanged-TOAST values from the prior event for the
+        // same PK in this cycle. pgoutput emits `'u'` (unchanged
+        // sentinel) for TOAST columns whose value didn't move on an
+        // UPDATE; without this merge, an INSERT-then-UPDATE inside a
+        // single cycle leaves the UPDATE's row with sentinels and
+        // FileIndex resolution fails (no committed data file yet).
+        if !unchanged.is_empty() {
+            if let Some(prev) = by_pk.get(&key) {
+                unchanged.retain(|col| match prev.row.get(col) {
+                    Some(v) => {
+                        new_row.insert(col.clone(), v.clone());
+                        false
+                    }
+                    None => true,
+                });
+            }
+        }
         by_pk.insert(
             key,
             MaterializedRow {
                 op: evt.op,
-                row: evt.row,
-                unchanged_cols: evt.unchanged_cols,
+                row: new_row,
+                unchanged_cols: unchanged,
             },
         );
     }

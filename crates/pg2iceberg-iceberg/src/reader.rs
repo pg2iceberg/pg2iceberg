@@ -6,12 +6,12 @@
 
 use crate::writer::WriterError;
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pg2iceberg_core::value::{DaysSinceEpoch, TimestampMicros};
+use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
 use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, PgValue, Row};
 use std::collections::BTreeMap;
 
@@ -86,10 +86,34 @@ fn decode_value(ty: IcebergType, arr: &dyn Array, i: usize) -> Result<PgValue> {
         IcebergType::TimestampTz => {
             PgValue::TimestampTz(TimestampMicros(cast!(TimestampMicrosecondArray)?.value(i)))
         }
-        IcebergType::Time
-        | IcebergType::Decimal { .. }
-        | IcebergType::Binary
-        | IcebergType::Uuid => {
+        IcebergType::Decimal { scale, .. } => {
+            let arr = cast!(Decimal128Array)?;
+            let unscaled = arr.value(i);
+            // Re-pack as the unscaled-be-bytes shape PG/PgValue uses.
+            // We carry the column's iceberg scale on the wire so the
+            // round-trip preserves both the exact integer value and
+            // the decimal-point position. Trimming leading sign-
+            // extension bytes keeps the encoding minimal.
+            let mut bytes = unscaled.to_be_bytes().to_vec();
+            // Strip redundant leading 0x00 (positive) or 0xFF
+            // (negative) bytes while keeping the sign bit consistent
+            // with the next byte.
+            while bytes.len() > 1 {
+                let head = bytes[0];
+                let next = bytes[1];
+                let head_is_redundant = (head == 0x00 && (next & 0x80) == 0)
+                    || (head == 0xFF && (next & 0x80) != 0);
+                if !head_is_redundant {
+                    break;
+                }
+                bytes.remove(0);
+            }
+            PgValue::Numeric(Decimal {
+                unscaled_be_bytes: bytes,
+                scale,
+            })
+        }
+        IcebergType::Time | IcebergType::Binary | IcebergType::Uuid => {
             return Err(WriterError::TypeNotYetSupported(ty));
         }
     })

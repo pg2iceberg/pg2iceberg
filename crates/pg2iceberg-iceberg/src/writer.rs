@@ -8,8 +8,8 @@
 use crate::file_index::FileIndex;
 use crate::fold::{pk_key, MaterializedRow};
 use arrow_array::builder::{
-    BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-    StringBuilder, TimestampMicrosecondBuilder,
+    BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -362,11 +362,73 @@ fn arrow_data_type(ty: IcebergType) -> DataType {
         IcebergType::TimestampTz => {
             DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()))
         }
+        IcebergType::Decimal { precision, scale } => {
+            DataType::Decimal128(precision as u8, scale as i8)
+        }
         // Phase 7.5 wires these.
-        IcebergType::Decimal { .. } | IcebergType::Binary | IcebergType::Uuid => {
+        IcebergType::Binary | IcebergType::Uuid => {
             DataType::Null // placeholder; we error before constructing arrays
         }
     }
+}
+
+/// Convert a `PgValue::Numeric` to the i128 the Arrow `Decimal128`
+/// builder expects, rescaled to `target_scale` (the column's iceberg
+/// scale). Returns `None` if the value can't be represented (e.g.
+/// the unscaled bytes overflow i128, or upscaling would lose
+/// precision because the source has more fractional digits than the
+/// column allows). The PG side already enforces `precision ≤ 38` at
+/// startup, so the i128 fit is the only practical risk here.
+fn decimal_to_arrow_i128(d: &pg2iceberg_core::value::Decimal, target_scale: i32) -> Option<i128> {
+    // Sign-extend the unscaled big-endian bytes to a 16-byte i128.
+    if d.unscaled_be_bytes.is_empty() {
+        return Some(0);
+    }
+    if d.unscaled_be_bytes.len() > 16 {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    let pad = 16 - d.unscaled_be_bytes.len();
+    // Sign-extend: if the high bit of the first byte is set the
+    // value is negative; pad with 0xFF so the two's-complement
+    // representation stays consistent.
+    let sign = if d.unscaled_be_bytes[0] & 0x80 != 0 {
+        0xFFu8
+    } else {
+        0
+    };
+    for b in buf.iter_mut().take(pad) {
+        *b = sign;
+    }
+    buf[pad..].copy_from_slice(&d.unscaled_be_bytes);
+    let mut value = i128::from_be_bytes(buf);
+    // Rescale to the column's iceberg scale.
+    let src_scale = d.scale as i32;
+    if target_scale > src_scale {
+        // Upscale: multiply by 10^(target - src). Saturating not OK —
+        // rather return None than silently corrupt.
+        let diff = (target_scale - src_scale) as u32;
+        let factor = 10i128.checked_pow(diff)?;
+        value = value.checked_mul(factor)?;
+    } else if target_scale < src_scale {
+        // Downscale would silently truncate fractional digits and
+        // lose precision. We refuse rather than mask data loss —
+        // PG-side casts to a stricter `numeric(p,s)` would have
+        // erred at write time, and a CDC pipeline that drops
+        // precision after the fact is a foot-gun. The caller
+        // surfaces this as `WriterError::Encode`, refuses the
+        // commit, and the operator sees a loud failure instead of
+        // bad rows.
+        let diff = (src_scale - target_scale) as u32;
+        let divisor = 10i128.checked_pow(diff)?;
+        let truncated = value.checked_div(divisor)?;
+        let remainder = value.checked_rem(divisor)?;
+        if remainder != 0 {
+            return None;
+        }
+        value = truncated;
+    }
+    Some(value)
 }
 
 fn write_chunk(
@@ -506,10 +568,54 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
                 _ => None,
             }
         ),
-        IcebergType::Time
-        | IcebergType::Decimal { .. }
-        | IcebergType::Binary
-        | IcebergType::Uuid => {
+        IcebergType::Decimal { precision, scale } => {
+            let mut b = Decimal128Builder::with_capacity(n)
+                .with_precision_and_scale(precision as u8, scale as i8)
+                .map_err(|e| {
+                    WriterError::Encode(format!(
+                        "Decimal128Builder precision={precision} scale={scale}: {e}"
+                    ))
+                })?;
+            for r in rows {
+                match r.get(&key) {
+                    None => {
+                        if !col.nullable {
+                            return Err(WriterError::MissingColumn {
+                                col: col.name.clone(),
+                            });
+                        }
+                        b.append_null();
+                    }
+                    Some(PgValue::Null) => {
+                        if !col.nullable {
+                            return Err(WriterError::NullInNonNullable {
+                                col: col.name.clone(),
+                            });
+                        }
+                        b.append_null();
+                    }
+                    Some(PgValue::Numeric(d)) => match decimal_to_arrow_i128(d, scale as i32) {
+                        Some(x) => b.append_value(x),
+                        None => {
+                            return Err(WriterError::Encode(format!(
+                                "decimal value (scale={}) out of range for \
+                                 Decimal128({precision},{scale}) — would lose precision \
+                                 or overflow i128",
+                                d.scale
+                            )));
+                        }
+                    },
+                    Some(other) => {
+                        return Err(WriterError::UnsupportedValue {
+                            ty: col.ty,
+                            value: other.clone(),
+                        });
+                    }
+                }
+            }
+            Arc::new(b.finish()) as Arc<dyn Array>
+        }
+        IcebergType::Time | IcebergType::Binary | IcebergType::Uuid => {
             return Err(WriterError::TypeNotYetSupported(col.ty));
         }
     };
@@ -523,9 +629,90 @@ mod tests {
     use crate::fold::MaterializedRow;
     use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use pg2iceberg_core::value::{DaysSinceEpoch, TimestampMicros};
+    use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
     use pg2iceberg_core::{Namespace, PartitionField, TableIdent, TableSchema, Transform};
     use std::collections::BTreeMap;
+
+    // ── Decimal scaling: never silently lose precision ────────────────
+
+    /// Build a `PgValue::Numeric` from a signed decimal string. Caller
+    /// owns the precision/scale convention; this helper just packs the
+    /// big-endian unscaled bytes correctly so the writer's i128 path
+    /// is exercised.
+    fn dec_from_i128(unscaled: i128, scale: u8) -> Decimal {
+        Decimal {
+            unscaled_be_bytes: unscaled.to_be_bytes().to_vec(),
+            scale,
+        }
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_same_scale_round_trips() {
+        // 1.23 (i.e. unscaled=123, scale=2) → i128=123 at target_scale=2.
+        let d = dec_from_i128(123, 2);
+        assert_eq!(decimal_to_arrow_i128(&d, 2), Some(123));
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_upscale_is_lossless() {
+        // 1.23 (scale=2) → target_scale=4 → 12300.
+        let d = dec_from_i128(123, 2);
+        assert_eq!(decimal_to_arrow_i128(&d, 4), Some(12_300));
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_downscale_with_zero_remainder_succeeds() {
+        // 1.2300 (scale=4) → target_scale=2 → 123 (no fractional loss).
+        let d = dec_from_i128(12_300, 4);
+        assert_eq!(decimal_to_arrow_i128(&d, 2), Some(123));
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_downscale_with_nonzero_remainder_refuses() {
+        // 1.2345 (scale=4) → target_scale=2 → would silently truncate
+        // to 1.23, losing the 0.0045. Must return None so the writer
+        // raises `WriterError::Encode` and the operator sees the data
+        // refused rather than dropped.
+        let d = dec_from_i128(12_345, 4);
+        assert_eq!(decimal_to_arrow_i128(&d, 2), None);
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_downscale_negative_value_with_remainder_refuses() {
+        // Negative-value flavour of the lossy-downscale guard. Same
+        // reasoning, exercises the sign-bit path through the helper.
+        let d = dec_from_i128(-12_345, 4);
+        assert_eq!(decimal_to_arrow_i128(&d, 2), None);
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_negative_round_trips() {
+        let d = dec_from_i128(-123, 2);
+        assert_eq!(decimal_to_arrow_i128(&d, 2), Some(-123));
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_preserves_short_byte_input() {
+        // Real PG sends the unscaled value as the minimum number of
+        // bytes — `123` is one byte (`0x7B`), not eight. The helper
+        // sign-extends correctly.
+        let d = Decimal {
+            unscaled_be_bytes: vec![0x7B],
+            scale: 0,
+        };
+        assert_eq!(decimal_to_arrow_i128(&d, 0), Some(123));
+    }
+
+    #[test]
+    fn decimal_to_arrow_i128_short_byte_negative_sign_extends() {
+        // `-128` as a single byte is `0x80`. Sign-extension to i128
+        // must produce a negative value, not 0x80 = 128.
+        let d = Decimal {
+            unscaled_be_bytes: vec![0x80],
+            scale: 0,
+        };
+        assert_eq!(decimal_to_arrow_i128(&d, 0), Some(-128));
+    }
 
     fn schema_id_qty() -> TableSchema {
         TableSchema {
