@@ -88,6 +88,107 @@ ch_query() {
     curl -sf "$CLICKHOUSE_URL" --data-binary "$sql" 2>/dev/null
 }
 
+# Run a SELECT against DuckDB's Iceberg REST integration. The user-authored
+# query body (e.g. `SELECT … FROM lake.default.<table> ORDER BY id`) is
+# wrapped in a `COPY … TO '/dev/stdout'` so the output is deterministic
+# TSV — same shape as ClickHouse's TabSeparated, including `\N` for null —
+# which lets the same diff/reference machinery work for both engines.
+#
+# Used for cases that hit ClickHouse-side bugs in specific Iceberg types
+# (e.g. UUID round-tripping). Opt in per-case by adding a leading comment
+# line `# engine: duckdb` at the top of the `__reference.tsv`. Default
+# remains ClickHouse. Comment lines are stripped before the diff so they
+# don't contaminate the expected output.
+dq_query() {
+    local sql="$1"
+    # Strip a trailing semicolon if the user-authored query has one — the
+    # COPY wrapper takes a SELECT expression, not a statement.
+    sql="${sql%;}"
+    sql="${sql%$'\n'}"
+    sql="${sql%;}"
+    local s3_host="${S3_ENDPOINT#http://}"
+    s3_host="${s3_host#https://}"
+    # COPY targets a real temp file rather than `/dev/stdout` so the
+    # ack/affected-row chatter from INSTALL / LOAD / CREATE SECRET /
+    # ATTACH (which DuckDB always prints in batch mode) doesn't
+    # contaminate the captured output. Only the file's contents go to
+    # stdout. Stderr is left on the terminal so iceberg-extension load /
+    # ATTACH / secret errors stay visible during iteration.
+    local out_file
+    out_file=$(mktemp)
+    duckdb -batch >/dev/null <<DUCKDB
+-- Pin the session TZ so TIMESTAMPTZ rendering matches across machines.
+-- DuckDB defaults to the host's local TZ, which would make the same
+-- reference TSV pass on UTC CI runners and fail on a +08 dev laptop.
+SET TimeZone = 'UTC';
+INSTALL iceberg;
+LOAD iceberg;
+INSTALL httpfs;
+LOAD httpfs;
+CREATE OR REPLACE SECRET s3_secret (
+    TYPE S3,
+    KEY_ID '${S3_ACCESS_KEY}',
+    SECRET '${S3_SECRET_KEY}',
+    ENDPOINT '${s3_host}',
+    URL_STYLE 'path',
+    USE_SSL false,
+    REGION 'us-east-1'
+);
+-- The dev/test iceberg-rest container is anonymous; DuckDB's iceberg
+-- extension defaults to AUTHORIZATION_TYPE 'oauth2' which then
+-- demands a SECRET / client_id+client_secret. Pin to 'none' so the
+-- ATTACH succeeds against the unauthenticated localhost catalog.
+ATTACH 'warehouse' AS lake (TYPE ICEBERG, ENDPOINT '${CATALOG_URI}', AUTHORIZATION_TYPE 'none');
+COPY (
+${sql}
+) TO '${out_file}' WITH (FORMAT CSV, DELIMITER E'\t', HEADER false, NULLSTR '\N');
+DUCKDB
+    local rc=$?
+    if [ "$rc" -eq 0 ] && [ -f "$out_file" ]; then
+        cat "$out_file"
+    fi
+    if [ "${KEEP_TMP:-0}" = "1" ]; then
+        # Surface where the raw duckdb output landed so a contributor
+        # regenerating a reference TSV can copy the exact bytes.
+        echo "  DQ_OUT: $out_file" >&2
+    else
+        rm -f "$out_file"
+    fi
+    return "$rc"
+}
+
+# Read the engine for a test (default: clickhouse). Opt-in per-case via a
+# leading `# engine: <name>` comment line in the `__reference.tsv`. Only
+# scans contiguous leading `#` lines so a stray `#` inside expected data
+# can't accidentally toggle the engine.
+read_engine() {
+    local reference_file="$1"
+    [ -f "$reference_file" ] || { echo "clickhouse"; return; }
+    awk '
+        /^#/ {
+            sub(/^#[[:space:]]*/, "", $0)
+            if (match($0, /^engine:[[:space:]]*[A-Za-z0-9_]+/)) {
+                # Print the value after "engine:".
+                sub(/^engine:[[:space:]]*/, "", $0)
+                print tolower($0)
+                exit
+            }
+            next
+        }
+        { exit }
+    ' "$reference_file" | tr -d '[:space:]' | { read -r v; echo "${v:-clickhouse}"; }
+}
+
+# Strip leading comment lines (anything starting with `#`) from a
+# reference file so they don't contaminate the diff. Stops at the first
+# non-comment line.
+strip_reference_comments() {
+    local reference_file="$1"
+    awk 'BEGIN { stripping = 1 }
+         stripping && /^#/ { next }
+         { stripping = 0; print }' "$reference_file"
+}
+
 # Extract table name from setup SQL (first CREATE TABLE statement).
 extract_table_name() {
     local sql="$1"
@@ -250,10 +351,28 @@ run_test() {
 
     info "TEST: $test_name"
 
+    # In PARALLEL mode each invocation runs in a `&` subshell, so any
+    # `failed=…` / `errors+=…` mutations the parent expects are lost.
+    # Counting must happen via files in $RESULT_DIR — record exactly one
+    # PASS / FAIL marker per test, including for early aborts (missing
+    # fixtures, setup/data failure, replication-start failure). Without
+    # this, aborted tests vanish from the totals (40 cases → 38 results).
+    record_result() {
+        local result="$1"
+        if [ -n "${tmp_dir:-}" ] && [ -d "$tmp_dir" ]; then
+            echo "$result" > "${tmp_dir}/result"
+        fi
+        if [ -n "${RESULT_DIR:-}" ]; then
+            mkdir -p "$RESULT_DIR"
+            printf '%s\n' "$result" > "${RESULT_DIR}/${test_name}"
+        fi
+    }
+
     # Validate files exist.
     for f in "$input_file" "$query_file" "$reference_file"; do
         if [ ! -f "$f" ]; then
             echo "  SKIP: missing $(basename "$f")"
+            record_result FAIL
             return
         fi
     done
@@ -265,6 +384,7 @@ run_test() {
     table="$(extract_table_name "$setup_sql")"
     if [ -z "$table" ]; then
         echo "  SKIP: could not extract table name from setup SQL"
+        record_result FAIL
         return
     fi
 
@@ -274,6 +394,9 @@ run_test() {
         publication="pg2iceberg_pub_${table}"
     fi
     local slot="pg2iceberg_slot_${table}"
+
+    local engine
+    engine="$(read_engine "$reference_file")"
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
@@ -322,8 +445,7 @@ run_test() {
             if [ $? -ne 0 ]; then
                 echo "  ERROR: setup failed"
                 echo "$out" | head -5
-                failed=$((failed + 1))
-                errors+=("$test_name")
+                record_result FAIL
                 return
             fi
             ;;
@@ -342,8 +464,7 @@ run_test() {
                         echo "  Log tail:"
                         tail -5 "$pg2iceberg_log" | sed 's/^/    /'
                     fi
-                    failed=$((failed + 1))
-                    errors+=("$test_name")
+                    record_result FAIL
                     return
                 fi
                 replication_started=true
@@ -354,8 +475,7 @@ run_test() {
             if [ $? -ne 0 ]; then
                 echo "  ERROR: data step failed"
                 echo "$out" | head -5
-                failed=$((failed + 1))
-                errors+=("$test_name")
+                record_result FAIL
                 return
             fi
             ;;
@@ -383,21 +503,31 @@ run_test() {
         wait "$pg2iceberg_pid" 2>/dev/null || true
     fi
 
-    # ── Verify via ClickHouse ──
+    # ── Verify via the per-case engine (default ClickHouse) ──
     local query_sql
     query_sql="$(cat "$query_file")"
 
     local expected
-    expected="$(cat "$reference_file")"
+    expected="$(strip_reference_comments "$reference_file")"
 
     # Retry query a few times — ClickHouse schema cache invalidation is async,
     # so the first query after shutdown may still see stale (empty) state.
+    # DuckDB has no cache to drop, so the same retry loop just re-issues the
+    # query in case the metadata pointer is still settling on the catalog.
     local actual=""
     local retry=0
     while [ $retry -lt 5 ]; do
-        ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
-        sleep 1
-        actual=$(ch_query "$query_sql" 2>&1) || true
+        case "$engine" in
+        duckdb)
+            sleep 1
+            actual=$(dq_query "$query_sql") || true
+            ;;
+        *)
+            ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
+            sleep 1
+            actual=$(ch_query "$query_sql" 2>&1) || true
+            ;;
+        esac
         if [ "$actual" = "$expected" ]; then
             break
         fi
@@ -406,9 +536,9 @@ run_test() {
 
     if [ "$actual" = "$expected" ]; then
         echo "  PASS"
-        echo "PASS" > "${tmp_dir}/result"
+        record_result PASS
     else
-        echo "  FAIL"
+        echo "  FAIL [engine=${engine}]"
         diff --color=auto -u \
             <(echo "$expected") \
             <(echo "$actual") \
@@ -417,12 +547,7 @@ run_test() {
             echo "  pg2iceberg log tail:"
             tail -10 "$pg2iceberg_log" | sed 's/^/    /'
         fi
-        echo "FAIL" > "${tmp_dir}/result"
-    fi
-    # Preserve result dir for the collector (cleanup_test still runs on RETURN,
-    # but we copy the result out first).
-    if [ -n "${RESULT_DIR:-}" ]; then
-        cp "${tmp_dir}/result" "${RESULT_DIR}/${test_name}"
+        record_result FAIL
     fi
 }
 
@@ -438,6 +563,23 @@ main() {
         || die "ClickHouse not reachable at $CLICKHOUSE_URL"
     curl -sf "${CATALOG_URI}/v1/config" >/dev/null 2>&1 \
         || die "Iceberg REST catalog not reachable at $CATALOG_URI"
+
+    # DuckDB is only required if at least one case's reference file
+    # opts in via a leading `# engine: duckdb` comment. Skip the check
+    # otherwise so contributors who don't have duckdb installed locally
+    # can still run the rest of the suite.
+    local needs_duckdb=0
+    for ref in "$CASES_DIR"/*__reference.tsv; do
+        [ -f "$ref" ] || continue
+        if [ "$(read_engine "$ref")" = "duckdb" ]; then
+            needs_duckdb=1
+            break
+        fi
+    done
+    if [ "$needs_duckdb" = "1" ]; then
+        command -v duckdb >/dev/null 2>&1 \
+            || die "duckdb CLI not on PATH (required by at least one case's '# engine: duckdb' reference comment)"
+    fi
 
     # Build pg2iceberg if the binary doesn't exist or BUILD=1 forces a rebuild.
     if [ ! -x "$PG2ICEBERG_BIN" ] || [ "${BUILD:-0}" = "1" ]; then
@@ -494,12 +636,19 @@ main() {
     fi
 
     # ── Collect results ──
-    for result_file in "$RESULT_DIR"/*; do
-        [ -f "$result_file" ] || continue
-        local test_name
-        test_name="$(basename "$result_file")"
+    # Iterate the discovered list so a test that crashed without writing
+    # a result file (e.g. shell error before record_result) is still
+    # accounted for as MISSING — otherwise the totals silently dip below
+    # the test count.
+    for test_name in $tests; do
+        local result_file="$RESULT_DIR/${test_name}"
+        if [ ! -f "$result_file" ]; then
+            failed=$((failed + 1))
+            errors+=("$test_name (no result recorded)")
+            continue
+        fi
         local result
-        result="$(cat "$result_file")"
+        result="$(tr -d '[:space:]' < "$result_file")"
         if [ "$result" = "PASS" ]; then
             passed=$((passed + 1))
         else

@@ -26,6 +26,19 @@ jobs:
           # this prod-feature release build doesn't evict their caches.
           key: e2e
 
+      - name: Install DuckDB CLI
+        # A handful of cases verify their output via DuckDB instead of
+        # ClickHouse (opt-in per case via a `__engine` marker file) when
+        # the type round-trip on the ClickHouse side is buggy — UUID is
+        # the original motivating example. Pin the version so the
+        # Iceberg-extension wire format stays stable across runs.
+        run: |
+          DUCKDB_VERSION=v1.5.2
+          curl -fsSL -o /tmp/duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+
       - name: Bring up the test stack
         working-directory: tests
         run: |
