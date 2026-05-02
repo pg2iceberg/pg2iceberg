@@ -146,8 +146,18 @@ impl PgClient for PgClientImpl {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        // `publish_via_partition_root = true` makes pgoutput tag DML
+        // events on partition children with the *parent* table's relid
+        // and name. Without it, INSERT into a `PARTITION BY RANGE`
+        // parent fans out to children physically, and pgoutput emits
+        // Relation/Insert/Update/Delete against the child relid — so
+        // the consumer would see N untracked tables (`<parent>_2024`,
+        // `<parent>_2025`, …) instead of the one configured `<parent>`.
+        // PG 13+ supports this option (we require 13+ already, so no
+        // version gate here). Mirrors `pg2iceberg/logical/logical.go`
+        // `ensurePublication`.
         let q = format!(
-            "CREATE PUBLICATION {} FOR TABLE {}",
+            "CREATE PUBLICATION {} FOR TABLE {} WITH (publish_via_partition_root = true)",
             quote_ident(name),
             table_list
         );
