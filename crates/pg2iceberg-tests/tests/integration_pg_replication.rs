@@ -222,7 +222,7 @@ async fn publication_tables_reflects_alter_publication() {
         name: table.clone(),
     };
     client
-        .create_publication(&pubname, &[ident.clone()])
+        .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("create_publication");
 
@@ -392,7 +392,7 @@ async fn start_replication_streams_insert_events() {
         name: table.clone(),
     };
     client
-        .create_publication(&pubname, &[ident.clone()])
+        .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
     let cp = client.create_slot(&slot).await.expect("slot");
@@ -438,10 +438,8 @@ async fn start_replication_streams_insert_events() {
             }
         };
         match msg {
-            DecodedMessage::Relation { ident: t, .. } => {
-                if t.name == table {
-                    relation_seen = true;
-                }
+            DecodedMessage::Relation { ident: t, .. } if t.name == table => {
+                relation_seen = true;
             }
             DecodedMessage::Change(ev) if ev.op == Op::Insert && ev.table.name == table => {
                 inserts_seen += 1;
