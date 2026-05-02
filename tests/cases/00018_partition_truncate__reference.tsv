@@ -1,5 +1,5 @@
-1	alice	name_truncate=ali
-2	bob	name_truncate=bob
-3	charlie	name_truncate=cha
-4	dave	name_truncate=dav
-5	eve	name_truncate=eve
+1	alice	name_trunc=ali
+2	bob	name_trunc=bob
+3	charlie	name_trunc=cha
+4	dave	name_trunc=dav
+5	eve	name_trunc=eve
