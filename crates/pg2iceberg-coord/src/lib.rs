@@ -98,9 +98,10 @@ impl CommitBatch {
 /// WAL. The pipeline extracts the `uuid` column from the INSERT and
 /// pairs it with the containing transaction's commit LSN.
 ///
-/// Markers are the blue-green replica-alignment primitive (see
-/// `examples/blue-green/` in the Go reference). When both blue and
-/// green pg2iceberg instances see the same marker UUID at equivalent
+/// Markers are the blue-green replica-alignment primitive: both blue
+/// and green pg2iceberg instances watch the same `_pg2iceberg.markers`
+/// table on their respective sources, and when both see the same
+/// marker UUID at equivalent
 /// WAL points, each emits a row to its own Iceberg meta-marker table
 /// recording the snapshot ID per tracked table at that moment.
 /// External `iceberg-diff` then verifies blue/green equivalence at
@@ -205,7 +206,8 @@ pub trait Coordinator: Send + Sync {
     /// [`CoordCommitReceipt`] only if the PG transaction committed.
     ///
     /// Empty batches return `Ok` with an empty grants vector and the supplied
-    /// `flushable_lsn`. (Mirrors Go's no-op behavior for empty appends.)
+    /// `flushable_lsn` — a no-op append, used as the single LSN-advance code
+    /// path even when there's nothing to claim.
     async fn claim_offsets(&self, batch: &CommitBatch) -> Result<CoordCommitReceipt>;
 
     async fn read_log(
@@ -228,7 +230,11 @@ pub trait Coordinator: Send + Sync {
 
     async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()>;
     async fn unregister_consumer(&self, group: &str, worker: &WorkerId) -> Result<()>;
-    /// Returns workers with non-expired heartbeats, sorted by id (matches Go).
+    /// Returns workers with non-expired heartbeats, sorted by id. The
+    /// stable order is load-bearing for distributed-mode assignment:
+    /// every worker computes the same round-robin partition by sorting
+    /// the same list, so they agree on who owns which table without
+    /// explicit coordination.
     async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>>;
 
     async fn try_lock(&self, table: &TableIdent, worker: &WorkerId, ttl: Duration) -> Result<bool>;

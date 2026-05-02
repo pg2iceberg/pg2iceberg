@@ -14,9 +14,9 @@
 //!    data file must be downgraded to `Update` so the writer emits an
 //!    equality delete; otherwise readers would see two rows for that PK.
 //!
-//! On materializer restart, the index is rebuilt by reading manifest entries
-//! for the current snapshot. Phase 8 wires that path; Phase 7.5 only owns
-//! the in-memory data structure.
+//! On materializer restart, the index is rebuilt by reading manifest
+//! entries for the current snapshot — see
+//! [`Materializer::rebuild_file_index_from_catalog`].
 
 use pg2iceberg_core::PartitionLiteral;
 use std::collections::{BTreeMap, BTreeSet};

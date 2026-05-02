@@ -36,8 +36,7 @@ fn parse_numeric_typmod(type_modifier: i32) -> (Option<u8>, Option<u8>) {
 }
 
 /// Map a Postgres OID + type-modifier to our [`PgType`]. Returns `None`
-/// for OIDs we don't model (callers usually fall back to `PgType::Text`,
-/// matching the Go reference).
+/// for OIDs we don't model (callers usually fall back to `PgType::Text`).
 pub fn pg_type_from_oid(oid: u32, type_modifier: i32) -> Option<PgType> {
     Some(match oid {
         // Booleans + integers.
@@ -55,17 +54,16 @@ pub fn pg_type_from_oid(oid: u32, type_modifier: i32) -> Option<PgType> {
             PgType::Numeric { precision, scale }
         }
 
-        // String-like — varchar/bpchar/name all collapse to Text per the
-        // Go reference (postgres/schema.go:120). Iceberg has no
-        // fixed-length character type and the distinction doesn't
-        // survive replication anyway.
+        // String-like — varchar/bpchar/name all collapse to Text.
+        // Iceberg has no fixed-length character type and the
+        // distinction doesn't survive replication anyway.
         //
         // Network-address types (`inet`, `cidr`, `macaddr`,
         // `macaddr8`) are also collapsed to Text here. PG's wire
         // format for these is the canonical text form (e.g.
         // `192.168.1.1/24`), so passing them through as strings is
         // lossless and matches the documented "fall back to string"
-        // contract in `tests/cases/00005_column_types`.
+        // contract documented in `tests/cases/00005_column_types`.
         x if x == Type::TEXT.oid()
             || x == Type::VARCHAR.oid()
             || x == Type::BPCHAR.oid()

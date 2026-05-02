@@ -5,7 +5,7 @@
 //! - threshold gating (no compaction below threshold)
 //! - small-file merge (many → one)
 //! - equality-delete application inline
-//! - **partition-aware output** (the Go bug we don't replicate)
+//! - **partition-aware output** (each partition compacts independently)
 //! - second-cycle no-op
 //! - sequence-aware delete semantics
 //!

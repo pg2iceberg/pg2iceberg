@@ -1,6 +1,6 @@
 //! Staged-event Parquet codec. Sync, pure-compute.
 //!
-//! Mirrors `iceberg/events_schema.go:30-42` (the Go source of truth):
+//! Schema (the seven fields below are the staged-event contract):
 //!
 //! | Field ID | Name | Type | Null |
 //! |---|---|---|---|
@@ -12,11 +12,11 @@
 //! | 6 | `_xid` | int64 | nullable |
 //!
 //! Field IDs are persisted in Parquet column metadata under `PARQUET:field_id`
-//! so Iceberg readers (Go and Rust) resolve columns by ID, not name.
+//! so Iceberg readers resolve columns by ID, not name.
 //!
-//! The JSON inside `_data` is currently the serde-tagged form of `Row`. That
-//! is *not yet* compatible with Go's natural-JSON encoding — switching is a
-//! Phase 2.5 task tracked in the port plan.
+//! The JSON inside `_data` is currently the serde-tagged form of
+//! `Row`. Switching to a more interoperable encoding (plain JSON
+//! object keyed by column name) is a tracked follow-up.
 
 use crate::{MatEvent, Result, StreamError};
 use arrow_array::builder::{Int64Builder, StringBuilder, TimestampMicrosecondBuilder};

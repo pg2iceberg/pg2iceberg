@@ -106,8 +106,8 @@ fn batches_with_multiple_tables_assign_independently() {
 
 #[test]
 fn multiple_claims_for_same_table_in_one_batch_chain_offsets() {
-    // Mirrors Go: per-batch totals are aggregated, then the running offset is
-    // carried across claims in input order.
+    // Per-batch totals are aggregated; the running offset is carried
+    // across claims in input order.
     let (c, _) = coord_at_t0();
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![
@@ -236,7 +236,8 @@ fn registered_consumer_appears_in_active_until_ttl_expires() {
         vec![w.clone()]
     );
 
-    // Past TTL → swept out (matches Go ActiveConsumers line 343 sweep).
+    // Past TTL → swept out by the implicit cleanup pass that
+    // `active_consumers` runs before returning the live list.
     clock.advance(Duration::from_secs(2));
     assert!(block_on(c.active_consumers("default")).unwrap().is_empty());
 }

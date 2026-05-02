@@ -1,17 +1,15 @@
-//! Binary configuration. Mirrors the Go reference's
-//! `config/config.go` shape so operators can reuse their existing
-//! `pg2iceberg.yaml` without translation.
+//! Binary configuration.
 //!
 //! Sections: `tables` (list), `source.{postgres, logical, query}`,
 //! `sink` (catalog + storage + credential mode + flush knobs),
 //! `state` (coordinator location).
 //!
-//! Some fields are intentionally not yet consumed by the Rust port
-//! (query-mode settings, materializer cycle knobs, control-plane
-//! metadata, etc.). They're carried in the schema so existing Go
-//! configs deserialize cleanly; we wire them as the corresponding
-//! features land. Hence the crate-level `dead_code` allow on the
-//! config structs — *fields*, not types.
+//! Some fields are accepted by the deserializer but not yet consumed
+//! at runtime (query-mode settings, materializer cycle knobs,
+//! control-plane metadata, etc.). They're carried in the schema so
+//! configs round-trip cleanly while features land. Hence the
+//! crate-level `dead_code` allow on the config structs — *fields*,
+//! not types.
 
 #![allow(dead_code)]
 
@@ -37,7 +35,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TableConfig {
-    /// Fully-qualified table name `"schema.name"`. Mirrors Go.
+    /// Fully-qualified table name `"schema.name"`.
     pub name: String,
     #[serde(default)]
     pub skip_snapshot: bool,
@@ -57,8 +55,8 @@ pub struct TableConfig {
     pub iceberg: IcebergTableConfig,
 }
 
-/// Iceberg per-table options. Mirrors Go's `IcebergTableConfig` —
-/// just `partition` for now; sort orders and other knobs are
+/// Iceberg per-table options. Just `partition` for now; sort orders
+/// and other knobs are
 /// follow-ons.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct IcebergTableConfig {
@@ -201,8 +199,7 @@ pub struct SinkConfig {
 
     /// `"static"` (default) — explicit S3 keys below.
     /// `"vended"` — temporary credentials from the catalog's
-    /// `LoadTable` response. NOT YET WIRED in the Rust port; will
-    /// error at startup. Plan §Phase 7.
+    /// `LoadTable` response. NOT YET WIRED; will error at startup.
     /// `"iam"` — instance profile / AWS SSO / env-var chain.
     #[serde(default = "default_credential_mode")]
     pub credential_mode: String,
@@ -254,7 +251,7 @@ pub struct SinkConfig {
     /// Grace period for orphan-file cleanup (e.g. `"30m"`). Files
     /// younger than this are protected from deletion even if
     /// unreferenced — it gives in-flight commits a window before
-    /// cleanup races them. Default `30m` matches Go.
+    /// cleanup races them. Default `30m`.
     #[serde(default = "default_maintenance_grace")]
     pub maintenance_grace: String,
 
@@ -265,8 +262,8 @@ pub struct SinkConfig {
     #[serde(default = "default_materialized_prefix")]
     pub materialized_prefix: String,
 
-    /// Free-form REST-catalog props passthrough. Not in the Go YAML
-    /// shape but useful for vendor-specific settings (Polaris OAuth2
+    /// Free-form REST-catalog props passthrough. Useful for
+    /// vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
     #[serde(default, rename = "catalog_props")]
     pub catalog_props: BTreeMap<String, String>,
@@ -385,13 +382,13 @@ pub struct StateConfig {
     #[serde(default)]
     pub path: String,
     /// Postgres URL for the coordinator. If absent, the source PG
-    /// hosts the `_pg2iceberg.*` schema (matches Go).
+    /// hosts the `_pg2iceberg.*` schema.
     #[serde(default)]
     pub postgres_url: String,
     #[serde(default = "default_coord_schema")]
     pub coordinator_schema: String,
     /// Materialization group name (consumer / mat_cursor key).
-    /// Not in the Go YAML — defaults to `"default"`.
+    /// Defaults to `"default"`.
     #[serde(default = "default_group")]
     pub group: String,
 }
@@ -536,11 +533,10 @@ impl TableConfig {
         !self.columns.is_empty()
     }
 
-    /// Convert to our [`TableSchema`]. Splits `name` on `.` for the
-    /// namespace + table — same form Go's reference uses.
-    /// Errors if `columns:` is empty; callers should branch via
-    /// [`Self::has_explicit_columns`] and use schema discovery
-    /// instead in that case.
+    /// Convert to our [`TableSchema`]. Splits `name` on `.` to
+    /// recover the (namespace, table) pair. Errors if `columns:` is
+    /// empty; callers should branch via [`Self::has_explicit_columns`]
+    /// and use schema discovery instead in that case.
     pub fn to_table_schema(&self) -> Result<TableSchema> {
         let (ns, name) = parse_qualified_name(&self.name)?;
         if self.columns.is_empty() {

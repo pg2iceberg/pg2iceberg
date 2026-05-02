@@ -7,8 +7,8 @@
 //! mutually consistent: the new data row is visible, the prior data row is
 //! invalidated.
 //!
-//! This is the read path for the future Phase 12 `verify` subcommand. For
-//! Phase 8 it powers the materializer's end-to-end correctness tests.
+//! This is the read path used by the `verify` subcommand and the
+//! materializer's end-to-end correctness tests.
 
 use crate::fold::pk_key;
 use crate::reader::read_data_file;

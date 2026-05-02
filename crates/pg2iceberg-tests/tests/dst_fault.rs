@@ -26,7 +26,8 @@
 //!   function (instead of `Snapshotter::run_chunks`) means a
 //!   mid-snapshot PUT failure restarts the snapshot from chunk 0
 //!   on replay. Correctness-safe (re-stage produces the same
-//!   bytes), but a real fix is "switch to Snapshotter" — Phase 11.5.
+//!   bytes), but a real fix is to switch the binary to call
+//!   `Snapshotter::run_chunks` instead.
 
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
@@ -220,10 +221,10 @@ impl FaultHarness {
     }
 
     /// Crash-and-restart: drop the in-memory pipeline, reopen
-    /// replication from the slot, materializer state survives (the
-    /// FileIndex rebuild path makes this safe for both crash variants
-    /// once Phase 8.5 lands; for now the materializer is a "parallel
-    /// worker" that we don't restart here).
+    /// replication from the slot, materializer state survives. (The
+    /// FileIndex rebuild path will eventually make this safe for both
+    /// crash variants; for now the materializer is a "parallel
+    /// worker" we don't restart here.)
     fn crash_and_restart(&mut self) {
         let pipeline = Pipeline::new(
             self.coord.clone(),
@@ -475,8 +476,9 @@ fn mid_snapshot_blob_put_fault_recovers_via_resumable_snapshotter() {
     // resume picks up at the next chunk.
     //
     // The binary today uses the *non-resumable* `run_snapshot` free
-    // function (Phase 11.5 gap) — see
-    // `mid_snapshot_blob_put_fault_with_run_snapshot_loses_progress`.
+    // function — see the
+    // `mid_snapshot_blob_put_fault_with_run_snapshot_loses_progress`
+    // companion test for that path.
     let seeds: Vec<(i32, i32)> = (1..=10).map(|i| (i, i * 10)).collect();
     let mut h = FaultHarness::boot_with_seeds(&seeds);
 
@@ -1459,12 +1461,12 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
 }
 
 #[test]
-#[ignore = "GAP: materializer-crash recovery requires FileIndex rebuild from catalog history; pinned in plan §P2"]
+#[ignore = "GAP: materializer-crash recovery requires FileIndex rebuild from catalog history"]
 fn materializer_crash_during_commit_loses_in_memory_state() {
-    // Documents Phase 8.5 follow-up: today the harness doesn't
-    // rebuild the materializer's FileIndex from catalog history on
-    // restart. A real materializer crash mid-commit would lose the
-    // in-memory FileIndex, and a re-insert promotion would
+    // Documents the follow-up: today the harness doesn't rebuild
+    // the materializer's FileIndex from catalog history on restart.
+    // A real materializer crash mid-commit would lose the in-memory
+    // FileIndex, and a re-insert promotion would
     // mis-classify already-committed PKs as fresh inserts. The
     // FileIndex rebuild path exists in the iceberg crate
     // (`rebuild_from_catalog`); the harness just doesn't exercise it

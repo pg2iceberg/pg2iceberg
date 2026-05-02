@@ -44,9 +44,8 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 
 /// Create a bucket by exec'ing `mc` inside a transient minio/mc
 /// container attached to the same docker network as the MinIO
-/// container. This is the canonical pattern from the Go example's
-/// docker-compose — and avoids dragging the AWS SDK into our
-/// test-only dep tree.
+/// container. Avoids dragging the AWS SDK into our test-only dep
+/// tree.
 async fn create_bucket_via_mc(network: &str, bucket: &str) {
     use testcontainers::core::wait::ExitWaitStrategy;
     let cmd = format!(
@@ -227,9 +226,9 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             s3_secret_key: "minioadmin".into(),
             s3_region: "us-east-1".into(),
             flush_interval: String::new(),
-            // 1000 mirrors the Go reference's default. Sink::new
-            // asserts `flush_threshold > 0`, so 0 would crash the
-            // pipeline on startup.
+            // 1000 is a reasonable default. Sink::new asserts
+            // `flush_threshold > 0`, so 0 would crash the pipeline on
+            // startup.
             flush_rows: 1000,
             materializer_interval: String::new(),
             compaction_data_files: 8,

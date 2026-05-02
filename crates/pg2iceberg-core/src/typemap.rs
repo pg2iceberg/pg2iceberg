@@ -1,7 +1,6 @@
 //! Postgres → Iceberg type-shape mapping.
 //!
-//! Mirrors `postgres/schema.go:104-161` from the Go reference. The
-//! corresponding value mapping lives in [`value_map`].
+//! The corresponding value mapping lives in [`value_map`].
 
 use crate::value::{IcebergValue, PgValue};
 use serde::{Deserialize, Serialize};
@@ -18,8 +17,8 @@ pub enum PgType {
     Int8,
     Float4,
     Float8,
-    /// `precision == None` represents unconstrained `numeric`. The Go reference
-    /// maps this to `decimal(38, 18)` and emits a warning.
+    /// `precision == None` represents unconstrained `numeric`. We
+    /// fall back to `decimal(38, 18)` and emit a warning.
     Numeric {
         precision: Option<u8>,
         scale: Option<u8>,
@@ -34,7 +33,7 @@ pub enum PgType {
     Uuid,
     Json,
     Jsonb,
-    /// PG `oid` is a 32-bit unsigned ID; we map it to int (matches Go).
+    /// PG `oid` is a 32-bit unsigned ID; we map it to int.
     Oid,
 }
 
@@ -63,10 +62,11 @@ pub enum MapError {
     NumericScaleExceedsPrecision { precision: u8, scale: u8 },
 }
 
-/// Outcome of mapping a PG type to an Iceberg type, plus any non-fatal warning
-/// to surface to the operator. The Go reference emits a log line for the
-/// unconstrained-numeric case; we return it as data so the binary can log it
-/// once at startup rather than deep in the type layer.
+/// Outcome of mapping a PG type to an Iceberg type, plus any non-fatal
+/// warning to surface to the operator. We return warnings as data so
+/// the binary can log them once at startup rather than deep in the
+/// type layer (the unconstrained-numeric case is the canonical
+/// example).
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct Mapped {
     pub iceberg: IcebergType,

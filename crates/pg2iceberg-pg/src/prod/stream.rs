@@ -14,10 +14,11 @@
 //! being delivered (manifesting as missing schema-evolution + late-tx
 //! events in tests).
 //!
-//! The fix mirrors the Go reference's pattern: a dedicated task owns the
-//! stream, drains decoded events into a bounded mpsc, and serves ack
-//! requests from a small command channel. The outer `select!` no longer
-//! cancels mid-decode — `events_rx.recv()` is fully cancel-safe.
+//! The fix is to give the stream its own task: that task owns the
+//! `LogicalReplicationStream`, drains decoded events into a bounded
+//! mpsc, and serves ack requests from a small command channel. The
+//! outer `select!` no longer cancels mid-decode — `events_rx.recv()`
+//! is fully cancel-safe.
 //!
 //! Translation rules (`LogicalReplicationMessage` → our
 //! [`crate::DecodedMessage`]):
@@ -36,8 +37,8 @@
 //!   with `before` / `after` rows decoded via [`super::value_decode`].
 //! - `Truncate` → emits one `Change` per truncated relation with
 //!   `Op::Truncate` and no before/after row.
-//! - `Origin` / `Type` / `Message` → silently skipped (matches Go
-//!   reference behavior).
+//! - `Origin` / `Type` / `Message` → silently skipped (we don't surface
+//!   pgoutput protocol metadata to consumers).
 //! - `PrimaryKeepAlive` → `DecodedMessage::Keepalive`.
 
 use crate::prod::typemap::pg_type_from_oid;
@@ -63,10 +64,9 @@ use tokio_postgres::types::PgLsn;
 /// for timestamp conversion.
 const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
 
-/// Bounded buffer for decoded events. Mirrors the Go reference's
-/// `make(chan postgres.ChangeEvent, 1000)` so transient main-loop
-/// stalls (materializer cycle, compaction tick) don't backpressure
-/// the wire.
+/// Bounded buffer for decoded events. 1000 is enough capacity that
+/// transient main-loop stalls (materializer cycle, compaction tick)
+/// don't backpressure the wire even under WAL bursts.
 const EVENTS_CHANNEL_CAPACITY: usize = 1000;
 
 /// Acks are infrequent (once per Standby tick + a final shutdown ack),
@@ -350,7 +350,7 @@ impl ReaderState {
                 Ok(Some(first))
             }
             // Origin / Type / Message are protocol-level metadata we
-            // don't surface — matches the Go reference's behavior.
+            // don't surface to consumers.
             PgMsg::Origin(_) | PgMsg::Type(_) | PgMsg::Message(_) => Ok(None),
             _ => Ok(None),
         }
@@ -376,9 +376,9 @@ impl ReaderState {
             table,
             op,
             // pgoutput delivers DML messages between Begin and Commit;
-            // assigning the txn's final_lsn matches the Go reference's
-            // semantics (every row in a txn is tagged with the commit
-            // LSN, not the per-row WAL position).
+            // every row in a txn is tagged with the commit LSN, not
+            // the per-row WAL position. This keeps cross-row ordering
+            // consistent with the txn boundary downstream.
             lsn: txn.map(|t| t.final_lsn).unwrap_or(Lsn(0)),
             commit_ts: txn.map(|t| t.commit_ts).unwrap_or(Timestamp(0)),
             xid: txn.map(|t| t.xid),

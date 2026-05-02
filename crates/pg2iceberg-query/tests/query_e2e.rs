@@ -283,11 +283,11 @@ fn poll_only_no_flush_does_not_appear_in_iceberg() {
     assert_eq!(read_iceberg(&h).len(), 1);
 }
 
-// ---------- watermark persistence (Phase 10 finish) ----------
+// ---------- watermark persistence ----------
 
 #[test]
 fn watermark_persists_across_pipeline_restart() {
-    // Phase 1: a fresh process polls + flushes; watermark gets saved to coord.
+    // Step 1: a fresh process polls + flushes; watermark gets saved to coord.
     let db = SimPostgres::new();
     db.create_table(schema()).unwrap();
 
@@ -316,7 +316,7 @@ fn watermark_persists_across_pipeline_restart() {
     }
     // Pipeline dropped. Coord, catalog, blob_store survive (durable).
 
-    // Phase 2: a new process boots with the same coord; should restore wm=7.
+    // Step 2: a new process boots with the same coord; should restore wm=7.
     let mut h = boot_with_coord(db, coord, catalog, blob_store, namer);
     assert_eq!(
         h.qp.watermark(&ident()),
@@ -398,7 +398,7 @@ fn empty_pipeline_save_yields_empty_watermark_map() {
     assert!(wm.is_none(), "no tables registered → no watermark stored");
 }
 
-// ---------- chunked polling (Phase 10 finish) ----------
+// ---------- chunked polling ----------
 
 fn boot_with_poll_chunk_size(n: usize) -> Harness {
     let db = SimPostgres::new();
@@ -478,13 +478,13 @@ fn chunk_size_does_not_change_final_state() {
 
 #[test]
 fn re_insert_after_restart_correctly_promotes_via_rebuilt_file_index() {
-    // Phase 1: insert id=1 v=1, materialize. Phase 1 dies.
-    // Phase 2: a new process boots; rebuilds FileIndex from catalog so it
+    // Step 1: insert id=1 v=1, materialize. Step 1's process dies.
+    // Step 2: a new process boots; rebuilds FileIndex from catalog so it
     //          knows pk=1 is "live" in a prior data file.
     //          PG side: row(1) gets a new value at v=2 (UPDATE bumps wm).
     //          Poll picks it up. Promote_re_inserts must fire even though
     //          phase-2's in-memory FileIndex started empty pre-rebuild.
-    // Phase 3: read Iceberg → must show {(1, 99, 2)}, NOT duplicates of (1, *).
+    // Step 3: read Iceberg → must show {(1, 99, 2)}, NOT duplicates of (1, *).
 
     let db = SimPostgres::new();
     db.create_table(schema()).unwrap();
@@ -511,7 +511,7 @@ fn re_insert_after_restart_correctly_promotes_via_rebuilt_file_index() {
     }
     // Process death.
 
-    // Phase 2: bump the row.
+    // Step 2: bump the row.
     update(&db, 1, 99, 2);
 
     let mut h = boot_with_coord(db, coord, catalog, blob_store, namer);

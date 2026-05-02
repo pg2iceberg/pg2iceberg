@@ -25,9 +25,9 @@
 //! steps so the proptest exercises pipeline/materializer ordering, and
 //! `CrashAndRestart` models pipeline-process crashes between flushes.
 //!
-//! Pipeline-only crash for now: the materializer's FileIndex rebuild from
-//! catalog history is a Phase 8.5 follow-on. Once it lands, we can crash
-//! the materializer in DST too.
+//! Pipeline-only crash for now: the materializer's FileIndex rebuild
+//! from catalog history is a tracked follow-up. Once it lands, we
+//! can crash the materializer in DST too.
 
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
@@ -287,7 +287,7 @@ impl DstHarness {
     fn crash_and_restart(&mut self) {
         // Drain + ack first so we model "graceful crash after a flush" — the
         // simpler case. Mid-flush crashes (orphan blobs from PUT-without-claim)
-        // are an explicit Phase 6.5 expansion.
+        // are a tracked follow-up.
         self.drive();
         self.flush_and_ack();
 
@@ -661,7 +661,7 @@ fn materializer_idempotent_when_run_extra_times() {
     check_invariants(&mut h).unwrap();
 }
 
-// ---------- snapshot integration (Phase 11 in DST) ----------
+// ---------- snapshot integration ----------
 
 #[test]
 fn snapshot_then_workload_keeps_all_invariants() {

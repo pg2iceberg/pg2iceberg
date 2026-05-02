@@ -217,7 +217,7 @@ fn snapshot_bootstraps_existing_pg_data() {
 fn snapshot_then_live_replication_picks_up_seamlessly() {
     let mut h = boot(&[(1, 10), (2, 20)]);
 
-    // Phase 1: snapshot.
+    // Step 1: snapshot.
     let snap_lsn = block_on(run_snapshot(
         &h.db,
         h.coord.clone() as Arc<dyn Coordinator>,
@@ -229,7 +229,7 @@ fn snapshot_then_live_replication_picks_up_seamlessly() {
     block_on(h.materializer.cycle()).unwrap();
     assert_eq!(read_iceberg(&h), read_pg(&h));
 
-    // Phase 2: live replication picks up new writes.
+    // Step 2: live replication picks up new writes.
     let mut tx = h.db.begin_tx();
     tx.insert(&ident(), row(3, 30));
     tx.update(&ident(), row(1, 99));
@@ -279,7 +279,7 @@ fn snapshot_then_more_writes_in_pg_before_replication_starts_no_data_lost() {
     assert_eq!(iceberg, vec![row(1, 10), row(2, 20)]);
 }
 
-// ---------- chunked snapshot (Phase 11 finish) ----------
+// ---------- chunked snapshot ----------
 
 #[test]
 fn chunk_size_one_materializes_every_row_exactly_once() {
@@ -357,7 +357,7 @@ fn chunked_snapshot_produces_one_log_index_entry_per_chunk() {
     assert_eq!(entries.len(), 4, "ceil(10/3) = 4 chunks");
 }
 
-// ---------- resumable snapshot (Phase 11 finish) ----------
+// ---------- resumable snapshot ----------
 
 #[test]
 fn snapshotter_run_to_completion_matches_run_snapshot() {
@@ -463,7 +463,7 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
         (pipeline, materializer, stream)
     }
 
-    // Phase 1: partial snapshot.
+    // Step 1: partial snapshot.
     let snap_lsn = {
         let (mut pipeline, _materializer, _stream) =
             build(&db, &coord, &catalog, &blob_store, &stage_namer, &mat_namer);
@@ -479,7 +479,7 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
         "after partial run, progress must be persisted"
     );
 
-    // Phase 2: a fresh process resumes.
+    // Step 2: a fresh process resumes.
     let (mut pipeline, mut materializer, mut stream) =
         build(&db, &coord, &catalog, &blob_store, &stage_namer, &mat_namer);
     let s = Snapshotter::new(coord.clone() as Arc<dyn Coordinator>).with_chunk_size(5);
@@ -487,7 +487,7 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
     stream.send_standby(snap_lsn);
     block_on(materializer.cycle()).unwrap();
 
-    // Phase 3: verify.
+    // Step 3: verify.
     let mut iceberg = block_on(read_materialized_state(
         catalog.as_ref(),
         blob_store.as_ref(),

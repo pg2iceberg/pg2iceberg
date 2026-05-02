@@ -44,11 +44,10 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 /// Default validity window for vended credentials when the catalog
-/// doesn't include an explicit expiry. Mirrors Go's `defaultVendedTTL`.
+/// doesn't include an explicit expiry.
 pub const DEFAULT_VENDED_TTL: Duration = Duration::from_secs(55 * 60);
 
-/// How far in advance of expiry a refresh kicks in. Mirrors Go's
-/// `refreshBuffer`.
+/// How far in advance of expiry a refresh kicks in.
 pub const DEFAULT_REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
 
 /// Per-table credentials extracted from the catalog response.
@@ -143,8 +142,7 @@ pub fn warehouse_relative_path(location: &str) -> Option<String> {
     }
 }
 
-/// Extract the bucket name from `s3://bucket/...` URIs. Mirrors Go's
-/// `url.Parse(...).Host`.
+/// Extract the bucket name from an `s3://bucket/...` URI.
 pub fn bucket_from_location(location: &str) -> Option<String> {
     let stripped = location
         .strip_prefix("s3://")
@@ -174,8 +172,8 @@ struct EntryInner {
 }
 
 /// Configuration for the router. `default_ttl` and `refresh_buffer`
-/// have sensible defaults that mirror Go's behavior; the bucket /
-/// region / endpoint are operator-supplied at startup.
+/// have sensible built-in defaults; the bucket / region / endpoint
+/// are operator-supplied at startup.
 #[derive(Clone, Debug)]
 pub struct VendedRouterConfig {
     pub default_ttl: Duration,

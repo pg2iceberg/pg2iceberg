@@ -2,9 +2,10 @@
 //! resolves TOAST + re-insert promotion, writes Iceberg data + delete files,
 //! commits to the catalog, and advances the cursor.
 //!
-//! Mirrors `logical/materializer.go`. Phase 8 first cut delivers the core
-//! single-worker cycle. Distributed mode (multi-worker round-robin),
-//! combined-mode CachedStream, and the async ticker are explicit follow-ons.
+//! Single-worker cycle is the core. Distributed mode (multi-worker
+//! round-robin), combined-mode CachedStream, and the async ticker
+//! are layered on top — see the `enable_distributed_mode`,
+//! `compact_cycle`, and `expire_cycle` entry points.
 //!
 //! ## Cycle ordering (the durability gate, again)
 //!
@@ -120,10 +121,9 @@ pub trait MaterializerNamer: Send + Sync {
     /// Iceberg readers track file location explicitly in the
     /// manifest, so the layout below is convention rather than
     /// requirement — but every mainstream Iceberg writer (Spark,
-    /// Trino, Flink, the Go pg2iceberg reference) uses it, and
-    /// some readers (older Spark, ClickHouse's `_path` virtual
-    /// column) lean on it for partition pruning. Sticking to it
-    /// keeps cross-engine debugging painless.
+    /// Trino, Flink) uses it, and some readers (older Spark,
+    /// ClickHouse's `_path` virtual column) lean on it for partition
+    /// pruning. Sticking to it keeps cross-engine debugging painless.
     async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String;
 }
 

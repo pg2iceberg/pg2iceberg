@@ -30,13 +30,13 @@
 use pg2iceberg_core::Timestamp;
 use std::time::Duration;
 
-/// Periodic-task intervals. Defaults mirror the Go reference (10 s flush /
-/// 10 s materialize / 10 s standby; watcher is new in the Rust port and
-/// runs less frequently — invariant checks aren't free).
+/// Periodic-task intervals. Defaults: 10 s flush, 10 s materialize,
+/// 10 s standby; the watcher runs less frequently because invariant
+/// checks aren't free.
 ///
-/// Compaction is intentionally *not* a separate handler — Go invokes it
-/// at the end of every materializer cycle gated by file-count
-/// thresholds, so we do the same. See [`crate::Materializer::compact_cycle`].
+/// Compaction is intentionally *not* a separate handler — it runs at
+/// the end of each materializer cycle gated by file-count thresholds.
+/// See [`crate::Materializer::compact_cycle`].
 #[derive(Clone, Debug)]
 pub struct Schedule {
     pub flush: Duration,

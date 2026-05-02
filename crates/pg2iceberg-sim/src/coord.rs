@@ -33,7 +33,7 @@ struct State {
     /// enforced on insert.
     log: Vec<LogEntry>,
     /// `mat_cursor.last_offset`. Default value when ensure_cursor inserts a
-    /// row is `-1`, matching the Go DDL.
+    /// row is `-1` (matches the prod DDL default).
     cursors: BTreeMap<(String, TableIdent), i64>,
     /// `consumer.expires_at` per `(group, worker)`.
     consumers: BTreeMap<(String, WorkerId), Timestamp>,
@@ -269,8 +269,8 @@ impl Coordinator for MemoryCoordinator {
     async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>> {
         let now = self.clock.now();
         let mut state = self.state.lock().unwrap();
-        // Expire stale entries first (matches Go: ActiveConsumers does the
-        // sweep too, line 343).
+        // Expire stale entries first so the returned list is "live as
+        // of now" — matches the prod impl's behaviour.
         state.consumers.retain(|_, exp| *exp >= now);
         let mut out: Vec<WorkerId> = state
             .consumers

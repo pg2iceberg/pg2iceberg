@@ -188,8 +188,9 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     }
 
     /// Highest LSN whose underlying batch has committed in the coordinator.
-    /// This is what the pipeline hands to its `send_standby` ticker (Phase 5
-    /// keeps that out of band — the sim test calls `send_standby` directly).
+    /// This is what the pipeline hands to its `send_standby` ticker
+    /// (kept out-of-band so callers in tests can drive `send_standby`
+    /// directly).
     pub fn flushed_lsn(&self) -> Lsn {
         Lsn(self.flushed_lsn.load(Ordering::SeqCst))
     }
@@ -283,7 +284,9 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 self.sink.record_change(evt)?;
             }
             DecodedMessage::Relation { .. } => {
-                // Schema evolution lands in Phase 7.
+                // Schema evolution is applied via
+                // `Materializer::apply_relation`, which the lifecycle
+                // calls *before* this dispatch. Nothing to do here.
             }
             DecodedMessage::Keepalive { .. } => {
                 // The standby ticker reads `flushed_lsn()` directly.
@@ -323,8 +326,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             // Possible if every committed tx was empty. Still advance the LSN
             // (we know all tx commits up to this point are durable in PG, but
             // there's nothing for the coord to register).
-            // For Phase 5 we still go through claim_offsets with an empty
-            // batch so the receipt is the single LSN-advance code path.
+            // We still go through claim_offsets with an empty batch
+            // so the receipt is the single LSN-advance code path.
         }
 
         let mut claims = Vec::with_capacity(chunks.len());

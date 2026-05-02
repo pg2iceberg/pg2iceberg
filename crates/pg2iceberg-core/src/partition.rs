@@ -3,8 +3,7 @@
 //! `iceberg-rust` dep. Translation to `iceberg::spec::Transform` /
 //! `UnboundPartitionSpec` lives in `pg2iceberg-iceberg/src/prod/`.
 //!
-//! Mirrors the Go reference's partition-expression grammar
-//! (`config.example.yaml`):
+//! Partition-expression grammar (see `config.example.yaml`):
 //!
 //! - `col_name` — identity
 //! - `year(col)` — year-since-1970 int
@@ -439,10 +438,9 @@ fn truncate_i64(v: i64, w: i64) -> i64 {
 }
 
 /// Decimal truncate per iceberg spec: applies `v - rem_euclid(v, W)` to
-/// the *unscaled* integer value, preserving the original scale. Mirrors
-/// the Go reference's `truncateDecimal` (which uses `big.Int` because Go
-/// stores decimals as strings); we use `i128` since iceberg caps precision
-/// at 38 digits and that fits.
+/// the *unscaled* integer value, preserving the original scale. We use
+/// `i128` since iceberg caps decimal precision at 38 digits, which
+/// fits comfortably below i128's range.
 fn truncate_decimal(d: &crate::value::Decimal, w: u32) -> Result<PartitionLiteral, PartitionError> {
     let unscaled = be_bytes_to_i128(&d.unscaled_be_bytes).ok_or_else(|| {
         PartitionError::Invalid(format!(

@@ -3,7 +3,6 @@
 //! columns and primary key without needing the operator to declare
 //! them in YAML.
 //!
-//! Mirrors `postgres/schema.go::DiscoverSchema` from the Go reference.
 //! Two `simple_query` calls per table:
 //!
 //! 1. **Column metadata** from `information_schema.columns` —
@@ -170,7 +169,6 @@ async fn fetch_primary_key(client: &Client, schema: &str, table: &str) -> Result
 
 /// Map a Postgres `udt_name` (the canonical type name from
 /// `information_schema.columns.udt_name`) to our [`PgType`].
-/// Mirrors `postgres/schema.go::ParseType` from the Go reference.
 fn map_udt_to_pg_type(
     udt_name: &str,
     precision: Option<u32>,

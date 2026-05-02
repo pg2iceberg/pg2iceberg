@@ -1,8 +1,8 @@
 //! SQL statements used by the production `Coordinator` impl.
 //!
 //! These are kept here so they're testable as strings (snapshot tests, future
-//! sqllogictest, etc.) and shareable between the prod impl (Phase 3 PG) and
-//! any tooling that needs to introspect the wire SQL.
+//! sqllogictest, etc.) and shareable between the prod impl and any
+//! tooling that needs to introspect the wire SQL.
 //!
 //! All statements take the schema as input rather than embedding it. Schema
 //! names are pre-sanitized via [`crate::schema::CoordSchema`].

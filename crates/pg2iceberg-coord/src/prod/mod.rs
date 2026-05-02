@@ -8,10 +8,10 @@
 //! the receipt is never minted and the slot can't move.
 //!
 //! The replication-mode prod client lives in `pg2iceberg-pg/src/prod/`.
-//! Per the Go reference and Supabase etl, those are **separate
-//! connections** — replication mode supports a different command
-//! subset than regular mode, and using one connection for both would
-//! restrict the SQL surface unnecessarily.
+//! That's a **separate connection** from the coord one: replication
+//! mode supports a different command subset than regular SQL mode, so
+//! sharing one connection would restrict the SQL surface
+//! unnecessarily.
 
 pub mod connect;
 pub mod coord;

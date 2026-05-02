@@ -1,4 +1,4 @@
-//! Phase 13 ops tests: pipeline metrics + materializer metrics + graceful
+//! Ops tests: pipeline metrics + materializer metrics + graceful
 //! shutdown lose nothing in the durable state.
 
 use pg2iceberg_coord::schema::CoordSchema;

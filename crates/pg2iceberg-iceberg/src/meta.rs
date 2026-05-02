@@ -1,12 +1,11 @@
 //! Control-plane meta tables.
 //!
-//! Mirrors `pg2iceberg/iceberg/meta_schema.go` + `meta_recorder.go` from the
-//! Go reference. Five Iceberg tables under the operator-configured
-//! `meta_namespace` capture pipeline observability *as data*: every commit,
-//! checkpoint, compaction, maintenance op, and blue-green marker becomes a
-//! row that downstream tooling (Polynya UI, dashboards, custom verifiers)
-//! reads with a plain Iceberg query — no scraping logs, no extra metrics
-//! pipeline.
+//! Five Iceberg tables under the operator-configured `meta_namespace`
+//! capture pipeline observability *as data*: every commit, checkpoint,
+//! compaction, maintenance op, and blue-green marker becomes a row
+//! that downstream tooling (Polynya UI, dashboards, custom verifiers)
+//! reads with a plain Iceberg query — no scraping logs, no extra
+//! metrics pipeline.
 //!
 //! - `<meta_ns>.commits` — one row per user-table commit (logical mode:
 //!   per materialize cycle; query mode: per query-flush cycle).
@@ -478,12 +477,12 @@ mod tests {
         let s = meta_commits_schema("_pg2iceberg_blue");
         assert_eq!(s.ident.namespace.0, vec!["_pg2iceberg_blue".to_string()]);
         assert_eq!(s.ident.name, "commits");
-        // Field IDs 1..=16 from the Go reference must be preserved
-        // exactly. Renumbering would break readers built against the
-        // Go schema.
+        // Field IDs 1..=16 are part of the published meta-table
+        // contract — renumbering would break downstream readers built
+        // against this schema.
         let ids: Vec<i32> = s.columns.iter().map(|c| c.field_id).collect();
         assert_eq!(ids, (1..=16).collect::<Vec<_>>());
-        // Required columns Go declared as non-null.
+        // Required columns: non-null in the contract.
         for name in ["ts", "table_name", "mode", "snapshot_id", "sequence_number"] {
             let c = s.columns.iter().find(|c| c.name == name).unwrap();
             assert!(!c.nullable, "{name} must be required");

@@ -331,7 +331,7 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
     let consumer_ttl = std::time::Duration::from_secs(30);
     materializer.enable_distributed_mode(WorkerId(worker_id.clone()), consumer_ttl);
 
-    // Cycle interval. Mirrors Go's `MaterializerInterval` (default 10s).
+    // Cycle interval. Default 10s if not configured.
     let cycle_interval = if cfg.sink.materializer_interval.is_empty() {
         std::time::Duration::from_secs(10)
     } else {
@@ -483,7 +483,7 @@ where
 }
 
 /// One-shot: run a compaction pass over every configured table, log
-/// outcomes, exit. Mirrors Go's `pg2iceberg compact`.
+/// outcomes, exit.
 pub async fn run_compact(cfg: Config) -> Result<()> {
     if cfg.sink.target_file_size == 0 {
         anyhow::bail!(
@@ -518,11 +518,10 @@ pub async fn run_compact(cfg: Config) -> Result<()> {
 }
 
 /// One-shot: run maintenance over every configured table — snapshot
-/// expiry first, then orphan-file cleanup — and exit. Mirrors Go's
-/// `pg2iceberg maintain` (which does both phases in sequence).
+/// expiry first, then orphan-file cleanup — and exit.
 ///
 /// Either retention or grace is required; the other is treated as a
-/// no-op for that phase if blank.
+/// no-op for that step if blank.
 ///
 /// CLI `--retention` (e.g. `168h`) overrides
 /// `sink.maintenance_retention`. Cleanup grace and the materialized
@@ -543,7 +542,7 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
 
     let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
 
-    // Phase 1: snapshot expiry.
+    // Step 1: snapshot expiry.
     if !retention_str.is_empty() {
         let dur = humantime::parse_duration(&retention_str)
             .with_context(|| format!("parse retention `{retention_str}`"))?;
@@ -561,7 +560,7 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
         }
     }
 
-    // Phase 2: orphan-file cleanup.
+    // Step 2: orphan-file cleanup.
     if !grace_str.is_empty() {
         let dur = humantime::parse_duration(&grace_str)
             .with_context(|| format!("parse maintenance_grace `{grace_str}`"))?;
@@ -684,10 +683,10 @@ async fn build_one_shot_materializer(
 }
 
 /// One-shot: diff every configured table against PG ground truth.
-/// Mirrors Go's `pg2iceberg verify` semantics: open a snapshot tx
-/// against the source, read each table's rows at that view, read the
-/// materialized Iceberg state, compare PK-by-PK. Returns non-zero
-/// exit on any non-empty diff so CI / cron can detect drift.
+/// Opens a snapshot tx against the source, reads each table's rows
+/// at that view, reads the materialized Iceberg state, compares
+/// PK-by-PK. Returns non-zero exit on any non-empty diff so CI /
+/// cron can detect drift.
 pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     let blob = build_blob(&cfg).context("build blob store")?;
     if cfg.sink.catalog_uri.is_empty() {
@@ -797,11 +796,10 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
 }
 
 /// One-shot: drop the replication slot, drop the publication, and
-/// drop the coordinator schema (CASCADE). Mirrors Go's
-/// `--cleanup`. Idempotent per resource — a missing slot /
-/// publication / schema is silently skipped — but errors out if the
-/// slot is still active (i.e. some consumer is connected). Stop the
-/// running process before invoking cleanup.
+/// drop the coordinator schema (CASCADE). Idempotent per resource —
+/// a missing slot / publication / schema is silently skipped — but
+/// errors out if the slot is still active (i.e. some consumer is
+/// connected). Stop the running process before invoking cleanup.
 ///
 /// Each step opens a *fresh* connection because the source PG and
 /// the coord PG can live on different hosts (separate state DSN).
@@ -864,14 +862,13 @@ pub async fn run_cleanup(cfg: Config) -> Result<()> {
 
 /// One-shot: run the initial snapshot phase for every configured
 /// table, mark `snapshot_complete = true` in the checkpoint, and
-/// exit. Mirrors Go's `--snapshot-only`.
+/// exit.
 ///
 /// The replication slot is created here if missing — that pins the
 /// WAL from `consistent_point` onward, so a subsequent `run` doesn't
-/// lose any commits between snapshot completion and CDC start. This
-/// is **safer than Go's behavior**, which doesn't create the slot
-/// in `--snapshot-only` mode and assumes the operator has already
-/// done so out-of-band.
+/// lose any commits between snapshot completion and CDC start. The
+/// alternative — operator creates the slot manually first — risks
+/// the operator forgetting and losing data.
 ///
 /// On a checkpoint that already says `snapshot_complete = true`,
 /// returns `Ok(())` immediately without touching PG or the catalog.

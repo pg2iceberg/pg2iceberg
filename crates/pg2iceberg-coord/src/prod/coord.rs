@@ -95,8 +95,8 @@ fn pg(e: tokio_postgres::Error) -> CoordError {
 }
 
 /// `TableIdent` → the canonical text key used in the `_pg2iceberg`
-/// tables. Mirrors the Go reference: namespace and table joined by `.`,
-/// or just `table` if no namespace.
+/// tables: namespace and table joined by `.`, or just `table` if no
+/// namespace.
 fn table_key(t: &TableIdent) -> String {
     if t.namespace.0.is_empty() {
         t.name.clone()
@@ -147,8 +147,9 @@ impl Coordinator for PostgresCoordinator {
             return Ok(receipt::mint(batch.flushable_lsn, Vec::new()));
         }
 
-        // Aggregate per-table totals so we hit `log_seq` once per table
-        // rather than once per claim (matches Go: tableOffsets map).
+        // Aggregate per-table totals so we hit `log_seq` once per
+        // table rather than once per claim — saves N - 1 round-trips
+        // when a single batch carries claims from multiple tables.
         let mut totals: BTreeMap<String, u64> = BTreeMap::new();
         for c in &batch.claims {
             let key = table_key(&c.table);
@@ -356,7 +357,8 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>> {
-        // Sweep expired rows first (matches Go's ActiveConsumers).
+        // Sweep expired rows first so the returned list is "live as
+        // of now" without bouncing through a separate cleanup pass.
         let client = self.client.lock().await;
         client
             .execute(&sql::expire_consumers(&self.schema), &[])

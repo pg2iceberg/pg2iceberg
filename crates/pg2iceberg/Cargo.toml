@@ -50,12 +50,10 @@ tokio = { version = "1", features = [
 ] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-# YAML to match the Go reference's config layout. Operators can drop
-# their existing pg2iceberg.yaml in unchanged (modulo TLS / gaps
-# documented in `config.rs`).
+# YAML for operator-facing config. See `config.rs` for the surface.
 serde_yaml = "0.9"
 anyhow = "1"
-# `pg2iceberg maintain --retention 168h` — same parser as Go's time.ParseDuration.
+# Parses `pg2iceberg maintain --retention 168h` style durations.
 humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,9 +1,10 @@
 //! Materialization helpers: TOAST resolution + re-insert promotion.
 //!
 //! Sits between [`crate::fold::fold_events`] and
-//! [`crate::writer::TableWriter::prepare`]. Both functions are sync; the
-//! materializer (Phase 8) handles the async `BlobStore.get` calls before
-//! invoking [`resolve_unchanged_cols`].
+//! [`crate::writer::TableWriter::prepare`]. Both functions are sync;
+//! the caller (typically `pg2iceberg-logical::Materializer::cycle`)
+//! handles the async `BlobStore.get` calls before invoking
+//! [`resolve_unchanged_cols`].
 
 use crate::file_index::FileIndex;
 use crate::fold::{pk_key, MaterializedRow};

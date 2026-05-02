@@ -63,7 +63,8 @@ pub struct MaterializeTickOutcome {
 ///   exits on this; pipeline is unrecoverable in-process.
 /// - `compact_cycle()` failure → captured in
 ///   `MaterializeTickOutcome::compaction_error` and returned `Ok`.
-///   Mirrors the Go reference: compaction is best-effort.
+///   Compaction is intentionally best-effort: a transient blob-store
+///   blip shouldn't kill the pipeline.
 pub async fn run_materialize_tick<Cat>(
     materializer: &mut Materializer<Cat>,
     compaction: Option<&CompactionConfig>,

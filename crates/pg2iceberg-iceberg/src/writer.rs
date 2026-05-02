@@ -38,8 +38,11 @@ pub enum WriterError {
     NullInNonNullable { col: String },
     #[error("encode failure: {0}")]
     Encode(String),
-    /// Phase 7 doesn't yet wire decimal/uuid/binary builders.
-    #[error("type {0:?} is not yet supported by the writer (Phase 7.5)")]
+    /// Reserved for the case where a new `IcebergType` variant is added
+    /// to the type enum but the writer doesn't yet have a builder arm
+    /// for it. All variants currently have arms; the exhaustive match
+    /// in `build_one_array` keeps it that way at compile time.
+    #[error("type {0:?} is not yet supported by the writer")]
     TypeNotYetSupported(IcebergType),
     /// Partition column missing from a non-Delete row. For Insert/Update
     /// rows this should never happen — they always carry full row data.
@@ -48,11 +51,11 @@ pub enum WriterError {
     /// indicates a fold/TOAST-resolution bug upstream.
     #[error("partition column `{column}` missing from {op:?} row on partitioned table")]
     PartitionColumnMissing { column: String, op: Op },
-    /// Cross-batch `Delete` whose PK isn't in the FileIndex — we have no
-    /// way to recover the partition tuple. Mirrors Go's behavior where
-    /// the delete is silently dropped if `fileIdx.PkToFile` doesn't have
-    /// the PK, but we surface it as an error rather than silently lose
-    /// the delete.
+    /// Cross-batch `Delete` whose PK isn't in the FileIndex — we have
+    /// no way to recover the partition tuple. We surface it as an
+    /// error rather than silently dropping the delete; see the
+    /// `tier_3_delete_with_no_row_data_and_no_file_index_entry_errors`
+    /// test for the contract details.
     #[error(
         "delete for PK `{pk_key}` cannot be routed: row carries no partition \
          columns and FileIndex has no entry for this PK. Either set REPLICA \
@@ -154,12 +157,12 @@ impl TableWriter {
     /// `file_index` is consulted only for partitioned tables to recover
     /// partition values for `Delete` rows that don't carry the partition
     /// source column on the row payload (replica identity DEFAULT case
-    /// when partition col isn't in the PK). Mirrors Go's
-    /// `tablewriter.go:230-244` two-tier resolution: row first, then
-    /// FileIndex. Unlike Go, a tier-3 miss surfaces as
-    /// `WriterError::DeletePartitionUnresolved` rather than a silent
-    /// drop. Pass `&FileIndex::new()` for unpartitioned schemas or when
-    /// the caller has no file index (e.g. test harnesses).
+    /// when partition col isn't in the PK). The two-tier resolution
+    /// checks the row payload first, then falls back to the FileIndex.
+    /// A tier-3 miss surfaces as `WriterError::DeletePartitionUnresolved`
+    /// rather than a silent drop, so the operator gets a clear signal.
+    /// Pass `&FileIndex::new()` for unpartitioned schemas or when the
+    /// caller has no file index (e.g. test harnesses).
     pub fn prepare(
         &self,
         rows: &[MaterializedRow],
@@ -696,13 +699,12 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
             }
             Arc::new(b.finish()) as Arc<dyn Array>
         }
-        // Iceberg's `time` is microseconds-since-midnight in i64 storage
-        // (matches Arrow `Time64(Microsecond)` and the Go reference's
-        // `Time64Builder`). PG `TIME WITH TIME ZONE` carries an offset
-        // we don't store — Iceberg's `time` is timezone-naive — so we
-        // accept `PgValue::TimeTz` by extracting just its microseconds
-        // component, mirroring Go's behaviour where TIMETZ collapses to
-        // the same Time64 column.
+        // Iceberg's `time` is microseconds-since-midnight in i64
+        // storage, which matches Arrow's `Time64(Microsecond)`. PG
+        // `TIME WITH TIME ZONE` carries an offset we don't store —
+        // Iceberg's `time` is timezone-naive — so `PgValue::TimeTz`
+        // collapses to the same Time64 column by taking only its
+        // microseconds component.
         IcebergType::Time => collect_with!(Time64MicrosecondBuilder::with_capacity(n), |v: &PgValue| {
             match v {
                 PgValue::Time(t) => Some(t.0),
@@ -1342,8 +1344,7 @@ mod tests {
         // Schema partitions by `region`, delete row has only `id`. With a
         // populated FileIndex the writer recovers the partition tuple via
         // tier-2 lookup and emits the equality-delete in the right
-        // partition. Mirrors Go's `tablewriter.go:233` behavior but with
-        // structured partition values per file rather than path mining.
+        // partition.
         let w = TableWriter::new(schema_partitioned_by_region());
         let mut fi = FileIndex::new();
         // Pretend a prior cycle wrote PK=1 into the "us" partition.
@@ -1402,10 +1403,8 @@ mod tests {
     ///   process before `rebuild_from_catalog` finishes; an old cycle
     ///   replaying after compaction). Asserting it as a hard contract
     ///   in CI risks pinning behavior we may want to relax later
-    ///   (e.g. fall back to "delete with null partition" or fan-out).
-    /// - Go's reference silently drops in this case; if we ever decide
-    ///   the silent-drop is acceptable for parity, this test would
-    ///   need to flip.
+    ///   (e.g. fall back to "delete with null partition" or fan-out
+    ///   the delete across all partitions, or silently drop it).
     ///
     /// Run on demand with `cargo test -- --ignored`.
     #[test]

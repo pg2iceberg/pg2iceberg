@@ -21,9 +21,8 @@
 //! The replication-mode connection that drives the slot can't run
 //! parameterized queries, can't open named cursors, and can't easily
 //! sit inside a long REPEATABLE READ tx without interfering with the
-//! `START_REPLICATION` command we eventually issue. Two connections is
-//! the same shape as the Go reference (`pkg/postgres` opens
-//! independent conns for replication and snapshot reads).
+//! `START_REPLICATION` command we eventually issue. So replication
+//! and snapshot reads each get their own independent connection.
 //!
 //! ## What's deferred
 //!
@@ -36,7 +35,7 @@
 //!   second insert becomes an Update which voids the first), but it
 //!   means an interleaved snapshot is not optimal. For
 //!   first-deployment use cases on quiesced tables this isn't a
-//!   problem; for hot tables, wire the marker fence (Phase 11.5).
+//!   problem; hot tables need a real marker-row fence to land first.
 //! - **Resumable mid-snapshot crash recovery.** The
 //!   [`pg2iceberg_snapshot::Snapshotter`] surface persists per-table
 //!   PK-key progress; we honor `after_pk_key` correctly so it works,
@@ -113,8 +112,9 @@ impl PgSnapshotSource {
         // produces snap_lsn > `B` in the presence of concurrent
         // commits, which would *lose* events in `[B, snap_lsn]` that
         // are neither in the snapshot view nor (with start LSN
-        // = snap_lsn) replicated. Mirrors Go's marker-row fence:
-        // accept duplicates, never lose events.
+        // = snap_lsn) replicated. The principle: accept duplicates
+        // (the materializer's PK-keyed dedup absorbs them), never
+        // lose events.
         let lsn_text = simple_query_one_value(&conn.client, "SELECT pg_current_wal_lsn()::text")
             .await
             .context("pg_current_wal_lsn (pre-BEGIN fence)")?

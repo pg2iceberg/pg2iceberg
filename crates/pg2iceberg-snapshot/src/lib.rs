@@ -4,9 +4,9 @@
 //! slot past that LSN so live replication picks up exactly where the
 //! snapshot left off.
 //!
-//! Mirrors `snapshot/` and `logical/logical.go:507-519` from the Go
-//! reference, but skips the CTID-page-chunked parallel read (deferred to
-//! Phase 11.5 — useful when source tables are huge, irrelevant for the sim).
+//! The current implementation does a single sequential read per
+//! table; CTID-page-chunked parallel reads (useful for very large
+//! source tables) are a tracked follow-up.
 //!
 //! ## Why this exists
 //!
@@ -89,9 +89,8 @@ pub trait SnapshotSource: Send + Sync {
 /// the same buffer.
 pub const SNAPSHOT_XID_BASE: u32 = 0xFFFF_FF00;
 
-/// `_pg2iceberg.markers` is a **blue-green replica alignment**
-/// feature in the Go reference (see `examples/blue-green/` in the Go
-/// repo). It is *not* the snapshot↔CDC fence — that lives in
+/// `_pg2iceberg.markers` is the **blue-green replica alignment**
+/// table. It is *not* the snapshot↔CDC fence — that lives in
 /// `pg2iceberg_validate::run_logical_lifecycle` and uses
 /// `pg_current_wal_lsn()` directly.
 ///
@@ -139,8 +138,8 @@ pub enum MarkerKind {
 }
 
 /// Default chunk size for [`run_snapshot`]. Trades off peak memory against
-/// coord-write amplification. ~1k rows per chunk is the same default as
-/// the Go reference's `flush_rows`.
+/// coord-write amplification — ~1k rows per chunk is a reasonable
+/// balance for the typical OLTP-row-size workload.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024;
 
 /// Drive a fresh pipeline through the initial-snapshot phase using the

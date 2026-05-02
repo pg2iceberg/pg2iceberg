@@ -24,8 +24,7 @@ pub struct MaterializedRow {
 }
 
 /// Build a canonical PK key from a row given the PK column list.
-/// Mirrors Go's `BuildPKKey`. Used for grouping during the fold and as the
-/// FileIndex key in Phase 7.5.
+/// Used for grouping during the fold and as the FileIndex key.
 pub fn pk_key(row: &Row, pk_cols: &[ColumnName]) -> String {
     let parts: Vec<&PgValue> = pk_cols.iter().filter_map(|c| row.get(c)).collect();
     serde_json::to_string(&parts).expect("PgValue is Serializable")

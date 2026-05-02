@@ -1,8 +1,8 @@
 //! Value vocabulary for the type-mapping layer.
 //!
 //! These types capture the *shape* of a value at the PG and Iceberg sides.
-//! They're used for property-test round-trips before we wire any actual
-//! Parquet/Arrow encoders. Phase 2 will plug encoder/decoder behavior on top.
+//! Used for property-test round-trips and consumed by the
+//! Parquet/Arrow encoders.
 
 use serde::{Deserialize, Serialize};
 

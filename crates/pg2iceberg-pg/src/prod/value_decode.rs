@@ -41,7 +41,7 @@ pub fn decode_text(ty: PgType, bytes: &[u8]) -> Result<PgValue, DecodeError> {
         PgType::Int2 => PgValue::Int2(raw.parse().map_err(|_| bad())?),
         PgType::Int4 | PgType::Oid => {
             // PG `oid` is unsigned 32-bit; reading as i64 then casting
-            // accepts the wraparound the Go reference allows.
+            // accepts wraparound for `oid` values above 2^31.
             PgValue::Int4(raw.parse::<i64>().map_err(|_| bad())? as i32)
         }
         PgType::Int8 => PgValue::Int8(raw.parse().map_err(|_| bad())?),

@@ -2,7 +2,7 @@
 //!
 //! For every random sequence of DML `ChangeEvent`s, encoding to Parquet and
 //! decoding back must preserve op / lsn / commit_ts / xid / unchanged_cols /
-//! row, in order. Phase 2 deliverable.
+//! row, in order.
 
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimeMicros, TimestampMicros};
 use pg2iceberg_core::{

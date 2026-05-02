@@ -1,7 +1,8 @@
 //! Decode an Iceberg-shaped Parquet data file into `Vec<Row>`.
 //!
 //! Inverse of [`crate::writer::TableWriter::prepare`]'s data-file output.
-//! Used by Phase 7.5 TOAST resolution and (eventually) the Phase 12 verify
+//! Used by TOAST resolution (re-fetching prior column values for an
+//! `UPDATE ... SET col = unchanged_toast`) and by the `verify`
 //! subcommand.
 
 use crate::writer::WriterError;

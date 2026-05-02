@@ -51,8 +51,8 @@ use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
-/// Knobs that decide whether a table is worth compacting and how to size
-/// the output. Mirrors Go's `iceberg/compact.go::CompactionConfig`.
+/// Knobs that decide whether a table is worth compacting and how to
+/// size the output.
 #[derive(Clone, Debug)]
 pub struct CompactionConfig {
     /// Trigger compaction when live data files >= this count.
@@ -63,7 +63,7 @@ pub struct CompactionConfig {
     /// delete is a reason to compact.
     pub delete_file_threshold: usize,
     /// Files smaller than `target_size_bytes / 2` are eligible for
-    /// rewrite. Default in Go is `128 MiB / 2 = 64 MiB`.
+    /// rewrite. Default 128 MiB target → 64 MiB minimum.
     pub target_size_bytes: u64,
 }
 

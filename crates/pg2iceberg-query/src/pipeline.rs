@@ -13,9 +13,9 @@
 //!    - `TableWriter::prepare` → upload → `Catalog::commit_snapshot`.
 //!    - Update FileIndex with newly-written PKs and removed PKs.
 //!
-//! No coord, no staging Parquet, no slot. The watermark per table IS the
-//! cursor. Persistence is a Phase 10.5 task (write into the
-//! `_pg2iceberg.checkpoints` table).
+//! No coord, no staging Parquet, no slot. The watermark per table IS
+//! the cursor. Watermark persistence into the
+//! `_pg2iceberg.checkpoints` table is a tracked follow-up.
 
 use crate::buffer::Buffer;
 use crate::{watermark_compare, QueryError, WatermarkSource};

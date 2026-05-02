@@ -1,10 +1,9 @@
 //! Row-buffered writer that produces a Parquet chunk when a threshold trips.
 //!
-//! Mirrors the Go `RollingDataWriter` shape (`iceberg/writer.go`), but is much
-//! simpler at this stage: events are buffered in memory and the codec encodes
-//! once per [`flush`]. Streaming encode (per-row) and time/byte thresholds are
-//! deferred until there's a reason — premature optimization here would just
-//! complicate the DST surface.
+//! Events are buffered in memory and the codec encodes once per
+//! [`flush`]. Streaming encode (per-row) and time/byte thresholds are
+//! deferred until there's a reason — premature optimization here
+//! would just complicate the DST surface.
 
 use crate::codec::{encode_chunk, EncodedChunk};
 use crate::Result;

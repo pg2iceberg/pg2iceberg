@@ -1,8 +1,8 @@
 //! Property tests for the PG → Iceberg type and value mapping.
 //!
-//! Phase 1 deliverable. Value-level encoding (Parquet/Arrow) is out of scope;
-//! these tests pin the *shape* of the mapping so Phase 2 can plug encoders in
-//! against a known spec.
+//! Value-level encoding (Parquet/Arrow) is out of scope; these tests
+//! pin the *shape* of the mapping so the encoders can plug in against
+//! a known spec.
 
 use pg2iceberg_core::typemap::{
     map_pg_to_iceberg, value_map, IcebergType, MapError, MapWarning, MAX_DECIMAL_PRECISION,

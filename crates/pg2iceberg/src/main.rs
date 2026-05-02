@@ -49,22 +49,20 @@ enum Command {
         config: PathBuf,
     },
     /// One-shot: run a single compaction pass over every configured
-    /// table and exit. Mirrors Go's `pg2iceberg compact` — for cron /
-    /// k8s CronJob deployments where compaction runs out-of-band from
-    /// the replication loop.
+    /// table and exit. Useful for cron / k8s CronJob deployments where
+    /// compaction runs out-of-band from the replication loop.
     Compact {
         #[arg(long)]
         config: PathBuf,
     },
     /// One-shot: run snapshot expiry over every configured table and
-    /// exit. Mirrors Go's `pg2iceberg maintain`. Reads
-    /// `sink.maintenance_retention` from YAML; CLI override takes
-    /// precedence when supplied.
+    /// exit. Reads `sink.maintenance_retention` from YAML; CLI
+    /// override takes precedence when supplied.
     Maintain {
         #[arg(long)]
         config: PathBuf,
-        /// Override `sink.maintenance_retention`. Format matches Go's
-        /// `time.ParseDuration` (e.g. `168h`, `7d`, `30m`).
+        /// Override `sink.maintenance_retention` (e.g. `168h`, `30m`).
+        /// Parsed by `humantime`.
         #[arg(long)]
         retention: Option<String>,
     },
@@ -87,10 +85,10 @@ enum Command {
     /// A subsequent `run` invocation will skip the snapshot and start
     /// CDC from `flushed_lsn`.
     ///
-    /// Mirrors Go's `--snapshot-only`. Creates the replication slot
-    /// before snapshotting if it doesn't exist yet — that pins the WAL
-    /// from `consistent_point` onward so a later `run` doesn't lose
-    /// any data committed between snapshot completion and CDC start.
+    /// Creates the replication slot before snapshotting if it doesn't
+    /// exist yet — that pins the WAL from `consistent_point` onward so
+    /// a later `run` doesn't lose any data committed between snapshot
+    /// completion and CDC start.
     Snapshot {
         #[arg(long)]
         config: PathBuf,
@@ -100,11 +98,11 @@ enum Command {
     /// PG-side state created by a pg2iceberg pipeline ahead of a
     /// re-bootstrap or final retirement.
     ///
-    /// Mirrors Go's `--cleanup`. The slot must be inactive — stop
-    /// any running consumer first. Idempotent in the per-resource
-    /// sense (missing slot/publication/schema are skipped silently),
-    /// but does **not** delete the materialized Iceberg tables — that
-    /// has to be done out-of-band against the catalog.
+    /// The slot must be inactive — stop any running consumer first.
+    /// Idempotent in the per-resource sense (missing slot /
+    /// publication / schema are skipped silently), but does **not**
+    /// delete the materialized Iceberg tables — that has to be done
+    /// out-of-band against the catalog.
     Cleanup {
         #[arg(long)]
         config: PathBuf,
@@ -114,9 +112,8 @@ enum Command {
     /// materializer cycle** — pair with one or more
     /// `materializer-only` workers reading from the same coord.
     ///
-    /// Mirrors Go's `--stream-only`. Only one stream-only process
-    /// per slot (PG enforces single consumer); scale the
-    /// materializer side instead.
+    /// Only one stream-only process per slot (PG enforces single
+    /// consumer); scale the materializer side instead.
     StreamOnly {
         #[arg(long)]
         config: PathBuf,
@@ -127,9 +124,8 @@ enum Command {
     /// the same `consumer_group` and round-robin tables across
     /// themselves; rebalances automatically on join/leave.
     ///
-    /// Mirrors Go's `--materializer-only`. The `--worker-id` must
-    /// be process-unique (e.g. a k8s pod name) and stable across
-    /// restarts of the same process.
+    /// The `--worker-id` must be process-unique (e.g. a k8s pod name)
+    /// and stable across restarts of the same process.
     MaterializerOnly {
         #[arg(long)]
         config: PathBuf,

@@ -17,10 +17,8 @@
 //!   a "deletion" watermark). Query mode is upsert-only; users who need
 //!   delete semantics use logical mode.
 //!
-//! Mirrors `query/poller.go` + `query/buffer.go` + `query/pipeline.go`
-//! (the orchestrator part). Phase 10 first-cut deferrals: watermark
-//! persistence, snapshot bootstrap (`pg_export_snapshot` for initial-load
-//! consistency), reconnect/retry logic.
+//! Tracked follow-ups: snapshot bootstrap (`pg_export_snapshot` for
+//! initial-load consistency) and reconnect/retry logic.
 
 pub mod buffer;
 pub mod pipeline;
@@ -64,9 +62,9 @@ pub trait WatermarkSource: Send + Sync {
     ) -> Result<Vec<Row>>;
 }
 
-/// Total ordering on the subset of `PgValue` types we accept as watermark
-/// columns. Mirrors the Go reference: numeric and timestamp/date columns
-/// are valid; everything else is rejected at the source layer.
+/// Total ordering on the subset of `PgValue` types we accept as
+/// watermark columns. Numeric and timestamp/date columns are valid;
+/// everything else is rejected at the source layer.
 pub fn watermark_compare(
     a: &PgValue,
     b: &PgValue,

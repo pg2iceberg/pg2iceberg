@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn untracked_xid_event_stages_directly() {
         // Snapshot-phase events arrive without an open tx — they should still
-        // make it into the per-table writer. (Mirrors Go's `writeDirect`.)
+        // make it into the per-table writer.
         let mut s = Sink::new(100);
         let mut evt = insert(0, 1, 1);
         evt.xid = None;
