@@ -363,9 +363,7 @@ fn arrow_data_type(ty: IcebergType) -> DataType {
         IcebergType::TimestampTz => {
             DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into()))
         }
-        IcebergType::Decimal { precision, scale } => {
-            DataType::Decimal128(precision as u8, scale as i8)
-        }
+        IcebergType::Decimal { precision, scale } => DataType::Decimal128(precision, scale as i8),
         IcebergType::Binary => DataType::Binary,
         // Iceberg's `uuid` is a 16-byte fixed-size binary on the
         // Parquet wire (per the Iceberg → Parquet mapping in the
@@ -526,8 +524,17 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
                 _ => None,
             }
         }),
+        // Iceberg int→long is a legal, value-preserving widening, and
+        // Postgres SMALLINT/INTEGER both fit in i64. Accepting all three
+        // Pg integer widths lets the materializer flush rows that were
+        // staged *before* an `ALTER COLUMN ... TYPE BIGINT` together
+        // with rows staged after it: the promotion updates the column
+        // type to Long, but coord-staged rows still carry their
+        // original Int2/Int4 wire values until the next snapshot.
         IcebergType::Long => collect_with!(Int64Builder::with_capacity(n), |v: &PgValue| {
             match v {
+                PgValue::Int2(x) => Some(*x as i64),
+                PgValue::Int4(x) => Some(*x as i64),
                 PgValue::Int8(x) => Some(*x),
                 _ => None,
             }
@@ -538,8 +545,13 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
                 _ => None,
             }
         }),
+        // Iceberg float→double is the parallel widening for floats.
+        // Accept Float4 alongside Float8 so cross-promotion rows from
+        // before an `ALTER COLUMN ... TYPE DOUBLE PRECISION` keep
+        // flushing.
         IcebergType::Double => collect_with!(Float64Builder::with_capacity(n), |v: &PgValue| {
             match v {
+                PgValue::Float4(x) => Some(*x as f64),
                 PgValue::Float8(x) => Some(*x),
                 _ => None,
             }
@@ -573,7 +585,7 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
         ),
         IcebergType::Decimal { precision, scale } => {
             let mut b = Decimal128Builder::with_capacity(n)
-                .with_precision_and_scale(precision as u8, scale as i8)
+                .with_precision_and_scale(precision, scale as i8)
                 .map_err(|e| {
                     WriterError::Encode(format!(
                         "Decimal128Builder precision={precision} scale={scale}: {e}"

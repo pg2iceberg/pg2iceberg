@@ -298,7 +298,11 @@ run_test() {
 
     cleanup_test() {
         clean_resources
-        rm -rf "${tmp_dir:-}"
+        if [ "${KEEP_TMP:-0}" = "1" ]; then
+            echo "  TMP: $tmp_dir"
+        else
+            rm -rf "${tmp_dir:-}"
+        fi
     }
 
     trap cleanup_test RETURN

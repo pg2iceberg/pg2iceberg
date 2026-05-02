@@ -28,7 +28,7 @@ use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pollster::block_on;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SLOT: &str = "p2i-slot";
 const PUB: &str = "p2i-pub";
@@ -619,4 +619,309 @@ fn add_column_then_insert_uses_new_column() {
         rows[0].get(&col("note")),
         Some(&PgValue::Text("hello".into()))
     );
+}
+
+// ── Long-running evolution: simulate "months" of ALTERs ────────────────
+//
+// Drives a deterministic mix of `ALTER ADD COLUMN`, `ALTER COLUMN TYPE`,
+// and `ALTER DROP COLUMN` against a single table over many iterations.
+// After every step we assert PG and Iceberg agree on the schema:
+//
+// - Every column currently in PG must exist in Iceberg with the same
+//   `IcebergType`. (Promotions are applied to both sides simultaneously,
+//   so they should match exactly, not just be promotion-compatible.)
+// - Every Iceberg column NOT in PG must be a soft-drop (we tracked the
+//   drop, and Iceberg keeps it as `nullable = true` for backward
+//   compatibility with prior data files that still carry it).
+// - The PK column `id` is never dropped or retyped — its `field_id`
+//   must stay stable across the whole run.
+//
+// We also re-insert one row per iteration so the materializer actually
+// flushes after every evolution. That exercises the "old staged data
+// promoted under new schema" path the writer's int→long / float→double
+// widening just landed for.
+
+/// Tiny SplitMix64 — deterministic PRNG, no external dep. Same constants
+/// as Vigna's reference. Used to pick ops + columns + types so failures
+/// reproduce on any host.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        SplitMix64(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn pick_in(&mut self, n: usize) -> usize {
+        debug_assert!(n > 0);
+        (self.next_u64() % (n as u64)) as usize
+    }
+}
+
+#[derive(Debug)]
+enum EvoOp {
+    Add { name: String, ty: IcebergType },
+    Promote { name: String, new_ty: IcebergType },
+    Drop { name: String },
+}
+
+fn legal_promotion(ty: IcebergType) -> Option<IcebergType> {
+    match ty {
+        IcebergType::Int => Some(IcebergType::Long),
+        IcebergType::Float => Some(IcebergType::Double),
+        _ => None,
+    }
+}
+
+fn pick_add_type(rng: &mut SplitMix64) -> IcebergType {
+    // Mix of promotable + non-promotable types so later iterations have
+    // both kinds in `pg_cols` to choose from.
+    const CHOICES: &[IcebergType] = &[
+        IcebergType::Int,
+        IcebergType::Long,
+        IcebergType::Float,
+        IcebergType::Double,
+        IcebergType::String,
+        IcebergType::Boolean,
+    ];
+    CHOICES[rng.pick_in(CHOICES.len())]
+}
+
+fn default_value_for(ty: IcebergType, seed: i64) -> PgValue {
+    match ty {
+        IcebergType::Int => PgValue::Int4(seed as i32),
+        IcebergType::Long => PgValue::Int8(seed),
+        IcebergType::Float => PgValue::Float4(seed as f32 + 0.5),
+        IcebergType::Double => PgValue::Float8(seed as f64 + 0.25),
+        IcebergType::String => PgValue::Text(format!("v{seed}")),
+        IcebergType::Boolean => PgValue::Bool(seed % 2 == 0),
+        // Other types aren't reached because we only ADD from
+        // `pick_add_type`'s closed set.
+        other => panic!("default_value_for: unsupported type {other:?}"),
+    }
+}
+
+#[test]
+fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
+    let initial_ident = ident_named("evo");
+    let initial_schema = TableSchema {
+        ident: initial_ident.clone(),
+        columns: vec![
+            ColumnSchema {
+                name: "id".into(),
+                field_id: 1,
+                ty: IcebergType::Int,
+                nullable: false,
+                is_primary_key: true,
+            },
+            ColumnSchema {
+                name: "c001".into(),
+                field_id: 2,
+                ty: IcebergType::Int,
+                nullable: true,
+                is_primary_key: false,
+            },
+        ],
+        partition_spec: Vec::new(),
+        pg_schema: None,
+    };
+    let mut h = Harness::boot(std::slice::from_ref(&initial_schema));
+
+    // Tracked PG view — source of truth for what columns currently
+    // exist in PG. Mirrors what `sim PG.alter_*` does.
+    let mut pg_cols: BTreeMap<String, IcebergType> = initial_schema
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.ty))
+        .collect();
+    // Names that have ever been dropped. Used to confirm Iceberg-side
+    // soft-drops are accounted for.
+    let mut dropped_cols: BTreeSet<String> = BTreeSet::new();
+    // Field id of `id`; should never change across the run.
+    let id_field_id = 1;
+
+    let mut next_seq: u32 = 1; // c001 already taken
+    let mut rng = SplitMix64::new(0x517A1C0DEC0FFEE);
+
+    // 120 ≈ "monthly evolution for 10 years" if you squint. Enough
+    // mutation density to surface field-id drift, soft-drop bookkeeping,
+    // and writer/widening interactions without ballooning test runtime.
+    let n_steps = 120;
+    for step in 0..n_steps {
+        // ── Pick op ──
+        let non_pk_names: Vec<String> = pg_cols
+            .keys()
+            .filter(|n| n.as_str() != "id")
+            .cloned()
+            .collect();
+        let promotable_names: Vec<String> = non_pk_names
+            .iter()
+            .filter(|n| legal_promotion(pg_cols[*n]).is_some())
+            .cloned()
+            .collect();
+
+        // 50% Add, 25% Promote, 25% Drop — fall back to Add when the
+        // chosen op has no eligible target.
+        let dice = rng.pick_in(4);
+        let op = match dice {
+            0 | 1 => {
+                next_seq += 1;
+                let name = format!("c{next_seq:03}");
+                EvoOp::Add {
+                    name,
+                    ty: pick_add_type(&mut rng),
+                }
+            }
+            2 if !promotable_names.is_empty() => {
+                let n = promotable_names[rng.pick_in(promotable_names.len())].clone();
+                let new_ty = legal_promotion(pg_cols[&n]).unwrap();
+                EvoOp::Promote { name: n, new_ty }
+            }
+            3 if !non_pk_names.is_empty() => {
+                let n = non_pk_names[rng.pick_in(non_pk_names.len())].clone();
+                EvoOp::Drop { name: n }
+            }
+            _ => {
+                next_seq += 1;
+                EvoOp::Add {
+                    name: format!("c{next_seq:03}"),
+                    ty: pick_add_type(&mut rng),
+                }
+            }
+        };
+
+        // ── Apply on sim PG ──
+        match &op {
+            EvoOp::Add { name, ty } => {
+                h.db.alter_add_column(
+                    &initial_ident,
+                    ColumnSchema {
+                        name: name.clone(),
+                        field_id: 0,
+                        ty: *ty,
+                        nullable: true,
+                        is_primary_key: false,
+                    },
+                )
+                .unwrap();
+                pg_cols.insert(name.clone(), *ty);
+            }
+            EvoOp::Promote { name, new_ty } => {
+                h.db.alter_column_type(&initial_ident, name, *new_ty)
+                    .unwrap();
+                pg_cols.insert(name.clone(), *new_ty);
+            }
+            EvoOp::Drop { name } => {
+                h.db.alter_drop_column(&initial_ident, name).unwrap();
+                pg_cols.remove(name);
+                dropped_cols.insert(name.clone());
+            }
+        }
+
+        // ── Insert one row with the current PG schema ──
+        let mut row: Row = BTreeMap::new();
+        row.insert(col("id"), PgValue::Int4(step as i32 + 1));
+        for (cname, cty) in &pg_cols {
+            if cname == "id" {
+                continue;
+            }
+            row.insert(col(cname), default_value_for(*cty, step as i64));
+        }
+        let mut tx = h.db.begin_tx();
+        tx.insert(&initial_ident, row);
+        tx.commit(Timestamp(step as i64)).unwrap();
+
+        h.drive_then_materialize();
+
+        // ── Parity check ──
+        let ice = h.iceberg_schema(&initial_ident);
+        let ice_by_name: BTreeMap<&str, &ColumnSchema> = ice
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        // PK invariant: `id` is present, non-nullable, field_id stable.
+        let id_col = ice_by_name
+            .get("id")
+            .unwrap_or_else(|| panic!("step {step} ({op:?}): id column gone from Iceberg"));
+        assert!(
+            id_col.is_primary_key && !id_col.nullable,
+            "step {step} ({op:?}): id should remain non-null PK, got {id_col:?}"
+        );
+        assert_eq!(
+            id_col.field_id, id_field_id,
+            "step {step} ({op:?}): id field_id drifted"
+        );
+
+        // Every PG column → Iceberg has it with matching type.
+        for (name, ty) in &pg_cols {
+            let ice_col = ice_by_name.get(name.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "step {step} ({op:?}): pg has {name} but Iceberg doesn't. \
+                     pg_cols={pg_cols:?} ice={:?}",
+                    ice_by_name.keys().collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                ice_col.ty, *ty,
+                "step {step} ({op:?}): {name} type mismatch (pg={ty:?}, ice={:?})",
+                ice_col.ty
+            );
+        }
+
+        // Every Iceberg column not currently in PG must be a tracked
+        // soft-drop AND must be nullable. Anything else means schema
+        // bookkeeping has drifted.
+        for (name, ic) in &ice_by_name {
+            if pg_cols.contains_key(*name) {
+                continue;
+            }
+            assert!(
+                dropped_cols.contains(*name),
+                "step {step} ({op:?}): Iceberg has unknown column {name}, \
+                 not in pg_cols and never dropped"
+            );
+            assert!(
+                ic.nullable,
+                "step {step} ({op:?}): soft-dropped {name} should be nullable"
+            );
+        }
+    }
+
+    // Sanity: the final Iceberg schema should have at least all of
+    // `id` + every currently-live PG column + every soft-dropped name
+    // we ever saw. (The per-step asserts above already prove this; we
+    // restate it post-loop for grep-ability when this test fails on
+    // refactor.)
+    let final_schema = h.iceberg_schema(&initial_ident);
+    let final_names: BTreeSet<String> = final_schema
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert!(final_names.contains("id"));
+    for n in pg_cols.keys() {
+        assert!(final_names.contains(n), "final schema missing live col {n}");
+    }
+    for n in &dropped_cols {
+        assert!(
+            final_names.contains(n),
+            "final schema missing soft-dropped col {n}"
+        );
+    }
+
+    // Read-back of materialized data is intentionally NOT asserted
+    // here: data files written before a `PromoteColumnType` carry
+    // narrow Arrow types (Int32, Float32) and the current reader
+    // requires the on-disk type to match the schema's. That's the
+    // known "old data file under new schema" issue — see the existing
+    // `type_promotion_int_to_long_succeeds` test for context. The
+    // promote-on-read path is compaction's job; this DST is about the
+    // schema-bookkeeping invariant only.
 }
