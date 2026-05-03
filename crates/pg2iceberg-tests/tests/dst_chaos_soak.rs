@@ -193,11 +193,8 @@ fn pk_only(id: i32) -> Row {
 
 // ── workload model ─────────────────────────────────────────────────
 
-/// Fault ops the workload can schedule. Held here so the
-/// `fault_blob_put_then_recovery_keeps_parity` regression test can
-/// reach into the same set the (currently-`#[ignore]`-d) proptest
-/// would use once the post-restart drain semantics tighten up.
-#[allow(dead_code)]
+/// Fault ops the workload can schedule. Limited to ops where
+/// injection usefully exercises a recovery path.
 const FAULTABLE_OPS: &[&str] = &[
     ops::BLOB_PUT,
     ops::BLOB_GET,
@@ -265,13 +262,8 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         10 => (50u64..=500).prop_map(|ms| Step::Tick { ms }),
         // Chaos.
         2 => Just(Step::Restart),
-        // (InjectFault temporarily disabled while we stabilize the
-        // post-fault recovery path through `run_logical_main_loop`
-        // — the fault-restart-replay cycle still leaks events
-        // sometimes; see the diagnostic notes in the conversation.
-        // Re-enable once that's tightened up.)
-        // 2 => (prop::sample::select(FAULTABLE_OPS), 1u64..=3)
-        //     .prop_map(|(op, count)| Step::InjectFault { op, count }),
+        2 => (prop::sample::select(FAULTABLE_OPS), 1u64..=3)
+            .prop_map(|(op, count)| Step::InjectFault { op, count }),
         // Topology evolution.
         1 => Just(Step::AddTable),
     ]
@@ -501,13 +493,12 @@ impl ChaosHarness {
                 }
                 tokio::task::yield_now().await;
             }
-            // Swallow both the lifecycle's `Result` and the join
-            // error: the chaos test treats *any* exit (clean,
-            // crashed, panicked) as "process ended; the next
-            // `ensure_lifecycle_alive` will spin up a fresh one if
-            // needed". Diagnostic eprintln's here would spam the
-            // output in CI; reach for a tracing subscriber if a
-            // specific scenario needs investigation.
+            // Swallow lifecycle's `Result` and the join error; the
+            // chaos test treats *any* exit as "process ended; if a
+            // subsequent step needs the lifecycle alive,
+            // `ensure_lifecycle_alive` will respawn it." Reach for
+            // `eprintln!` here when investigating a specific failing
+            // seed.
             let _ = r.handle.await;
         }
     }
@@ -808,15 +799,7 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Currently `#[ignore]`-d: the lifecycle-driven harness reliably
-    /// surfaces a class of post-Restart replay races (events committed
-    /// in PG don't always reach Iceberg after a lifecycle restart
-    /// followed by more workload). The smoke + deterministic
-    /// regression tests below still exercise the `run_logical_main_loop`
-    /// path end-to-end at a known-good shape; the proptest is parked
-    /// until the post-restart drain semantics tighten up.
     #[test]
-    #[ignore]
     fn chaos_soak_preserves_data_integrity(steps in workload()) {
         run_chaos_test(|| async move {
             let mut h = ChaosHarness::boot().await;
@@ -902,6 +885,52 @@ fn add_table_then_workload_then_quiesce() {
         })
         .await;
         h.run_step(&Step::Tick { ms: 300 }).await;
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Regression: `Restart` after CDC progress used to trip
+/// `SlotAheadOfCheckpoint` because the validation invariant compared
+/// `slot.restart_lsn` against the per-table one-shot
+/// `snapshot_lsn` (instead of the moving `coord_flushed_lsn`).
+/// Fixed in `crates/pg2iceberg-validate/src/lib.rs` invariant 5.
+#[test]
+fn regression_restart_after_cdc_passes_validation() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot().await;
+        h.run_step(&Step::Insert {
+            table_idx: 0,
+            id: 1,
+        })
+        .await;
+        h.run_step(&Step::Tick { ms: 200 }).await;
+        // CDC has advanced slot past snapshot_lsn. Restart must
+        // validate cleanly.
+        h.run_step(&Step::Restart).await;
+        h.run_step(&Step::Insert {
+            table_idx: 0,
+            id: 2,
+        })
+        .await;
+        h.run_step(&Step::Tick { ms: 500 }).await;
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Regression: an empty table added via `AddTable` would later trip
+/// `SnapshotCompleteButTableNoSnapshot` on Restart — the invariant
+/// fired even though "snapshot of an empty source produced no
+/// catalog snapshot" is the correct behavior. Invariant removed
+/// from `crates/pg2iceberg-validate/src/lib.rs` (was invariant 7).
+#[test]
+fn regression_add_empty_table_then_restart_validates() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot().await;
+        h.run_step(&Step::AddTable).await;
+        // Don't insert anything into the new table. Restart must
+        // not reject just because chaos_t2 has no Iceberg snapshot.
+        h.run_step(&Step::Restart).await;
+        h.run_step(&Step::Tick { ms: 200 }).await;
         assert_no_data_loss(&mut h).await.unwrap();
     });
 }
