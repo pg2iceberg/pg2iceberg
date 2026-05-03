@@ -799,16 +799,31 @@ proptest! {
 //
 // The proptest above runs 32 cases per `cargo test` invocation. That's
 // enough to surface regressions during PR CI but often misses rare
-// interleavings that need 200+ seeds to manifest. The ignored test
-// below cranks the case count up; run with `cargo test --release
-// chaos_soak_extended_seeds -- --ignored --nocapture` when you want
-// the longer soak (a few minutes locally).
+// interleavings that need thousands of seeds to manifest. The ignored
+// test below cranks the case count up.
+//
+// Case-count tunable via `CHAOS_SOAK_CASES` env var (default 4096).
+// Local invocation: `cargo test --release chaos_soak_extended_seeds
+// -- --ignored --nocapture` — finishes in ~15s on a modern laptop.
+// Nightly CI sets `CHAOS_SOAK_CASES=50000` (~3 minutes) for a much
+// deeper sweep against the same proptest strategy. The default is
+// chosen so that opt-in local runs finish quickly enough to be
+// practical mid-debug without explicit overrides.
+//
+// Note: we don't rebind `PROPTEST_CASES` because that env var is
+// shared with the in-file `proptest!` macro — using a dedicated env
+// var keeps the small-scale `chaos_soak_preserves_data_integrity`
+// snappy regardless of nightly settings.
 
 #[test]
 #[ignore]
 fn chaos_soak_extended_seeds() {
+    let cases: u32 = std::env::var("CHAOS_SOAK_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
     let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
-        cases: 256,
+        cases,
         ..proptest::test_runner::Config::default()
     });
     runner
